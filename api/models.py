@@ -1,0 +1,212 @@
+"""
+Models for WhatsApp Messenger API
+"""
+from django.db import models
+from django.contrib.auth.models import User
+from django.utils import timezone
+from datetime import timedelta
+
+
+EXPIRY_CHOICES = [
+    ('1h', '1 Hour'),
+    ('5h', '5 Hours'),
+    ('end_of_day', 'End of Day'),
+    ('never', 'Never'),
+    ('custom', 'Custom'),
+]
+
+
+def get_expiry_datetime(expiry_type, custom_minutes=None):
+    now = timezone.now()
+
+    if expiry_type == '1h':
+        return now + timedelta(hours=1)
+    if expiry_type == '5h':
+        return now + timedelta(hours=5)
+    if expiry_type == 'end_of_day':
+        return (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+    if expiry_type == 'never':
+        return None
+    if expiry_type == 'custom':
+        minutes = custom_minutes or 30
+        return now + timedelta(minutes=minutes)
+    return now + timedelta(hours=1)
+
+
+class Conversation(models.Model):
+    """WhatsApp conversation/chat"""
+    whatsapp_id = models.CharField(max_length=255, unique=True)
+    contact_name = models.CharField(max_length=255)
+    contact_phone = models.CharField(max_length=20, null=True, blank=True)
+    whatsapp_username = models.CharField(max_length=255, null=True, blank=True)
+    opt_in_state = models.CharField(
+        max_length=50,
+        choices=[
+            ('not_opted_in', 'Not Opted In'),
+            ('opted_in_phone_unavailable', 'Opted In, Phone Unavailable'),
+            ('opted_in_phone_available', 'Opted In, Phone Available'),
+        ],
+        default='not_opted_in'
+    )
+    last_message = models.TextField(blank=True)
+    last_message_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=[('active', 'Active'), ('resolved', 'Resolved'), ('archived', 'Archived')],
+        default='active'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        contact_id = self.contact_phone or self.whatsapp_username or self.whatsapp_id
+        return f"{self.contact_name} ({contact_id})"
+
+    class Meta:
+        ordering = ['-last_message_at', '-created_at']
+
+
+class Message(models.Model):
+    """Messages within a conversation"""
+    DIRECTION_CHOICES = [
+        ('inbound', 'Inbound'),
+        ('outbound', 'Outbound'),
+    ]
+
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
+    direction = models.CharField(max_length=20, choices=DIRECTION_CHOICES)
+    message_type = models.CharField(max_length=50, default='text')  # text, image, document, etc.
+    content = models.TextField()
+    sender_name = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_read = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.conversation.contact_name} - {self.content[:50]}"
+
+    class Meta:
+        ordering = ['created_at']
+
+
+class ConversationTag(models.Model):
+    """Temporary tags/assignments for conversations"""
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='tags')
+    assigned_to = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='assigned_tags')
+    tag_name = models.CharField(max_length=255)  # e.g., "Billing Issue", "Technical Support"
+    tag_color = models.CharField(max_length=20, default='blue')  # Tailwind color classes
+    note = models.TextField(blank=True, default='')
+    
+    expiry_type = models.CharField(max_length=20, choices=EXPIRY_CHOICES, default='1h')
+    expires_at = models.DateTimeField(null=True, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_tags')
+    
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"{self.tag_name} - {self.conversation.contact_name}"
+
+    def is_expired(self):
+        """Check if tag has expired"""
+        if self.expires_at is None:
+            return False
+        return timezone.now() > self.expires_at
+
+    @classmethod
+    def create_tag(cls, conversation, tag_name, expiry_type='1h', created_by=None, tag_color='blue', custom_expiry_minutes=None):
+        """Factory method to create a tag with proper expiry calculation"""
+        tag = cls(
+            conversation=conversation,
+            tag_name=tag_name,
+            expiry_type=expiry_type,
+            expires_at=get_expiry_datetime(expiry_type, custom_expiry_minutes),
+            created_by=created_by,
+            tag_color=tag_color,
+        )
+        tag.save()
+        return tag
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class ConversationNote(models.Model):
+    """Notes attached to a conversation."""
+
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='notes')
+    content = models.TextField()
+    expiry_type = models.CharField(max_length=20, choices=EXPIRY_CHOICES, default='1h')
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_notes')
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"Note - {self.conversation.contact_name}"
+
+    def is_expired(self):
+        if self.expires_at is None:
+            return False
+        return timezone.now() > self.expires_at
+
+    @classmethod
+    def create_note(cls, conversation, content, expiry_type='1h', created_by=None, custom_expiry_minutes=None):
+        note = cls(
+            conversation=conversation,
+            content=content,
+            expiry_type=expiry_type,
+            expires_at=get_expiry_datetime(expiry_type, custom_expiry_minutes),
+            created_by=created_by,
+        )
+        note.save()
+        return note
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class ConversationTake(models.Model):
+    """Active claims for a conversation."""
+
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='takes')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='taken_conversations')
+    duration_minutes = models.PositiveIntegerField(default=30)
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"Taken - {self.conversation.contact_name}"
+
+    def is_expired(self):
+        return timezone.now() > self.expires_at
+
+    @classmethod
+    def create_take(cls, conversation, created_by=None, duration_minutes=30):
+        take = cls(
+            conversation=conversation,
+            created_by=created_by,
+            duration_minutes=duration_minutes,
+            expires_at=timezone.now() + timedelta(minutes=duration_minutes),
+        )
+        take.save()
+        return take
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class StickerAsset(models.Model):
+    """Reusable image asset for stickers and quick replies."""
+
+    name = models.CharField(max_length=255)
+    image = models.FileField(upload_to='stickers/%Y/%m/')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sticker_assets')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        ordering = ['-created_at']
