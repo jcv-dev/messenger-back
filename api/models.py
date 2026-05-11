@@ -39,15 +39,7 @@ class Conversation(models.Model):
     contact_name = models.CharField(max_length=255)
     contact_phone = models.CharField(max_length=20, null=True, blank=True)
     whatsapp_username = models.CharField(max_length=255, null=True, blank=True)
-    opt_in_state = models.CharField(
-        max_length=50,
-        choices=[
-            ('not_opted_in', 'Not Opted In'),
-            ('opted_in_phone_unavailable', 'Opted In, Phone Unavailable'),
-            ('opted_in_phone_available', 'Opted In, Phone Available'),
-        ],
-        default='not_opted_in'
-    )
+    custom_name = models.CharField(max_length=255, null=True, blank=True)
     last_message = models.TextField(blank=True)
     last_message_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(
@@ -75,9 +67,12 @@ class Message(models.Model):
 
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
     direction = models.CharField(max_length=20, choices=DIRECTION_CHOICES)
-    message_type = models.CharField(max_length=50, default='text')  # text, image, document, etc.
-    content = models.TextField()
+    message_type = models.CharField(max_length=50, default='text')  # text, image, video, audio, location, reaction, edit, document, sticker
+    content = models.TextField(blank=True, default='')
     sender_name = models.CharField(max_length=255, blank=True)
+    whatsapp_message_id = models.CharField(max_length=255, null=True, blank=True)
+    media_url = models.URLField(max_length=2000, null=True, blank=True)
+    metadata = models.JSONField(null=True, blank=True, default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
 

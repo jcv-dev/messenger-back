@@ -137,3 +137,6 @@ WHATSAPP_API_TOKEN = config('WHATSAPP_API_TOKEN', default='')
 WHATSAPP_PHONE_NUMBER = config('WHATSAPP_PHONE_NUMBER', default='')
 WHATSAPP_PHONE_NUMBER_ID = config('WHATSAPP_PHONE_NUMBER_ID', default='')
 WEBHOOK_TOKEN = config('WEBHOOK_TOKEN', default='')
+
+# Message retention in minutes — messages and their media files older than this are deleted
+MESSAGE_RETENTION_MINUTES = config('MESSAGE_RETENTION_MINUTES', default=0, cast=int)

@@ -107,7 +107,7 @@ class ConversationTakeSerializer(serializers.ModelSerializer):
 class MessageSerializer(serializers.ModelSerializer):
     class Meta:
         model = Message
-        fields = ['id', 'direction', 'message_type', 'content', 'sender_name', 'created_at', 'is_read']
+        fields = ['id', 'direction', 'message_type', 'content', 'sender_name', 'whatsapp_message_id', 'media_url', 'metadata', 'created_at', 'is_read']
 
 
 class ConversationSerializer(serializers.ModelSerializer):
@@ -117,15 +117,19 @@ class ConversationSerializer(serializers.ModelSerializer):
     active_take = serializers.SerializerMethodField()
     messages = MessageSerializer(many=True, read_only=True)
     active_tags = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
         fields = [
-            'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'opt_in_state', 'last_message',
+            'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
             'last_message_at', 'status', 'tags', 'active_tags', 'notes',
-            'active_notes', 'active_take', 'messages',
+            'active_notes', 'active_take', 'messages', 'unread_count',
             'created_at', 'updated_at'
         ]
+
+    def get_unread_count(self, obj):
+        return obj.messages.filter(is_read=False, direction='inbound').count()
 
     def get_active_tags(self, obj):
         """Get only non-expired tags"""
@@ -149,13 +153,18 @@ class ConversationListSerializer(serializers.ModelSerializer):
     """Lighter version for list views"""
     active_tags = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
+    active_take = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
         fields = [
-            'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'opt_in_state', 'last_message',
-            'last_message_at', 'status', 'active_tags', 'unread_count', 'created_at'
+            'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
+            'last_message_at', 'status', 'active_tags', 'active_take', 'unread_count', 'created_at'
         ]
+
+    def get_active_take(self, obj):
+        take = obj.takes.filter(is_active=True, expires_at__gt=timezone.now()).order_by('-created_at').first()
+        return ConversationTakeSerializer(take).data if take else None
 
     def get_active_tags(self, obj):
         from django.utils import timezone
@@ -165,7 +174,7 @@ class ConversationListSerializer(serializers.ModelSerializer):
         return ConversationTagSerializer(active_tags, many=True).data
 
     def get_unread_count(self, obj):
-        return obj.messages.filter(is_read=False).count()
+        return obj.messages.filter(is_read=False, direction='inbound').count()
 
 
 class CreateConversationTagSerializer(serializers.Serializer):
