@@ -11,8 +11,15 @@ from django.contrib.auth.models import User
 from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.cache import cache_page
+from django.db import transaction
 from rest_framework.authtoken.models import Token
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import OuterRef, Subquery, Q, Count, Prefetch
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset
 from .serializers import (
@@ -23,10 +30,15 @@ from .serializers import (
     TakeConversationSerializer, UserSerializer, StickerAssetSerializer
 )
 import json
+import logging
 import queue
 
 from .realtime import publish, subscribe, unsubscribe
 
+logger = logging.getLogger('api')
+
+_send_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix='wa-send')
+_download_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='wa-dl')
 
 import uuid
 import os
@@ -38,7 +50,7 @@ import urllib.parse
 def publish_conversation_update(conversation, message=None):
     payload = {
         'type': 'conversation.updated',
-        'conversation': ConversationSerializer(conversation).data,
+        'conversation': ConversationListSerializer(conversation).data,
     }
     if message is not None:
         payload['message'] = message
@@ -108,7 +120,7 @@ def download_whatsapp_media(media_value, token, media_type):
 
         return f"{settings.MEDIA_URL}whatsapp/{media_type}/{filename}"
     except Exception as e:
-        print(f"Error downloading WhatsApp media: {e}")
+        logger.error("Error downloading WhatsApp media: %s", e)
         return None
 
 
@@ -120,17 +132,19 @@ def download_media_async(message_id, raw_media, media_type):
             msg = Message.objects.get(id=message_id)
             msg.media_url = url
             msg.save(update_fields=['media_url'])
-            msg.conversation.save()
-            publish_conversation_update(msg.conversation)
+            publish_conversation_update(msg.conversation, MessageSerializer(msg).data)
         except Message.DoesNotExist:
             pass
-            pass
 
 
-def send_whatsapp_outbound(message_type, content, contact_phone):
+def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None, conversation_id=None, context_wamid=None):
     phone_number_id = getattr(settings, 'WHATSAPP_PHONE_NUMBER_ID', None) or settings.WHATSAPP_PHONE_NUMBER
     token = settings.WHATSAPP_API_TOKEN
     if not phone_number_id or not token or not contact_phone:
+        logger.error(
+            'WhatsApp outbound send blocked: phone_number_id=%s token_set=%s contact_phone=%r',
+            bool(phone_number_id), bool(token), contact_phone,
+        )
         return
 
     try:
@@ -159,26 +173,89 @@ def send_whatsapp_outbound(message_type, content, contact_phone):
                 if os.path.exists(file_path):
                     try:
                         media_id = upload_media_to_whatsapp(file_path, phone_number_id, token)
-                    except Exception as e:
-                        print(f"Error uploading media to WhatsApp: {e}")
+                    except urllib.error.HTTPError as e:
+                        err_body = e.read().decode() if hasattr(e, 'read') else ''
+                        logger.warning("Media upload to WhatsApp failed: HTTP %s %s", e.code, err_body[:200])
+                    except Exception:
+                        logger.warning("Media upload to WhatsApp failed (network/config error)")
 
             if media_id:
                 payload[wa_type] = {"id": media_id}
             else:
-                if parsed.hostname in ['localhost', '127.0.0.1']:
-                    public_host = next((h for h in settings.ALLOWED_HOSTS if h not in ['localhost', '127.0.0.1', '*']), None)
+                hostname = parsed.hostname
+                if hostname is None or hostname in ('localhost', '127.0.0.1', ''):
+                    public_host = next((h for h in settings.ALLOWED_HOSTS if h not in ('localhost', '127.0.0.1', '*', '')), None)
                     if public_host:
                         content = urllib.parse.urlunparse(('https', public_host, parsed.path, parsed.params, parsed.query, parsed.fragment))
+                    else:
+                        logger.warning("Skipping WhatsApp media outbound: no public host available, and upload failed")
+                        return
                 payload[wa_type] = {"link": content}
         else:
             payload['type'] = 'text'
             payload['text'] = {"body": content}
 
-        req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        if context_wamid:
+            payload['context'] = {"message_id": context_wamid}
+
+        body = json.dumps(payload).encode('utf-8')
+        logger.info('WhatsApp outbound -> %s [%s]', contact_phone, message_type)
+        req = urllib.request.Request(url, data=body, headers=headers, method='POST')
         with urllib.request.urlopen(req) as response:
-            pass
-    except Exception as e:
-        print(f"Error sending WhatsApp message: {e}")
+            resp_body = response.read().decode()
+            logger.info('WhatsApp API response: %s', resp_body)
+            if message_id:
+                try:
+                    resp_data = json.loads(resp_body)
+                    wamid = resp_data.get('messages', [{}])[0].get('id', '')
+                    if wamid:
+                        Message.objects.filter(id=message_id).update(whatsapp_message_id=wamid)
+                        logger.info('Updated message %d with wamid %s', message_id, wamid)
+                    if conversation_id:
+                        try:
+                            conv = Conversation.objects.get(id=conversation_id)
+                            sent_msg = Message.objects.get(id=message_id)
+                            publish_conversation_update(conv, MessageSerializer(sent_msg).data)
+                        except Exception:
+                            logger.exception('Failed to publish update after wamid for message %d', message_id)
+                except Exception:
+                    logger.exception('Failed to update wamid for message %d', message_id)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if hasattr(e, 'read') else ''
+        logger.error('WhatsApp API HTTP %s: %s', e.code, body)
+        if message_id:
+            try:
+                err_data = {}
+                try:
+                    parsed = json.loads(body)
+                    err_data = parsed.get('error', {})
+                except Exception:
+                    pass
+                failed_msg = Message.objects.get(id=message_id)
+                meta = failed_msg.metadata or {}
+                meta['send_error'] = err_data.get('message', body[:200]) or body[:200]
+                meta['send_error_code'] = err_data.get('code', e.code)
+                failed_msg.metadata = meta
+                failed_msg.save(update_fields=['metadata'])
+                if conversation_id:
+                    conv = Conversation.objects.get(id=conversation_id)
+                    publish_conversation_update(conv, MessageSerializer(failed_msg).data)
+            except Exception:
+                logger.exception('Failed to update send_error for message %d', message_id)
+    except Exception:
+        logger.exception("Error sending WhatsApp message")
+        if message_id:
+            try:
+                failed_msg = Message.objects.get(id=message_id)
+                meta = failed_msg.metadata or {}
+                meta['send_error'] = 'Network error sending message'
+                failed_msg.metadata = meta
+                failed_msg.save(update_fields=['metadata'])
+                if conversation_id:
+                    conv = Conversation.objects.get(id=conversation_id)
+                    publish_conversation_update(conv, MessageSerializer(failed_msg).data)
+            except Exception:
+                logger.exception('Failed to update send_error for message %d', message_id)
 
 
 
@@ -187,8 +264,19 @@ class ConversationViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        """Return all conversations"""
-        return Conversation.objects.order_by('-last_message_at', '-created_at')
+        """Return all conversations with last message metadata annotated"""
+        now = timezone.now()
+        last_msg = Message.objects.filter(conversation=OuterRef('pk')).order_by('-created_at')
+        active_q = Q(is_active=True) & (Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+        return Conversation.objects.order_by('-last_message_at', '-created_at').annotate(
+            _last_msg_sender=Subquery(last_msg.values('sender_name')[:1]),
+            _last_msg_direction=Subquery(last_msg.values('direction')[:1]),
+            _unread_count=Count('messages', filter=Q(messages__is_read=False, messages__direction='inbound'), distinct=True),
+        ).prefetch_related(
+            Prefetch('tags', queryset=ConversationTag.objects.filter(active_q)),
+            Prefetch('notes', queryset=ConversationNote.objects.filter(active_q)),
+            Prefetch('takes', queryset=ConversationTake.objects.filter(is_active=True, expires_at__gt=now)),
+        )
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -337,27 +425,76 @@ class ConversationViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Tag not found'}, status=status.HTTP_404_NOT_FOUND)
 
     @action(detail=True, methods=['get', 'post'])
+    @transaction.atomic
     def messages(self, request, pk=None):
         """Get or create messages for a conversation"""
         conversation = self.get_object()
 
         if request.method == 'GET':
-            messages = conversation.messages.all()
-            serializer = MessageSerializer(messages, many=True)
-            return Response(serializer.data)
+            before = request.query_params.get('before')
+            limit = min(int(request.query_params.get('limit', 50)), 200)
+
+            queryset = conversation.messages.select_related('context_message').all()
+
+            if before:
+                try:
+                    before_msg = Message.objects.get(id=before, conversation=conversation)
+                    queryset = queryset.filter(
+                        Q(created_at__lt=before_msg.created_at) |
+                        Q(created_at=before_msg.created_at, id__lt=before_msg.id)
+                    )
+                except Message.DoesNotExist:
+                    pass
+
+            queryset = queryset.order_by('-created_at', '-id')
+            msg_page = list(queryset[:limit + 1])
+            has_more = len(msg_page) > limit
+            msg_page = msg_page[:limit]
+            msg_page.reverse()
+            cursor = msg_page[0].id if msg_page and has_more else None
+
+            serializer = MessageSerializer(msg_page, many=True)
+            return Response({
+                'results': serializer.data,
+                'cursor': cursor,
+                'has_more': has_more,
+            })
 
         elif request.method == 'POST':
             data = request.data
             direction = data.get('direction', 'outbound')
             message_type = data.get('message_type', 'text')
             content = data.get('content')
-            
+            context_message_id = data.get('context_message_id')
+
+            context_msg = None
+            if context_message_id:
+                try:
+                    context_msg = Message.objects.get(id=context_message_id, conversation=conversation)
+                except Message.DoesNotExist:
+                    pass
+
+            uploaded_file = request.FILES.get('file')
+            if uploaded_file:
+                import uuid, os
+                ext = os.path.splitext(uploaded_file.name)[1] or '.bin'
+                safe_name = f"{uuid.uuid4().hex}{ext}"
+                upload_subdir = 'images' if message_type == 'image' else 'videos'
+                upload_dir = os.path.join(settings.MEDIA_ROOT, 'uploads', upload_subdir)
+                os.makedirs(upload_dir, exist_ok=True)
+                file_path = os.path.join(upload_dir, safe_name)
+                with open(file_path, 'wb+') as dest:
+                    for chunk in uploaded_file.chunks():
+                        dest.write(chunk)
+                content = f"{settings.MEDIA_URL}uploads/{upload_subdir}/{safe_name}"
+
             message = Message.objects.create(
                 conversation=conversation,
                 direction=direction,
                 message_type=message_type,
                 content=content,
                 sender_name=data.get('sender_name', request.user.get_full_name() or request.user.username),
+                context_message=context_msg,
             )
 
             if message_type in ('image', 'sticker', 'video', 'audio', 'document') and content:
@@ -385,23 +522,149 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation.save()
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
-                threading.Thread(
-                    target=send_whatsapp_outbound,
-                    args=(message_type, content, conversation.contact_phone),
-                    daemon=True
-                ).start()
+                context_wamid = context_msg.whatsapp_message_id if context_msg else None
+                _send_pool.submit(
+                    send_whatsapp_outbound,
+                    message_type, content, conversation.contact_phone, message.id, conversation.id,
+                    context_wamid=context_wamid,
+                )
 
             serializer = MessageSerializer(message)
-            publish_conversation_update(conversation, serializer.data)
+            publish_conversation_update(conversation)
 
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'])
+    @transaction.atomic
     def active_conversations(self, request):
-        """Get active conversations with non-expired tags"""
-        conversations = self.get_queryset().filter(status='active')
-        serializer = ConversationListSerializer(conversations, many=True)
-        return Response(serializer.data)
+        """Get active conversations with cursor-based pagination"""
+        queryset = self.get_queryset().filter(status='active').annotate(
+            msg_count=Count('messages')
+        ).filter(msg_count__gt=0)
+
+        before = request.query_params.get('before')
+        limit = min(int(request.query_params.get('limit', 100)), 500)
+
+        if before:
+            queryset = queryset.filter(last_message_at__lt=before)
+
+        queryset = queryset.order_by('-last_message_at', '-created_at')
+        conv_page = list(queryset[:limit + 1])
+        has_more = len(conv_page) > limit
+        conv_page = conv_page[:limit]
+
+        cursor = conv_page[-1].last_message_at.isoformat() if conv_page and has_more else None
+
+        serializer = ConversationListSerializer(conv_page, many=True)
+        return Response({
+            'results': serializer.data,
+            'cursor': cursor,
+            'has_more': has_more,
+        })
+
+    @action(detail=True, methods=['get'])
+    def metadata(self, request, pk=None):
+        """Get conversation metadata without messages (tags, notes, takes, contact info)"""
+        conversation = self.get_object()
+        serializer = ConversationSerializer(conversation)
+        data = serializer.data
+        data.pop('messages', None)
+        return Response(data)
+
+    @action(detail=False, methods=['post'])
+    @transaction.atomic
+    def initiate(self, request):
+        """Start a new conversation and send the first outbound message"""
+        ser = InitiateConversationSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        contact_phone = ser.validated_data['contact_phone']
+        contact_name = ser.validated_data['contact_name']
+        content = ser.validated_data['content']
+        message_type = ser.validated_data.get('message_type', 'text')
+
+        conversation, created = Conversation.objects.get_or_create(
+            whatsapp_id=contact_phone,
+            defaults={
+                'contact_name': contact_name,
+                'contact_phone': contact_phone,
+            }
+        )
+
+        if not created:
+            if conversation.contact_name != contact_name:
+                conversation.contact_name = contact_name
+            if conversation.contact_phone != contact_phone:
+                conversation.contact_phone = contact_phone
+            if conversation.status != 'active':
+                conversation.status = 'active'
+            conversation.save()
+
+        message = Message.objects.create(
+            conversation=conversation,
+            direction='outbound',
+            message_type=message_type,
+            content=content,
+            sender_name=request.user.get_full_name() or request.user.username,
+        )
+
+        if message_type in ('image', 'sticker', 'video', 'audio', 'document') and content:
+            parsed = urllib.parse.urlparse(content)
+            if parsed.scheme or parsed.path.startswith('/media/'):
+                message.media_url = content
+                message.content = ''
+                message.save(update_fields=['media_url', 'content'])
+
+        if message_type == 'text':
+            conversation.last_message = content
+        elif message_type == 'image':
+            conversation.last_message = '[Image]'
+        elif message_type == 'video':
+            conversation.last_message = '[Video]'
+        elif message_type == 'audio':
+            conversation.last_message = '[Voice message]'
+        elif message_type == 'sticker':
+            conversation.last_message = '[Sticker]'
+        elif message_type == 'document':
+            conversation.last_message = '[Document]'
+        else:
+            conversation.last_message = f'[{message_type.capitalize()}]'
+        conversation.last_message_at = timezone.now()
+        conversation.save()
+
+        if message_type not in ('edit', 'reaction'):
+            _send_pool.submit(
+                send_whatsapp_outbound,
+                message_type, content, conversation.contact_phone, message.id, conversation.id,
+            )
+
+        publish_conversation_update(conversation)
+
+        return Response(ConversationSerializer(conversation).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """Search all conversations by name, phone, ID, tags, or notes."""
+        q = request.query_params.get('q', '').strip()
+        if not q:
+            return Response({'results': []})
+        now = timezone.now()
+        active_q = Q(is_active=True) & (Q(expires_at__isnull=True) | Q(expires_at__gt=now))
+        queryset = Conversation.objects.filter(
+            Q(contact_name__icontains=q) |
+            Q(custom_name__icontains=q) |
+            Q(contact_phone__icontains=q) |
+            Q(whatsapp_id__icontains=q) |
+            Q(whatsapp_username__icontains=q) |
+            Q(tags__tag_name__icontains=q, tags__is_active=True) |
+            Q(notes__content__icontains=q, notes__is_active=True)
+        ).distinct().order_by('-last_message_at', '-created_at').prefetch_related(
+            Prefetch('tags', queryset=ConversationTag.objects.filter(active_q)),
+            Prefetch('notes', queryset=ConversationNote.objects.filter(active_q)),
+            Prefetch('takes', queryset=ConversationTake.objects.filter(is_active=True, expires_at__gt=now)),
+        )[:50]
+        serializer = ConversationListSerializer(queryset, many=True)
+        return Response({'results': serializer.data})
 
 
 class MessageViewSet(viewsets.ReadOnlyModelViewSet):
@@ -410,7 +673,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return Message.objects.all()
+        return Message.objects.select_related('conversation', 'context_message').all()
 
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -452,6 +715,7 @@ class StickerAssetViewSet(viewsets.ModelViewSet):
 
 # Webhook endpoint for WhatsApp (verification + incoming messages)
 @csrf_exempt
+@transaction.atomic
 def whatsapp_webhook(request):
     # Verification (GET)
     if request.method == 'GET':
@@ -480,200 +744,218 @@ def whatsapp_webhook(request):
             changes = entries[0].get('changes', []) if entries else []
             value = changes[0].get('value', {}) if changes else payload.get('value', {})
             messages = value.get('messages', [])
-            msg = messages[0] if messages else None
-
-            if not msg:
+            if not messages:
                 return JsonResponse({'status': 'no_message'}, status=200)
 
-            msg_type = msg.get('type', 'text')
-            sender = msg.get('from') or msg.get('from_user_id')
-            msg_id = msg.get('id')
-
             contacts = value.get('contacts', [])
-            contact_info = contacts[0] if contacts else {}
-            profile = contact_info.get('profile', {})
 
-            contact_name = profile.get('name', sender)
-            raw_username = contact_info.get('username') or profile.get('username') or ''
-            whatsapp_username = raw_username.lstrip('@') or None
-            wa_id = contact_info.get('wa_id') or contact_info.get('user_id') or sender
+            for msg in messages:
+                msg_type = msg.get('type', 'text')
+                sender = msg.get('from') or msg.get('from_user_id')
+                msg_id = msg.get('id')
 
-            conversation, created = Conversation.objects.get_or_create(
-                whatsapp_id=wa_id,
-                defaults={
-                    'contact_name': contact_name,
-                    'contact_phone': wa_id if wa_id and wa_id.isdigit() else None,
-                    'whatsapp_username': whatsapp_username,
-                }
-            )
+                sender_contact = next((c for c in contacts if c.get('wa_id') == sender or c.get('user_id') == sender), None)
+                contact_info = sender_contact or (contacts[0] if contacts else {})
+                profile = contact_info.get('profile', {})
 
-            if not created:
-                updated = False
-                if contact_name and conversation.contact_name != contact_name:
-                    conversation.contact_name = contact_name
-                    updated = True
-                if whatsapp_username and conversation.whatsapp_username != whatsapp_username:
-                    conversation.whatsapp_username = whatsapp_username
-                    updated = True
-                if wa_id and wa_id.isdigit() and conversation.contact_phone != wa_id:
-                    conversation.contact_phone = wa_id
-                    updated = True
-                if updated:
-                    conversation.save()
+                contact_name = profile.get('name', sender)
+                raw_username = contact_info.get('username') or profile.get('username') or ''
+                whatsapp_username = raw_username.lstrip('@') or None
+                wa_id = contact_info.get('wa_id') or contact_info.get('user_id') or sender
 
-            if not conversation.custom_name:
-                existing_custom = Conversation.objects.filter(
-                    whatsapp_id=wa_id
-                ).exclude(custom_name__isnull=True).exclude(custom_name='').values_list('custom_name', flat=True).first()
-                if existing_custom:
-                    conversation.custom_name = existing_custom
-                    conversation.save(update_fields=['custom_name'])
+                conversation, created = Conversation.objects.get_or_create(
+                    whatsapp_id=wa_id,
+                    defaults={
+                        'contact_name': contact_name,
+                        'contact_phone': wa_id if wa_id and wa_id.isdigit() else None,
+                        'whatsapp_username': whatsapp_username,
+                    }
+                )
 
-            content = ''
-            media_url = None
-            meta = {}
-            last_msg_text = ''
-            raw_media = None
-            media_type_for_download = None
+                if not created:
+                    updated = False
+                    if contact_name and conversation.contact_name != contact_name:
+                        conversation.contact_name = contact_name
+                        updated = True
+                    if whatsapp_username and conversation.whatsapp_username != whatsapp_username:
+                        conversation.whatsapp_username = whatsapp_username
+                        updated = True
+                    if wa_id and wa_id.isdigit() and conversation.contact_phone != wa_id:
+                        conversation.contact_phone = wa_id
+                        updated = True
+                    if updated:
+                        conversation.save()
 
-            if msg_type == 'text':
-                if 'text' in msg and isinstance(msg['text'], dict):
-                    content = msg['text'].get('body', '')
-                elif isinstance(msg.get('text'), str):
-                    content = msg['text']
-                last_msg_text = content
+                if not conversation.custom_name:
+                    existing_custom = Conversation.objects.filter(
+                        whatsapp_id=wa_id
+                    ).exclude(custom_name__isnull=True).exclude(custom_name='').values_list('custom_name', flat=True).first()
+                    if existing_custom:
+                        conversation.custom_name = existing_custom
+                        conversation.save(update_fields=['custom_name'])
 
-            elif msg_type == 'image':
-                img = msg.get('image', {})
-                content = img.get('caption', '')
-                raw_media = img.get('url') or img.get('id') or ''
-                media_type_for_download = 'image'
-                media_url = ''
-                meta = {
-                    'mime_type': img.get('mime_type', ''),
-                    'sha256': img.get('sha256', ''),
-                    'media_id': img.get('id', ''),
-                }
-                if 'context' in msg:
-                    meta['context'] = msg['context']
-                last_msg_text = content or 'Image'
+                content = ''
+                media_url = None
+                meta = {}
+                last_msg_text = ''
+                raw_media = None
+                media_type_for_download = None
 
-            elif msg_type == 'video':
-                vid = msg.get('video', {})
-                content = vid.get('caption', '')
-                raw_media = vid.get('url') or vid.get('id') or ''
-                media_type_for_download = 'video'
-                media_url = ''
-                meta = {
-                    'mime_type': vid.get('mime_type', ''),
-                    'sha256': vid.get('sha256', ''),
-                    'media_id': vid.get('id', ''),
-                }
-                if 'context' in msg:
-                    meta['context'] = msg['context']
-                last_msg_text = content or 'Video'
+                if msg_type == 'text':
+                    if 'text' in msg and isinstance(msg['text'], dict):
+                        content = msg['text'].get('body', '')
+                    elif isinstance(msg.get('text'), str):
+                        content = msg['text']
+                    last_msg_text = content
 
-            elif msg_type == 'sticker':
-                stk = msg.get('sticker', {})
-                raw_media = stk.get('url') or stk.get('id') or ''
-                media_type_for_download = 'sticker'
-                media_url = ''
-                meta = {
-                    'mime_type': stk.get('mime_type', ''),
-                    'sha256': stk.get('sha256', ''),
-                    'media_id': stk.get('id', ''),
-                }
-                last_msg_text = 'Sticker'
+                elif msg_type == 'image':
+                    img = msg.get('image', {})
+                    content = img.get('caption', '')
+                    raw_media = img.get('url') or img.get('id') or ''
+                    media_type_for_download = 'image'
+                    media_url = ''
+                    meta = {
+                        'mime_type': img.get('mime_type', ''),
+                        'sha256': img.get('sha256', ''),
+                        'media_id': img.get('id', ''),
+                    }
+                    last_msg_text = content or 'Image'
 
-            elif msg_type == 'document':
-                doc = msg.get('document', {})
-                content = doc.get('caption', '')
-                raw_media = doc.get('url') or doc.get('id') or ''
-                media_type_for_download = 'document'
-                media_url = ''
-                meta = {
-                    'mime_type': doc.get('mime_type', ''),
-                    'sha256': doc.get('sha256', ''),
-                    'media_id': doc.get('id', ''),
-                    'filename': doc.get('filename', ''),
-                }
-                last_msg_text = content or 'Document'
+                elif msg_type == 'video':
+                    vid = msg.get('video', {})
+                    content = vid.get('caption', '')
+                    raw_media = vid.get('url') or vid.get('id') or ''
+                    media_type_for_download = 'video'
+                    media_url = ''
+                    meta = {
+                        'mime_type': vid.get('mime_type', ''),
+                        'sha256': vid.get('sha256', ''),
+                        'media_id': vid.get('id', ''),
+                    }
+                    last_msg_text = content or 'Video'
 
-            elif msg_type == 'audio':
-                aud = msg.get('audio', {})
-                raw_media = aud.get('url') or aud.get('id') or ''
-                media_type_for_download = 'audio'
-                media_url = ''
-                meta = {
-                    'mime_type': aud.get('mime_type', ''),
-                    'sha256': aud.get('sha256', ''),
-                    'media_id': aud.get('id', ''),
-                    'voice': aud.get('voice', False),
-                }
-                last_msg_text = 'Voice message' if meta.get('voice') else 'Audio'
+                elif msg_type == 'sticker':
+                    stk = msg.get('sticker', {})
+                    raw_media = stk.get('url') or stk.get('id') or ''
+                    media_type_for_download = 'sticker'
+                    media_url = ''
+                    meta = {
+                        'mime_type': stk.get('mime_type', ''),
+                        'sha256': stk.get('sha256', ''),
+                        'media_id': stk.get('id', ''),
+                    }
+                    last_msg_text = 'Sticker'
 
-            elif msg_type == 'location':
-                loc = msg.get('location', {})
-                content = loc.get('name') or loc.get('address', '')
-                meta = {
-                    'latitude': loc.get('latitude'),
-                    'longitude': loc.get('longitude'),
-                    'name': loc.get('name', ''),
-                    'address': loc.get('address', ''),
-                    'url': loc.get('url', ''),
-                }
-                last_msg_text = content or 'Location'
+                elif msg_type == 'document':
+                    doc = msg.get('document', {})
+                    content = doc.get('caption', '')
+                    raw_media = doc.get('url') or doc.get('id') or ''
+                    media_type_for_download = 'document'
+                    media_url = ''
+                    meta = {
+                        'mime_type': doc.get('mime_type', ''),
+                        'sha256': doc.get('sha256', ''),
+                        'media_id': doc.get('id', ''),
+                        'filename': doc.get('filename', ''),
+                    }
+                    last_msg_text = content or 'Document'
 
-            elif msg_type == 'reaction':
-                rxn = msg.get('reaction', {})
-                emoji = rxn.get('emoji')
-                meta = {
-                    'message_id': rxn.get('message_id', ''),
-                    'emoji': emoji,
-                }
-                last_msg_text = f'Reacted {emoji}' if emoji else 'Removed reaction'
+                elif msg_type == 'audio':
+                    aud = msg.get('audio', {})
+                    raw_media = aud.get('url') or aud.get('id') or ''
+                    media_type_for_download = 'audio'
+                    media_url = ''
+                    meta = {
+                        'mime_type': aud.get('mime_type', ''),
+                        'sha256': aud.get('sha256', ''),
+                        'media_id': aud.get('id', ''),
+                        'voice': aud.get('voice', False),
+                    }
+                    last_msg_text = 'Mensaje de voz' if meta.get('voice') else 'Audio'
 
-            elif msg_type == 'edit':
-                edt = msg.get('edit', {})
-                meta = {
-                    'original_message_id': edt.get('original_message_id', ''),
-                    'new_message': edt.get('message', {}),
-                }
-                nm = edt.get('message', {})
-                nm_type = nm.get('type', '')
-                if nm_type == 'text' and isinstance(nm.get('text'), dict):
-                    last_msg_text = nm['text'].get('body', '') or 'Edited message'
-                elif nm_type in ('image', 'video'):
-                    last_msg_text = nm.get(nm_type, {}).get('caption', '') or f'Edited {nm_type}'
+                elif msg_type == 'location':
+                    loc = msg.get('location', {})
+                    content = loc.get('name') or loc.get('address', '')
+                    meta = {
+                        'latitude': loc.get('latitude'),
+                        'longitude': loc.get('longitude'),
+                        'name': loc.get('name', ''),
+                        'address': loc.get('address', ''),
+                        'url': loc.get('url', ''),
+                    }
+                    last_msg_text = content or 'Location'
+
+                elif msg_type == 'reaction':
+                    rxn = msg.get('reaction', {})
+                    emoji = rxn.get('emoji')
+                    target_wamid = rxn.get('message_id', '')
+                    meta = {
+                        'message_id': target_wamid,
+                        'emoji': emoji,
+                    }
+                    if target_wamid:
+                        target_msg = Message.objects.filter(
+                            conversation=conversation,
+                            whatsapp_message_id=target_wamid
+                        ).first()
+                        if target_msg:
+                            meta['target_message_id'] = target_msg.id
+                    last_msg_text = f'Reaccionó {emoji}' if emoji else 'Reacción eliminada'
+
+                elif msg_type == 'edit':
+                    edt = msg.get('edit', {})
+                    meta = {
+                        'original_message_id': edt.get('original_message_id', ''),
+                        'new_message': edt.get('message', {}),
+                    }
+                    nm = edt.get('message', {})
+                    nm_type = nm.get('type', '')
+                    if nm_type == 'text' and isinstance(nm.get('text'), dict):
+                        last_msg_text = nm['text'].get('body', '') or 'Edited message'
+                    elif nm_type in ('image', 'video'):
+                        last_msg_text = nm.get(nm_type, {}).get('caption', '') or f'Edited {nm_type}'
+                    else:
+                        last_msg_text = 'Edited message'
+
                 else:
-                    last_msg_text = 'Edited message'
+                    content = msg.get('text', {}).get('body', '') if isinstance(msg.get('text'), dict) else msg.get('text', '')
+                    last_msg_text = content or msg_type
 
-            else:
-                content = msg.get('text', {}).get('body', '') if isinstance(msg.get('text'), dict) else msg.get('text', '')
-                last_msg_text = content or msg_type
+                if hasattr(content, '__iter__') and not isinstance(content, str):
+                    content = str(content)
 
-            if hasattr(content, '__iter__') and not isinstance(content, str):
-                content = str(content)
+                context_message_obj = None
+                if 'context' in msg:
+                    meta['context'] = msg['context']
+                    ctx_wamid = msg['context'].get('id', '')
+                    if ctx_wamid:
+                        ctx_msg = Message.objects.filter(
+                            conversation=conversation,
+                            whatsapp_message_id=ctx_wamid,
+                        ).first()
+                        if ctx_msg:
+                            context_message_obj = ctx_msg
 
-            message = Message.objects.create(
-                conversation=conversation,
-                direction='inbound',
-                message_type=msg_type,
-                content=content,
-                sender_name=conversation.contact_name,
-                whatsapp_message_id=msg_id,
-                media_url=media_url,
-                metadata=meta,
-            )
+                message = Message.objects.create(
+                    conversation=conversation,
+                    direction='inbound',
+                    message_type=msg_type,
+                    content=content,
+                    sender_name=conversation.contact_name,
+                    whatsapp_message_id=msg_id,
+                    media_url=media_url,
+                    metadata=meta,
+                    context_message=context_message_obj,
+                )
 
-            conversation.last_message = last_msg_text
-            conversation.last_message_at = timezone.now()
-            conversation.save()
+                conversation.last_message = last_msg_text
+                conversation.last_message_at = timezone.now()
+                conversation.save()
 
-            publish_conversation_update(conversation, MessageSerializer(message).data)
+                publish_conversation_update(conversation, MessageSerializer(message).data)
 
-            if raw_media and media_type_for_download:
-                threading.Thread(target=download_media_async, args=(message.id, raw_media, media_type_for_download), daemon=True).start()
+                if raw_media and media_type_for_download:
+                    _download_pool.submit(download_media_async, message.id, raw_media, media_type_for_download)
 
             return JsonResponse({'status': 'received'}, status=200)
         except Exception:
@@ -696,7 +978,7 @@ def realtime_events(request):
     except Token.DoesNotExist:
         return HttpResponse(status=401)
 
-    subscriber_id, event_queue = subscribe()
+    subscriber_id, event_queue, _, _ = subscribe()
 
     def event_stream():
         try:
@@ -713,14 +995,24 @@ def realtime_events(request):
     response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
     response['Cache-Control'] = 'no-cache'
     response['X-Accel-Buffering'] = 'no'
+    origin = request.headers.get('Origin', '')
+    if origin in settings.CORS_ALLOWED_ORIGINS:
+        response['Access-Control-Allow-Origin'] = origin
     return response
 
 
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
 def media_proxy(request):
     """Proxy WhatsApp CDN media through our server to avoid CORS issues."""
     media_url = request.GET.get('url', '')
     if not media_url:
         return HttpResponse(status=400)
+
+    allowed_prefixes = ('https://lookaside.fbsbx.com/', 'https://media.whatsapp.net/')
+    if not media_url.startswith(allowed_prefixes):
+        return HttpResponse(status=403)
 
     token = settings.WHATSAPP_API_TOKEN
     if not token:
@@ -728,7 +1020,7 @@ def media_proxy(request):
 
     try:
         req = urllib.request.Request(media_url, headers={'Authorization': f'Bearer {token}'})
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             content_type = response.headers.get('Content-Type', 'application/octet-stream')
             data = response.read()
             return HttpResponse(data, content_type=content_type)
@@ -736,6 +1028,7 @@ def media_proxy(request):
         return HttpResponse(f'Proxy error: {e}', status=502)
 
 
+@cache_page(86400)
 def static_map(request):
     import math
     from PIL import Image, ImageDraw

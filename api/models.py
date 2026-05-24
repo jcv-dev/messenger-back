@@ -47,7 +47,7 @@ class Conversation(models.Model):
         choices=[('active', 'Active'), ('resolved', 'Resolved'), ('archived', 'Archived')],
         default='active'
     )
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -56,6 +56,10 @@ class Conversation(models.Model):
 
     class Meta:
         ordering = ['-last_message_at', '-created_at']
+        indexes = [
+            models.Index(fields=['status', 'last_message_at'], name='conv_status_lastmsg_idx'),
+            models.Index(fields=['whatsapp_id'], name='conv_waid_idx'),
+        ]
 
 
 class Message(models.Model):
@@ -75,12 +79,20 @@ class Message(models.Model):
     metadata = models.JSONField(null=True, blank=True, default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
+    context_message = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='replies'
+    )
 
     def __str__(self):
         return f"{self.conversation.contact_name} - {self.content[:50]}"
 
     class Meta:
         ordering = ['created_at']
+        indexes = [
+            models.Index(fields=['conversation', 'created_at'], name='msg_conv_created_idx'),
+            models.Index(fields=['conversation', 'is_read', 'direction'], name='msg_unread_idx'),
+        ]
 
 
 class ConversationTag(models.Model):

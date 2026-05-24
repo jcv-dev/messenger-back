@@ -1,11 +1,10 @@
 from django.core.management.base import BaseCommand
 from django.conf import settings
 from django.utils import timezone
-from django.db.models import Count
 from datetime import timedelta
 import os
 
-from api.models import Message, Conversation
+from api.models import Message
 
 
 class Command(BaseCommand):
@@ -41,16 +40,7 @@ class Command(BaseCommand):
 
         count, _ = expired.delete()
 
-        stale_convs = Conversation.objects.annotate(
-            remaining=Count('messages')
-        ).filter(
-            remaining=0,
-            last_message_at__lt=cutoff,
-        )
-        conv_count = stale_convs.count()
-        stale_convs.delete()
-
         self.stdout.write(self.style.SUCCESS(
-            f'Cleaned up {count} messages, {media_deleted} media files, {conv_count} empty conversations '
+            f'Cleaned up {count} messages, {media_deleted} media files '
             f'(retention: {retention}m, cutoff: {cutoff})'
         ))

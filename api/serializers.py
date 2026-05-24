@@ -3,8 +3,6 @@ Serializers for WhatsApp Messenger API
 """
 from rest_framework import serializers
 from django.contrib.auth.models import User
-from django.db.models import Q
-from django.utils import timezone
 from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset
 
 
@@ -105,9 +103,35 @@ class ConversationTakeSerializer(serializers.ModelSerializer):
 
 
 class MessageSerializer(serializers.ModelSerializer):
+    context_message_preview = serializers.SerializerMethodField()
+    context_message_id = serializers.SerializerMethodField()
+
     class Meta:
         model = Message
-        fields = ['id', 'direction', 'message_type', 'content', 'sender_name', 'whatsapp_message_id', 'media_url', 'metadata', 'created_at', 'is_read']
+        fields = [
+            'id', 'direction', 'message_type', 'content', 'sender_name',
+            'whatsapp_message_id', 'media_url', 'metadata', 'created_at',
+            'is_read', 'context_message_id', 'context_message_preview',
+        ]
+
+    def get_context_message_id(self, obj):
+        return obj.context_message_id
+
+    def get_context_message_preview(self, obj):
+        if not obj.context_message_id:
+            return None
+        try:
+            cm = obj.context_message
+            return {
+                'id': cm.id,
+                'content': cm.content,
+                'message_type': cm.message_type,
+                'sender_name': cm.sender_name,
+                'media_url': cm.media_url,
+                'created_at': cm.created_at,
+            }
+        except Exception:
+            return None
 
 
 class ConversationSerializer(serializers.ModelSerializer):
@@ -115,7 +139,6 @@ class ConversationSerializer(serializers.ModelSerializer):
     notes = ConversationNoteSerializer(many=True, read_only=True)
     active_notes = serializers.SerializerMethodField()
     active_take = serializers.SerializerMethodField()
-    messages = MessageSerializer(many=True, read_only=True)
     active_tags = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
 
@@ -124,28 +147,23 @@ class ConversationSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
             'last_message_at', 'status', 'tags', 'active_tags', 'notes',
-            'active_notes', 'active_take', 'messages', 'unread_count',
+            'active_notes', 'active_take', 'unread_count',
             'created_at', 'updated_at'
         ]
 
     def get_unread_count(self, obj):
+        if hasattr(obj, '_unread_count') and obj._unread_count is not None:
+            return obj._unread_count
         return obj.messages.filter(is_read=False, direction='inbound').count()
 
     def get_active_tags(self, obj):
-        """Get only non-expired tags"""
-        active_tags = obj.tags.filter(is_active=True).filter(
-            Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
-        )
-        return ConversationTagSerializer(active_tags, many=True).data
+        return ConversationTagSerializer(obj.tags.all(), many=True).data
 
     def get_active_notes(self, obj):
-        active_notes = obj.notes.filter(is_active=True).filter(
-            Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
-        )
-        return ConversationNoteSerializer(active_notes, many=True).data
+        return ConversationNoteSerializer(obj.notes.all(), many=True).data
 
     def get_active_take(self, obj):
-        take = obj.takes.filter(is_active=True, expires_at__gt=timezone.now()).order_by('-created_at').first()
+        take = obj.takes.all().first()
         return ConversationTakeSerializer(take).data if take else None
 
 
@@ -154,27 +172,38 @@ class ConversationListSerializer(serializers.ModelSerializer):
     active_tags = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
     active_take = serializers.SerializerMethodField()
+    last_message_sender = serializers.SerializerMethodField()
+    last_message_direction = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
         fields = [
             'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
-            'last_message_at', 'status', 'active_tags', 'active_take', 'unread_count', 'created_at'
+            'last_message_at', 'status', 'active_tags', 'active_take', 'unread_count', 'created_at',
+            'last_message_sender', 'last_message_direction',
         ]
 
     def get_active_take(self, obj):
-        take = obj.takes.filter(is_active=True, expires_at__gt=timezone.now()).order_by('-created_at').first()
+        take = obj.takes.all().first()
         return ConversationTakeSerializer(take).data if take else None
 
     def get_active_tags(self, obj):
-        from django.utils import timezone
-        active_tags = obj.tags.filter(is_active=True).filter(
-            Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
-        )
-        return ConversationTagSerializer(active_tags, many=True).data
+        return ConversationTagSerializer(obj.tags.all(), many=True).data
 
     def get_unread_count(self, obj):
+        if hasattr(obj, '_unread_count') and obj._unread_count is not None:
+            return obj._unread_count
         return obj.messages.filter(is_read=False, direction='inbound').count()
+
+    def get_last_message_sender(self, obj):
+        if hasattr(obj, '_last_msg_sender'):
+            return obj._last_msg_sender
+        return None
+
+    def get_last_message_direction(self, obj):
+        if hasattr(obj, '_last_msg_direction'):
+            return obj._last_msg_direction
+        return None
 
 
 class CreateConversationTagSerializer(serializers.Serializer):
@@ -203,6 +232,23 @@ class CreateConversationNoteSerializer(serializers.Serializer):
 
 class TakeConversationSerializer(serializers.Serializer):
     duration_minutes = serializers.IntegerField(required=False, default=30, min_value=1)
+
+
+class InitiateConversationSerializer(serializers.Serializer):
+    contact_phone = serializers.CharField(max_length=20)
+    contact_name = serializers.CharField(max_length=255)
+    content = serializers.CharField(max_length=5000)
+    message_type = serializers.ChoiceField(
+        choices=['text', 'image', 'video', 'audio', 'document', 'sticker'],
+        default='text',
+        required=False
+    )
+
+    def validate_contact_phone(self, value):
+        cleaned = value.strip().lstrip('+')
+        if not cleaned:
+            raise serializers.ValidationError("Phone number is required")
+        return cleaned
 
 
 class StickerAssetSerializer(serializers.ModelSerializer):

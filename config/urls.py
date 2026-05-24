@@ -9,7 +9,7 @@ from rest_framework.authtoken.views import obtain_auth_token
 from api.views import whatsapp_webhook, realtime_events
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path('manage/', admin.site.urls),
     path('api-auth/', obtain_auth_token, name='api_token_auth'),
     path('api/', include('api.urls')),
     path('api/events/', realtime_events, name='realtime_events'),

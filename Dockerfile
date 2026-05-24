@@ -11,6 +11,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+RUN python manage.py collectstatic --noinput
+
 EXPOSE 8000
 
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000"]
+CMD ["gunicorn", "config.asgi:application", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--workers", "4", "--thread-pool-size", "16", \
+     "--bind", "0.0.0.0:8000"]
