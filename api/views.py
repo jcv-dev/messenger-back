@@ -40,6 +40,7 @@ import logging
 from django.core.cache import cache
 
 from .realtime import publish, subscribe, unsubscribe
+from .rate_limiter import acquire as acquire_rate_capacity
 
 logger = logging.getLogger('api')
 
@@ -207,6 +208,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
 
             file_path = _resolve_media_path(content)
             if file_path:
+                acquire_rate_capacity(phone_number_id)
                 try:
                     media_id = upload_media_to_whatsapp(file_path, phone_number_id, token)
                 except urllib.error.HTTPError as e:
@@ -277,6 +279,8 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
 
         if context_wamid:
             payload['context'] = {"message_id": context_wamid}
+
+        acquire_rate_capacity(phone_number_id)
 
         body = json.dumps(payload).encode('utf-8')
         logger.info('WhatsApp outbound -> %s [%s]', contact_phone, message_type)
