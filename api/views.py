@@ -628,7 +628,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
             if message_type in ('image', 'sticker', 'video', 'audio', 'document') and content:
                 parsed = urllib.parse.urlparse(content)
-                if parsed.scheme or parsed.path.startswith('/media/'):
+                if parsed.scheme or parsed.path.startswith('/media/') or parsed.path.startswith('/api/media/'):
                     message.media_url = content
                     message.content = ''
                     message.save(update_fields=['media_url', 'content'])
