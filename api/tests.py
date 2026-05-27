@@ -662,7 +662,7 @@ class RealTimeSSETests(APITestCase):
 class RedisRealtimeModuleTests(SimpleTestCase):
     """Test realtime.py Redis pub/sub with mocked Redis."""
 
-    @patch('api.realtime._get_sync_redis')
+    @patch('api.realtime.get_sync_redis')
     def test_publish_sends_to_correct_channel(self, mock_get_redis):
         mock_redis = mock_get_redis.return_value
         from api.realtime import publish
@@ -675,7 +675,7 @@ class RedisRealtimeModuleTests(SimpleTestCase):
         self.assertIn('test', args[1])
         self.assertIn('_seq', args[1])
 
-    @patch('api.realtime._get_sync_redis')
+    @patch('api.realtime.get_sync_redis')
     def test_publish_adds_sequence_number(self, mock_get_redis):
         mock_redis = mock_get_redis.return_value
         from api.realtime import publish
@@ -688,7 +688,7 @@ class RedisRealtimeModuleTests(SimpleTestCase):
         payload = json.loads(args[1])
         self.assertGreaterEqual(payload['_seq'], before)
 
-    @patch('api.realtime._get_sync_redis')
+    @patch('api.realtime.get_sync_redis')
     def test_publish_handles_connection_error_gracefully(self, mock_get_redis):
         mock_redis = mock_get_redis.return_value
         mock_redis.publish.side_effect = ConnectionError('Redis down')
@@ -696,7 +696,7 @@ class RedisRealtimeModuleTests(SimpleTestCase):
 
         publish({'type': 'test'})
 
-    @patch('api.realtime._get_sync_redis')
+    @patch('api.realtime.get_sync_redis')
     def test_publish_serializes_non_json_values(self, mock_get_redis):
         mock_redis = mock_get_redis.return_value
         from datetime import datetime
@@ -1595,7 +1595,7 @@ class RateLimiterTests(SimpleTestCase):
     def setUp(self):
         self.phone_id = '1121790094350602'
 
-    @patch('api.rate_limiter._get_client')
+    @patch('api.rate_limiter.get_sync_redis')
     def test_acquire_under_threshold_proceeds(self, mock_get_client):
         mock_redis = MagicMock()
         mock_get_client.return_value = mock_redis
@@ -1608,7 +1608,7 @@ class RateLimiterTests(SimpleTestCase):
         mock_redis.expire.assert_called_once()
         mock_redis.decr.assert_not_called()
 
-    @patch('api.rate_limiter._get_client')
+    @patch('api.rate_limiter.get_sync_redis')
     def test_acquire_key_includes_phone_id(self, mock_get_client):
         mock_redis = MagicMock()
         mock_get_client.return_value = mock_redis
@@ -1621,7 +1621,7 @@ class RateLimiterTests(SimpleTestCase):
         self.assertIn(self.phone_id, key)
         self.assertTrue(key.startswith('wa_rate_limit:'))
 
-    @patch('api.rate_limiter._get_client')
+    @patch('api.rate_limiter.get_sync_redis')
     def test_acquire_sets_ttl(self, mock_get_client):
         mock_redis = MagicMock()
         mock_get_client.return_value = mock_redis
@@ -1632,7 +1632,7 @@ class RateLimiterTests(SimpleTestCase):
 
         mock_redis.expire.assert_called_once_with(mock_redis.incr.call_args[0][0], 2)
 
-    @patch('api.rate_limiter._get_client')
+    @patch('api.rate_limiter.get_sync_redis')
     def test_acquire_decr_on_over_threshold(self, mock_get_client):
         """When incr returns over threshold, decr is called and retry succeeds."""
         mock_redis = MagicMock()
@@ -1647,7 +1647,7 @@ class RateLimiterTests(SimpleTestCase):
         mock_redis.expire.assert_called()
 
     @patch('api.rate_limiter.time.sleep')
-    @patch('api.rate_limiter._get_client')
+    @patch('api.rate_limiter.get_sync_redis')
     def test_acquire_retries_after_sleep(self, mock_get_client, mock_sleep):
         """Over threshold triggers decr + sleep before retry."""
         mock_redis = MagicMock()
@@ -1661,7 +1661,7 @@ class RateLimiterTests(SimpleTestCase):
         mock_redis.decr.assert_called_once()
         mock_sleep.assert_called_once_with(0.05)
 
-    @patch('api.rate_limiter._get_client')
+    @patch('api.rate_limiter.get_sync_redis')
     def test_acquire_redis_error_fails_open(self, mock_get_client):
         mock_redis = MagicMock()
         mock_get_client.return_value = mock_redis

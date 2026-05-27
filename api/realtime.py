@@ -12,6 +12,8 @@ from typing import Any, Callable
 import redis.asyncio as aioredis
 from django.conf import settings
 
+from .redis_client import get_sync_redis, reset_sync_redis
+
 logger = logging.getLogger(__name__)
 
 REDIS_CHANNEL = "sse:events"
@@ -20,31 +22,19 @@ _next_seq = count(1)
 
 # --- sync publish (called from sync DRF views) ---
 
-_sync_redis = None
-
-
-def _get_sync_redis():
-    global _sync_redis
-    if _sync_redis is None:
-        import redis as sync_redis
-
-        _sync_redis = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
-    return _sync_redis
-
 
 def publish(event: dict[str, Any]) -> None:
-    global _sync_redis
     seq = next(_next_seq)
     event["_seq"] = seq
     payload = json.dumps(event, default=str)
     try:
-        _get_sync_redis().publish(REDIS_CHANNEL, payload)
+        get_sync_redis().publish(REDIS_CHANNEL, payload)
         logger.info("SSE published seq=%s type=%s", seq, event.get('type'))
     except Exception:
-        _sync_redis = None
+        reset_sync_redis()
         logger.warning("Redis publish failed, resetting client for retry")
         try:
-            _get_sync_redis().publish(REDIS_CHANNEL, payload)
+            get_sync_redis().publish(REDIS_CHANNEL, payload)
         except Exception:
             logger.exception("Failed to publish SSE event (retry)")
 

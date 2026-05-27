@@ -3,19 +3,9 @@
 import time
 import logging
 
-from django.conf import settings
-
 logger = logging.getLogger(__name__)
 
-_client = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        import redis as sync_redis
-        _client = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
-    return _client
+from .redis_client import get_sync_redis
 
 
 def acquire(phone_number_id, threshold=70, max_wait=30):
@@ -29,7 +19,7 @@ def acquire(phone_number_id, threshold=70, max_wait=30):
     through) so a Redis outage or sustained traffic spike never permanently
     blocks outbound messages.
     """
-    redis = _get_client()
+    redis = get_sync_redis()
     start = time.time()
 
     while True:
