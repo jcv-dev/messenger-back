@@ -3,3 +3,12 @@ name = "domi-messager-backend"
 version = "1.1.2"
 description = "Domi Messager Backend"
 requires-python = ">=3.12"
+
+[tool.bumpversion]
+current_version = "1.1.2"
+tag = true
+commit = true
+message = "Bump version: {current_version} → {new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"

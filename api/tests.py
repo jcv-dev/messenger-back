@@ -1322,7 +1322,34 @@ class StaticMapAuthTests(APITestCase):
 # ── Serve Media ──────────────────────────────────────────────────────────────
 
 class ServeMediaTests(APITestCase):
-    """Signed media URL expiry and path traversal protection."""
+    """Signed media URL serving, MIME types, Content-Disposition, and path traversal protection."""
+
+    def setUp(self):
+        import os, tempfile
+        from django.conf import settings
+        self.media_dir = tempfile.mkdtemp(dir=settings.MEDIA_ROOT)
+        self.pdf_path = os.path.join(self.media_dir, 'test.pdf')
+        with open(self.pdf_path, 'wb') as f:
+            f.write(b'%PDF-1.4 fake pdf content')
+        self.txt_path = os.path.join(self.media_dir, 'test.txt')
+        with open(self.txt_path, 'w') as f:
+            f.write('plain text')
+        self.rel_pdf = os.path.relpath(self.pdf_path, settings.MEDIA_ROOT)
+        self.rel_txt = os.path.relpath(self.txt_path, settings.MEDIA_ROOT)
+
+    def tearDown(self):
+        import os, shutil
+        shutil.rmtree(self.media_dir, ignore_errors=True)
+
+    def _signed_url(self, path, ts=None):
+        import time
+        from django.core.signing import Signer
+        signer = Signer(salt='domi-media')
+        if ts is None:
+            ts = int(time.time())
+        signed = signer.sign(f'{path}|{ts}')
+        sig_val = signed.rsplit(':', 1)[1]
+        return f'/api/media/{path}?sig={sig_val}&t={ts}'
 
     def test_missing_signature_returns_404(self):
         response = self.client.get('/api/media/test.jpg')
@@ -1347,6 +1374,96 @@ class ServeMediaTests(APITestCase):
         sig_val = signed.rsplit(':', 1)[1]
         response = self.client.get(f'/api/media//etc/passwd?sig={sig_val}&t=1000000')
         self.assertEqual(response.status_code, 404)
+
+    def test_expired_signature_returns_404(self):
+        import time
+        ts = int(time.time()) - 7200
+        url = self._signed_url(self.rel_pdf, ts=ts)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+
+    def test_bad_signature_returns_404(self):
+        url = f'/api/media/{self.rel_pdf}?sig=invalid&t=1000000'
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(DEBUG=True)
+    def test_pdf_returns_application_pdf(self):
+        response = self.client.get(self._signed_url(self.rel_pdf))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/pdf')
+
+    @override_settings(DEBUG=True)
+    def test_txt_returns_text_plain(self):
+        response = self.client.get(self._signed_url(self.rel_txt))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('text/plain', response['Content-Type'])
+
+    def test_pdf_has_content_disposition_inline(self):
+        response = self.client.get(self._signed_url(self.rel_pdf))
+        self.assertTrue(response.has_header('Content-Disposition'))
+        self.assertIn('inline', response['Content-Disposition'])
+        self.assertIn('filename="test.pdf"', response['Content-Disposition'])
+
+    def test_txt_has_content_disposition_attachment(self):
+        response = self.client.get(self._signed_url(self.rel_txt))
+        self.assertTrue(response.has_header('Content-Disposition'))
+        self.assertIn('attachment', response['Content-Disposition'])
+
+    def test_xlsx_has_content_disposition_attachment(self):
+        import os
+        xlsx_path = os.path.join(self.media_dir, 'test.xlsx')
+        with open(xlsx_path, 'wb') as f:
+            f.write(b'fake excel')
+        rel = os.path.relpath(xlsx_path, settings.MEDIA_ROOT)
+        response = self.client.get(self._signed_url(rel))
+        self.assertTrue(response.has_header('Content-Disposition'))
+        self.assertIn('attachment', response['Content-Disposition'])
+
+    def test_docx_has_content_disposition_attachment(self):
+        import os
+        docx_path = os.path.join(self.media_dir, 'test.docx')
+        with open(docx_path, 'wb') as f:
+            f.write(b'fake word doc')
+        rel = os.path.relpath(docx_path, settings.MEDIA_ROOT)
+        response = self.client.get(self._signed_url(rel))
+        self.assertTrue(response.has_header('Content-Disposition'))
+        self.assertIn('attachment', response['Content-Disposition'])
+
+    def test_file_not_found_returns_404(self):
+        url = self._signed_url('uploads/documents/nonexistent.pdf')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(DEBUG=True)
+    def test_mime_fallback_for_unknown_extension(self):
+        import os
+        unknown_path = os.path.join(self.media_dir, 'test.qwertyuiop')
+        with open(unknown_path, 'w') as f:
+            f.write('unknown')
+        rel = os.path.relpath(unknown_path, settings.MEDIA_ROOT)
+        response = self.client.get(self._signed_url(rel))
+        self.assertEqual(response['Content-Type'], 'application/octet-stream')
+
+    @override_settings(DEBUG=True)
+    def test_pdf_content_is_served(self):
+        response = self.client.get(self._signed_url(self.rel_pdf))
+        self.assertEqual(response.status_code, 200)
+        content = b''.join(response.streaming_content)
+        self.assertEqual(content, b'%PDF-1.4 fake pdf content')
+
+    @override_settings(DEBUG=False)
+    def test_production_returns_accel_redirect(self):
+        response = self.client.get(self._signed_url(self.rel_pdf))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('X-Accel-Redirect', response)
+        self.assertIn('/internal-media/', response['X-Accel-Redirect'])
+
+    @override_settings(DEBUG=False)
+    def test_production_accel_has_content_disposition(self):
+        response = self.client.get(self._signed_url(self.rel_pdf))
+        self.assertTrue(response.has_header('Content-Disposition'))
+        self.assertIn('inline', response['Content-Disposition'])
 
 
 # ── CORS Headers ─────────────────────────────────────────────────────────────
