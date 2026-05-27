@@ -617,6 +617,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 message_type=message_type,
                 content=content,
                 sender_name=data.get('sender_name', request.user.get_full_name() or request.user.username),
+                sender=request.user if direction == 'outbound' else None,
                 context_message=context_msg,
                 metadata=metadata,
             )
@@ -740,6 +741,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             message_type=message_type,
             content=content,
             sender_name=request.user.get_full_name() or request.user.username,
+            sender=request.user,
         )
 
         if message_type in ('image', 'sticker', 'video', 'audio', 'document') and content:

@@ -187,9 +187,11 @@ class SerializerStructureTests(SimpleTestCase):
                         f"{name} uses fields = '__all__'",
                     )
 
-    def test_message_serializer_has_context_preview(self):
+    def test_message_serializer_has_required_fields(self):
         self.assertIn('context_message_preview', MessageSerializer.Meta.fields)
         self.assertIn('context_message_id', MessageSerializer.Meta.fields)
+        self.assertIn('sender', MessageSerializer.Meta.fields)
+        self.assertIn('sender_detail', MessageSerializer.Meta.fields)
 
 
 # ── Conversation ViewSet ────────────────────────────────────────────────────
@@ -445,6 +447,26 @@ class MessageViewSetTests(APITestCase):
         qs = MessageViewSet().get_queryset()
         str_qs = str(qs.query)
         self.assertIn('INNER JOIN', str_qs)
+
+    def test_create_outbound_message_sets_sender(self):
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Agent message'},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['sender'], self.user.id)
+        self.assertIsNotNone(response.data['sender_detail'])
+        self.assertEqual(response.data['sender_detail']['first_name'], self.user.first_name)
+        self.assertEqual(response.data['sender_detail']['username'], self.user.username)
+
+    def test_create_outbound_with_sender_name_falls_back_to_user(self):
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'No name sent'},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        msg = Message.objects.get(content='No name sent')
+        self.assertEqual(msg.sender, self.user)
 
 
 # ── Model logic ─────────────────────────────────────────────────────────────
@@ -838,6 +860,8 @@ class WebhookTests(APITestCase):
         conv = Conversation.objects.get(whatsapp_id='15551112222')
         self.assertIsNotNone(conv.group)
         self.assertTrue(Message.objects.filter(content='Hello from WhatsApp').exists())
+        msg = Message.objects.get(content='Hello from WhatsApp')
+        self.assertIsNone(msg.sender)
 
     def test_old_message_does_not_overwrite_last_message(self):
         """An older webhook message arriving late should not overwrite last_message."""
@@ -1412,6 +1436,7 @@ class InitiateConversationTests(APITestCase):
         msg = Message.objects.filter(content='First!').first()
         self.assertIsNotNone(msg)
         self.assertEqual(msg.direction, 'outbound')
+        self.assertEqual(msg.sender, self.user)
 
     def test_initiate_rejects_missing_phone(self):
         response = self.client.post(
@@ -1449,6 +1474,8 @@ class ContextualReplyTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['context_message_id'], self.original.id)
         self.assertIsNotNone(response.data['context_message_preview'])
+        self.assertEqual(response.data['sender'], self.user.id)
+        self.assertIsNotNone(response.data['sender_detail'])
 
     def test_reply_preview_includes_content(self):
         response = self.client.post(

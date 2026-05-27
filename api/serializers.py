@@ -168,11 +168,13 @@ class MessageSerializer(serializers.ModelSerializer):
     context_message_preview = serializers.SerializerMethodField()
     context_message_id = serializers.SerializerMethodField()
     media_url = serializers.SerializerMethodField()
+    sender_detail = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
-            'id', 'direction', 'message_type', 'content', 'sender_name',
+            'id', 'direction', 'message_type', 'content', 'sender_name', 'sender',
+            'sender_detail',
             'whatsapp_message_id', 'media_url', 'metadata', 'created_at',
             'is_read', 'context_message_id', 'context_message_preview',
         ]
@@ -198,6 +200,15 @@ class MessageSerializer(serializers.ModelSerializer):
 
     def get_media_url(self, obj):
         return sign_media_url(obj.media_url)
+
+    def get_sender_detail(self, obj):
+        if not obj.sender_id:
+            return None
+        return {
+            'id': obj.sender_id,
+            'first_name': obj.sender.first_name,
+            'username': obj.sender.username,
+        }
 
 
 class ConversationSerializer(serializers.ModelSerializer):

@@ -117,6 +117,7 @@ class Message(models.Model):
     message_type = models.CharField(max_length=50, default='text')  # text, image, video, audio, location, reaction, edit, document, sticker
     content = models.TextField(blank=True, default='')
     sender_name = models.CharField(max_length=255, blank=True)
+    sender = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='messages')
     whatsapp_message_id = models.CharField(max_length=255, null=True, blank=True)
     media_url = models.URLField(max_length=2000, null=True, blank=True)
     metadata = models.JSONField(null=True, blank=True, default=dict)

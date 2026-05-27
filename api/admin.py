@@ -14,7 +14,7 @@ class ConversationAdmin(admin.ModelAdmin):
 
 @admin.register(Message)
 class MessageAdmin(admin.ModelAdmin):
-    list_display = ['conversation', 'direction', 'created_at', 'is_read']
+    list_display = ['conversation', 'direction', 'sender', 'created_at', 'is_read']
     list_filter = ['direction', 'is_read', 'created_at']
     search_fields = ['content', 'conversation__contact_name']
 
