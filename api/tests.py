@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from django.db import IntegrityError
 from django.test import SimpleTestCase, override_settings
@@ -1585,3 +1585,87 @@ class WebhookHMACTests(APITestCase):
                 HTTP_X_HUB_SIGNATURE_256='sha256=' + 'f' * 64,
             )
         self.assertEqual(response.status_code, 403)
+
+
+# ── WhatsApp Rate Limiter ────────────────────────────────────────────────────
+
+class RateLimiterTests(SimpleTestCase):
+    """Unit tests for rate_limiter.py Redis sliding-window rate limiter."""
+
+    def setUp(self):
+        self.phone_id = '1121790094350602'
+
+    @patch('api.rate_limiter._get_client')
+    def test_acquire_under_threshold_proceeds(self, mock_get_client):
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.return_value = 1
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
+
+        mock_redis.incr.assert_called_once()
+        mock_redis.expire.assert_called_once()
+        mock_redis.decr.assert_not_called()
+
+    @patch('api.rate_limiter._get_client')
+    def test_acquire_key_includes_phone_id(self, mock_get_client):
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.return_value = 1
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
+
+        key = mock_redis.incr.call_args[0][0]
+        self.assertIn(self.phone_id, key)
+        self.assertTrue(key.startswith('wa_rate_limit:'))
+
+    @patch('api.rate_limiter._get_client')
+    def test_acquire_sets_ttl(self, mock_get_client):
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.return_value = 1
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
+
+        mock_redis.expire.assert_called_once_with(mock_redis.incr.call_args[0][0], 2)
+
+    @patch('api.rate_limiter._get_client')
+    def test_acquire_decr_on_over_threshold(self, mock_get_client):
+        """When incr returns over threshold, decr is called and retry succeeds."""
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.side_effect = [71, 1]
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
+
+        self.assertEqual(mock_redis.incr.call_count, 2)
+        mock_redis.decr.assert_called_once()
+        mock_redis.expire.assert_called()
+
+    @patch('api.rate_limiter.time.sleep')
+    @patch('api.rate_limiter._get_client')
+    def test_acquire_retries_after_sleep(self, mock_get_client, mock_sleep):
+        """Over threshold triggers decr + sleep before retry."""
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.side_effect = [71, 1]
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
+
+        self.assertEqual(mock_redis.incr.call_count, 2)
+        mock_redis.decr.assert_called_once()
+        mock_sleep.assert_called_once_with(0.05)
+
+    @patch('api.rate_limiter._get_client')
+    def test_acquire_redis_error_fails_open(self, mock_get_client):
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.side_effect = ConnectionError('Redis down')
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
