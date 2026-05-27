@@ -1,5 +1,6 @@
 import asyncio
 from unittest.mock import patch, MagicMock
+from urllib.parse import quote
 
 from django.db import IntegrityError
 from django.test import SimpleTestCase, override_settings
@@ -1060,6 +1061,45 @@ class MediaProxyTests(APITestCase):
         response = self.client.get('/api/media-proxy/?url=https://evil.com/hack')
         self.assertEqual(response.status_code, 403)
 
+    def test_signed_url_allows_without_auth(self):
+        """A valid signed URL passes auth (proxy step fails due to no API token in test)."""
+        import time
+        from api.serializers import media_proxy_signer
+        cdn_url = 'https://lookaside.fbsbx.com/test123'
+        ts = int(time.time())
+        signed = media_proxy_signer.sign(f'{cdn_url}|{ts}')
+        sig_val = signed.rsplit(media_proxy_signer.sep, 1)[1]
+        encoded = quote(cdn_url, safe='')
+        url = f'/api/media-proxy/?url={encoded}&sig={sig_val}&t={ts}'
+        response = self.client.get(url)
+        self.assertNotEqual(response.status_code, 401)
+        self.assertNotEqual(response.status_code, 403)
+
+    def test_signed_url_expired_returns_401_or_500(self):
+        """An expired signature falls back to token auth, which fails without token."""
+        import time
+        from api.serializers import media_proxy_signer
+        cdn_url = 'https://lookaside.fbsbx.com/test123'
+        ts = int(time.time()) - 7200
+        signed = media_proxy_signer.sign(f'{cdn_url}|{ts}')
+        sig_val = signed.rsplit(media_proxy_signer.sep, 1)[1]
+        encoded = quote(cdn_url, safe='')
+        url = f'/api/media-proxy/?url={encoded}&sig={sig_val}&t={ts}'
+        response = self.client.get(url)
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_signed_url_wrong_sig_returns_401(self):
+        """An invalid signature falls back to token auth, which fails without token."""
+        encoded = quote('https://lookaside.fbsbx.com/test', safe='')
+        url = f'/api/media-proxy/?url={encoded}&sig=invalid&t=1000000'
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 401)
+
+    def test_unsigned_still_requires_auth(self):
+        """Without a signature, falls back to token auth."""
+        response = self.client.get('/api/media-proxy/?url=https://lookaside.fbsbx.com/test')
+        self.assertEqual(response.status_code, 401)
+
 
 # ── User ViewSet ────────────────────────────────────────────────────────────
 
@@ -1669,3 +1709,16 @@ class RateLimiterTests(SimpleTestCase):
 
         from api.rate_limiter import acquire
         acquire(self.phone_id)
+
+    @override_settings(WA_RATE_LIMIT_THRESHOLD=5)
+    @patch('api.rate_limiter.get_sync_redis')
+    def test_acquire_uses_setting_default(self, mock_get_client):
+        """When threshold is not passed, it reads from WA_RATE_LIMIT_THRESHOLD."""
+        mock_redis = MagicMock()
+        mock_get_client.return_value = mock_redis
+        mock_redis.incr.side_effect = [6, 1]
+
+        from api.rate_limiter import acquire
+        acquire(self.phone_id)
+
+        mock_redis.decr.assert_called_once()
