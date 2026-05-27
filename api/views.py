@@ -1277,16 +1277,43 @@ def serve_media(request, path):
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return HttpResponseNotFound()
 
+    content_type, _ = mimetypes.guess_type(file_path)
+    if content_type is None:
+        MIME_OVERRIDES = {
+            '.pdf': 'application/pdf',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.mp4': 'video/mp4',
+            '.mp3': 'audio/mpeg',
+            '.wav': 'audio/wav',
+            '.ogg': 'audio/ogg',
+            '.doc': 'application/msword',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.xls': 'application/vnd.ms-excel',
+            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        }
+        _, ext = os.path.splitext(file_path)
+        content_type = MIME_OVERRIDES.get(ext.lower(), 'application/octet-stream')
+
+    filename = os.path.basename(file_path)
+
+    if content_type.startswith(('image/', 'video/', 'audio/')) or content_type == 'application/pdf':
+        disposition = 'inline'
+    else:
+        disposition = 'attachment'
+
     if settings.DEBUG:
-        content_type, _ = mimetypes.guess_type(file_path)
-        if content_type is None:
-            content_type = 'application/octet-stream'
         response = FileResponse(open(file_path, 'rb'), content_type=content_type)
+        response['Content-Disposition'] = f'{disposition}; filename="{filename}"'
         response['Cache-Control'] = 'private, max-age=86400, immutable'
         return response
 
     response = HttpResponse()
     response['X-Accel-Redirect'] = f'/internal-media/{path}'
+    response['Content-Disposition'] = f'{disposition}; filename="{filename}"'
     return response
 
 
