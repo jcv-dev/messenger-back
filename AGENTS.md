@@ -71,5 +71,5 @@ The project overrides Django's built-in `auth` migrations via `MIGRATION_MODULES
 - The router in `api/urls.py` uses `DefaultRouter`; custom detail actions (add_tag, add_note, messages, etc.) are defined via `@action` decorators on `ConversationViewSet`.
 - Sticker and User resources require `IsAdminUser` for write operations, `IsAuthenticated` for reads.
 - Dev server serves media files from `MEDIA_ROOT=media/` when `DEBUG=True` (via `static()` in `config/urls.py`).
-- Production uses gunicorn with `--worker-class gthread --threads 4` (gthread workers needed because views spawn daemon threads).
+- Production uses uvicorn with `--workers 2` (multi-process). Redis-backed pub/sub handles SSE broadcasting across workers.
 - Dockerfile uses Python 3.10-slim (narrower than `.python-version`'s 3.12.13).

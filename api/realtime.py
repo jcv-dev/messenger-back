@@ -1,65 +1,120 @@
-"""In-process realtime event broadcaster for SSE clients."""
+"""Redis-backed realtime event broadcaster for SSE clients."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-import queue
-import threading
+import logging
+import uuid
 from itertools import count
 from typing import Any, Callable
 
+import redis.asyncio as aioredis
+from django.conf import settings
 
-_lock = threading.Lock()
-_next_id = count(1)
+logger = logging.getLogger(__name__)
+
+REDIS_CHANNEL = "sse:events"
+
 _next_seq = count(1)
-_subscribers: dict[int, dict[str, Any]] = {}
+
+# --- sync publish (called from sync DRF views) ---
+
+_sync_redis = None
 
 
-def _current_seq() -> int:
-    return next(_next_seq) - 1
+def _get_sync_redis():
+    global _sync_redis
+    if _sync_redis is None:
+        import redis as sync_redis
+
+        _sync_redis = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return _sync_redis
 
 
-def subscribe() -> tuple[int, queue.Queue[str], Callable[[], bool], Callable[[], None]]:
-    subscriber_id = next(_next_id)
-    event_queue: queue.Queue[str] = queue.Queue(maxsize=1000)
-    state = {'queue': event_queue, 'missed': False}
-    with _lock:
+def publish(event: dict[str, Any]) -> None:
+    global _sync_redis
+    seq = next(_next_seq)
+    event["_seq"] = seq
+    payload = json.dumps(event, default=str)
+    try:
+        _get_sync_redis().publish(REDIS_CHANNEL, payload)
+        logger.info("SSE published seq=%s type=%s", seq, event.get('type'))
+    except Exception:
+        _sync_redis = None
+        logger.warning("Redis publish failed, resetting client for retry")
+        try:
+            _get_sync_redis().publish(REDIS_CHANNEL, payload)
+        except Exception:
+            logger.exception("Failed to publish SSE event (retry)")
+
+
+# --- async subscribe/unsubscribe (called from async SSE view) ---
+
+_subscribers: dict[str, dict[str, Any]] = {}
+_lock = asyncio.Lock()
+
+
+async def subscribe() -> (
+    tuple[str, asyncio.Queue[str], Callable[[], bool], Callable[[], None]]
+):
+    subscriber_id = str(uuid.uuid4())
+    event_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
+
+    redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(REDIS_CHANNEL)
+
+    state: dict[str, Any] = {
+        "queue": event_queue,
+        "pubsub": pubsub,
+        "redis": redis,
+        "missed": False,
+    }
+
+    async with _lock:
         _subscribers[subscriber_id] = state
 
+    async def bridge():
+        try:
+            async for message in pubsub.listen():
+                if message["type"] == "message":
+                    try:
+                        event_queue.put_nowait(message["data"])
+                    except asyncio.QueueFull:
+                        async with _lock:
+                            sub = _subscribers.get(subscriber_id)
+                            if sub:
+                                sub["missed"] = True
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("SSE bridge error for %s", subscriber_id)
+
+    task = asyncio.create_task(bridge())
+    state["task"] = task
+
     def check_missed() -> bool:
-        with _lock:
-            sub = _subscribers.get(subscriber_id)
-            return sub['missed'] if sub else False
+        return state.get("missed", False)
 
     def clear_missed() -> None:
-        with _lock:
-            sub = _subscribers.get(subscriber_id)
-            if sub:
-                sub['missed'] = False
+        state["missed"] = False
 
     return subscriber_id, event_queue, check_missed, clear_missed
 
 
-def unsubscribe(subscriber_id: int) -> None:
-    with _lock:
-        _subscribers.pop(subscriber_id, None)
-
-
-def publish(event: dict[str, Any]) -> None:
-    seq = next(_next_seq)
-    event['_seq'] = seq
-    payload = json.dumps(event, default=str)
-    with _lock:
-        subscribers = list(_subscribers.items())
-
-    for sub_id, state in subscribers:
+async def unsubscribe(subscriber_id: str) -> None:
+    async with _lock:
+        state = _subscribers.pop(subscriber_id, None)
+    if state:
+        state["task"].cancel()
         try:
-            state['queue'].put_nowait(payload)
-        except queue.Full:
-            with _lock:
-                if sub_id in _subscribers:
-                    _subscribers[sub_id]['missed'] = True
+            await state["pubsub"].unsubscribe(REDIS_CHANNEL)
+            await state["pubsub"].close()
+            await state["redis"].aclose()
+        except Exception:
+            logger.exception("Error closing subscriber %s", subscriber_id)
 
 
 def get_last_seq() -> int:
-    return _current_seq()
+    return next(_next_seq) - 1

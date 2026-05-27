@@ -2,7 +2,12 @@
 Models for WhatsApp Messenger API
 """
 from django.db import models
+from django.db.models import Q
 from django.contrib.auth.models import User
+from django.utils import timezone
+from datetime import timedelta
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils import timezone
 from datetime import timedelta
 
@@ -33,6 +38,40 @@ def get_expiry_datetime(expiry_type, custom_minutes=None):
     return now + timedelta(hours=1)
 
 
+class CityGroup(models.Model):
+    """City/group for routing conversations to agents."""
+    name = models.CharField(max_length=255, unique=True)
+    slug = models.SlugField(max_length=255, unique=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+    class Meta:
+        ordering = ['name']
+        verbose_name = "City Group"
+        verbose_name_plural = "City Groups"
+
+
+class UserProfile(models.Model):
+    """Profile extending User with city group assignment."""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    group = models.ForeignKey(
+        CityGroup, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='members',
+    )
+
+    def __str__(self):
+        return f"{self.user.username} → {self.group.name if self.group else 'No group'}"
+
+
+@receiver(post_save, sender=User)
+def create_user_profile(sender, instance, created, **kwargs):
+    if created:
+        UserProfile.objects.get_or_create(user=instance)
+
+
 class Conversation(models.Model):
     """WhatsApp conversation/chat"""
     whatsapp_id = models.CharField(max_length=255, unique=True)
@@ -42,6 +81,10 @@ class Conversation(models.Model):
     custom_name = models.CharField(max_length=255, null=True, blank=True)
     last_message = models.TextField(blank=True)
     last_message_at = models.DateTimeField(null=True, blank=True)
+    group = models.ForeignKey(
+        CityGroup, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='conversations',
+    )
     status = models.CharField(
         max_length=20,
         choices=[('active', 'Active'), ('resolved', 'Resolved'), ('archived', 'Archived')],
@@ -88,10 +131,17 @@ class Message(models.Model):
         return f"{self.conversation.contact_name} - {self.content[:50]}"
 
     class Meta:
-        ordering = ['created_at']
+        ordering = ['created_at', 'id']
         indexes = [
             models.Index(fields=['conversation', 'created_at'], name='msg_conv_created_idx'),
             models.Index(fields=['conversation', 'is_read', 'direction'], name='msg_unread_idx'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['whatsapp_message_id'],
+                name='unique_whatsapp_message_id',
+                condition=Q(whatsapp_message_id__isnull=False),
+            ),
         ]
 
 
@@ -109,8 +159,6 @@ class ConversationTag(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_tags')
     
-    is_active = models.BooleanField(default=True)
-
     def __str__(self):
         return f"{self.tag_name} - {self.conversation.contact_name}"
 
@@ -147,8 +195,7 @@ class ConversationNote(models.Model):
     expires_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_notes')
-    is_active = models.BooleanField(default=True)
-
+    
     def __str__(self):
         return f"Note - {self.conversation.contact_name}"
 
@@ -181,8 +228,7 @@ class ConversationTake(models.Model):
     duration_minutes = models.PositiveIntegerField(default=30)
     expires_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
-    is_active = models.BooleanField(default=True)
-
+    
     def __str__(self):
         return f"Taken - {self.conversation.contact_name}"
 
@@ -217,3 +263,15 @@ class StickerAsset(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+
+class SSEToken(models.Model):
+    """Short-lived one-time token for SSE connections."""
+    key = models.CharField(max_length=64, unique=True, db_index=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False)
+
+    def is_valid(self):
+        return not self.used and self.expires_at > timezone.now()

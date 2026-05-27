@@ -1,0 +1,12 @@
+.git
+venv/
+.env
+media/
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+docker-compose*
+*.md
+test_*.py
+nginx.conf
