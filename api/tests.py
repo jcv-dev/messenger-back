@@ -389,6 +389,25 @@ class ConversationStickerTests(APITestCase):
         self.assertEqual(response.data['message_type'], 'sticker')
         self.assertNotEqual(response.data['message_type'], 'image')
 
+    def test_sticker_with_api_media_url_sets_media_url(self):
+        """Sticker sent with /api/media/ URL should set media_url and clear content."""
+        conv = Conversation.objects.create(
+            whatsapp_id='15559999001', contact_name='Sticker Media Test', contact_phone='15559999001',
+            group=self.group,
+        )
+        response = self.client.post(
+            f'/api/conversations/{conv.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'sticker',
+             'content': '/api/media/stickers/2024/01/test.webp?sig=abc&t=123'},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['message_type'], 'sticker')
+        self.assertIsNotNone(response.data.get('media_url'))
+        self.assertNotEqual(response.data.get('media_url'), '')
+        msg = Message.objects.get(id=response.data['id'])
+        self.assertEqual(msg.media_url, '/api/media/stickers/2024/01/test.webp?sig=abc&t=123')
+        self.assertEqual(msg.content, '')
+
 
 class ConversationWriteTransactionTests(APITestCase):
     """Verify transactional integrity of write endpoints."""
