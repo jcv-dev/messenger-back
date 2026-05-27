@@ -9,4 +9,3 @@ __pycache__/
 docker-compose*
 *.md
 test_*.py
-nginx.conf
