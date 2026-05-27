@@ -164,6 +164,7 @@ WHATSAPP_PHONE_NUMBER = config('WHATSAPP_PHONE_NUMBER', default='')
 WHATSAPP_PHONE_NUMBER_ID = config('WHATSAPP_PHONE_NUMBER_ID', default='')
 WEBHOOK_TOKEN = config('WEBHOOK_TOKEN', default='')
 WHATSAPP_APP_SECRET = config('WHATSAPP_APP_SECRET', default='')
+WA_RATE_LIMIT_THRESHOLD = config('WA_RATE_LIMIT_THRESHOLD', default=70, cast=int)
 
 # Message retention in minutes — messages and their media files older than this are deleted
 MESSAGE_RETENTION_MINUTES = config('MESSAGE_RETENTION_MINUTES', default=0, cast=int)

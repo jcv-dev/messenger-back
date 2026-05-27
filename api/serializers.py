@@ -3,6 +3,7 @@ Serializers for WhatsApp Messenger API
 """
 import re
 import time
+import urllib.parse
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
@@ -10,27 +11,41 @@ from django.core.signing import Signer, BadSignature
 from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup
 
 media_signer = Signer(salt='domi-media')
+media_proxy_signer = Signer(salt='domi-media-proxy')
 
 
 def sign_media_url(url):
     """Sign a media URL so it can be served without exposing the auth token.
-    Returns a URL like /api/media/<path>?sig=<signature>&t=<timestamp>.
-    Handles /media/... paths and http://host/media/... legacy URLs.
+    Returns a signed URL like /api/media/<path>?sig=... for local files,
+    or /api/media-proxy/?url=...&sig=... for WhatsApp CDN URLs.
     Signature includes a Unix timestamp — expires after 1 hour."""
     if not url:
         return url
+
     if url.startswith('/media/'):
         path = url[len('/media/'):]
-    else:
-        m = re.match(r'^https?://[^/]+/media/(.+)$', url)
-        if m:
-            path = m.group(1)
-        else:
-            return url
-    ts = int(time.time())
-    signed = media_signer.sign(f'{path}|{ts}')
-    sig_val = signed.rsplit(':', 1)[1]
-    return f'/api/media/{path}?sig={sig_val}&t={ts}'
+        ts = int(time.time())
+        signed = media_signer.sign(f'{path}|{ts}')
+        sig_val = signed.rsplit(':', 1)[1]
+        return f'/api/media/{path}?sig={sig_val}&t={ts}'
+
+    m = re.match(r'^https?://[^/]+/media/(.+)$', url)
+    if m:
+        path = m.group(1)
+        ts = int(time.time())
+        signed = media_signer.sign(f'{path}|{ts}')
+        sig_val = signed.rsplit(':', 1)[1]
+        return f'/api/media/{path}?sig={sig_val}&t={ts}'
+
+    # WhatsApp CDN URLs → signed media-proxy URL
+    if 'lookaside.fbsbx.com' in url or 'media.whatsapp.net' in url:
+        ts = int(time.time())
+        signed = media_proxy_signer.sign(f'{url}|{ts}')
+        sig_val = signed.rsplit(media_proxy_signer.sep, 1)[1]
+        encoded = urllib.parse.quote(url, safe='')
+        return f'/api/media-proxy/?url={encoded}&sig={sig_val}&t={ts}'
+
+    return url
 
 
 class CityGroupSerializer(serializers.ModelSerializer):

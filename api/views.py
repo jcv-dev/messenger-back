@@ -1290,11 +1290,10 @@ def serve_media(request, path):
     return response
 
 
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication])
-@permission_classes([IsAuthenticated])
+@csrf_exempt
 def media_proxy(request):
-    """Proxy WhatsApp CDN media through our server to avoid CORS issues."""
+    """Proxy WhatsApp CDN media through our server to avoid CORS issues.
+    Authenticates via signed URL (sig + t params) or falls back to token auth."""
     media_url = request.GET.get('url', '')
     if not media_url:
         return HttpResponse(status=400)
@@ -1302,6 +1301,32 @@ def media_proxy(request):
     allowed_prefixes = ('https://lookaside.fbsbx.com/', 'https://media.whatsapp.net/')
     if not media_url.startswith(allowed_prefixes):
         return HttpResponse(status=403)
+
+    sig = request.GET.get('sig')
+    ts_param = request.GET.get('t')
+
+    authenticated = False
+    if sig and ts_param:
+        from api.serializers import media_proxy_signer
+        try:
+            media_proxy_signer.unsign(f'{media_url}|{ts_param}:{sig}')
+            age = int(time.time()) - int(ts_param)
+            if 0 <= age <= 3600:
+                authenticated = True
+        except (BadSignature, ValueError):
+            pass
+
+    if not authenticated:
+        try:
+            auth = TokenAuthentication()
+            result = auth.authenticate(request)
+            if result is not None:
+                authenticated = True
+        except Exception:
+            pass
+
+    if not authenticated:
+        return HttpResponse(status=401)
 
     token = settings.WHATSAPP_API_TOKEN
     if not token:

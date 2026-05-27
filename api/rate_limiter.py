@@ -3,12 +3,16 @@
 import time
 import logging
 
+from django.conf import settings
+
 logger = logging.getLogger(__name__)
 
 from .redis_client import get_sync_redis
 
 
-def acquire(phone_number_id, threshold=70, max_wait=30):
+def acquire(phone_number_id, threshold=None, max_wait=30):
+    if threshold is None:
+        threshold = settings.WA_RATE_LIMIT_THRESHOLD
     """Block until capacity is available under the rate limit threshold.
 
     Uses a Redis sliding-window counter keyed by ``wa_rate_limit:{id}:{unix_sec}``
