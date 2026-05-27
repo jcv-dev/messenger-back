@@ -11,6 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /var/lib/nginx/body /var/lib/nginx/proxy /var/lib/nginx/fastcgi \
+    /var/lib/nginx/uwsgi /var/lib/nginx/scgi \
+    && chown -R www-data:www-data /var/lib/nginx
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
