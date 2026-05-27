@@ -1,0 +1,5 @@
+[project]
+name = "domi-messager-backend"
+version = "1.0.0"
+description = "Domi Messager Backend"
+requires-python = ">=3.12"
