@@ -1311,7 +1311,7 @@ def serve_media(request, path):
         response['Cache-Control'] = 'private, max-age=86400, immutable'
         return response
 
-    response = HttpResponse()
+    response = HttpResponse(content_type=content_type)
     response['X-Accel-Redirect'] = f'/internal-media/{path}'
     response['Content-Disposition'] = f'{disposition}; filename="{filename}"'
     return response
