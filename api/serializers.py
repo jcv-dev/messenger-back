@@ -8,7 +8,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -355,6 +355,23 @@ class InitiateConversationSerializer(serializers.Serializer):
         cleaned = value.strip().lstrip('+')
         if not cleaned:
             raise serializers.ValidationError("Phone number is required")
+        return cleaned
+
+
+class BotExemptContactSerializer(serializers.ModelSerializer):
+    created_by = UserSerializer(read_only=True)
+
+    class Meta:
+        model = BotExemptContact
+        fields = ['id', 'contact_phone', 'contact_name', 'created_by', 'created_at']
+        read_only_fields = ['id', 'created_by', 'created_at']
+
+    def validate_contact_phone(self, value):
+        cleaned = re.sub(r'\D', '', value)
+        if not cleaned.startswith('57'):
+            raise serializers.ValidationError("Phone number must start with 57 (Colombia).")
+        if len(cleaned) < 10:
+            raise serializers.ValidationError("Phone number must be at least 10 digits.")
         return cleaned
 
 

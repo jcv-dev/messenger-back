@@ -24,14 +24,15 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
     ConversationNoteSerializer, ConversationTakeSerializer,
     CreateConversationTagSerializer, CreateConversationNoteSerializer,
     TakeConversationSerializer, InitiateConversationSerializer,
-    UserSerializer, StickerAssetSerializer, media_signer, sign_media_url,
+    UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
+    media_signer, sign_media_url,
 )
 import asyncio
 import json
@@ -869,6 +870,30 @@ class CityGroupViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated()]
 
 
+class BotExemptContactViewSet(viewsets.ModelViewSet):
+    """Manage bot-exempt phone numbers. Write operations require admin."""
+    queryset = BotExemptContact.objects.select_related('created_by').all()
+    serializer_class = BotExemptContactSerializer
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsAdminUser()]
+        return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        from .models import Conversation, ConversationTag
+        conversations = Conversation.objects.filter(contact_phone=instance.contact_phone)
+        ConversationTag.objects.filter(
+            conversation__in=conversations,
+            tag_name="Domii",
+            expires_at__isnull=True,
+        ).delete()
+        instance.delete()
+
+
 class StickerAssetViewSet(viewsets.ModelViewSet):
     """Store and serve reusable sticker images."""
 
@@ -912,7 +937,9 @@ def whatsapp_webhook(request):
         if not challenge:
             return HttpResponse(status=400)
 
-        expected_token = (settings.WEBHOOK_TOKEN or '').strip('"\'')
+        expected_token = (settings.WEBHOOK_TOKEN or '')
+        if len(expected_token) >= 2 and expected_token[0] == expected_token[-1] and expected_token[0] in '"\'':
+            expected_token = expected_token[1:-1]
         if mode == 'subscribe' and expected_token and verify_token == expected_token:
             return HttpResponse(challenge)
 
@@ -998,6 +1025,20 @@ def whatsapp_webhook(request):
                     if existing_custom:
                         conversation.custom_name = existing_custom
                         conversation.save(update_fields=['custom_name'])
+
+                if BotExemptContact.objects.filter(contact_phone=wa_id).exists():
+                    if not conversation.tags.filter(tag_name="Domii", expires_at__isnull=True).exists():
+                        try:
+                            bot_user = User.objects.filter(username="bot").first()
+                            ConversationTag.create_tag(
+                                conversation=conversation,
+                                tag_name="Domii",
+                                expiry_type="never",
+                                created_by=bot_user,
+                                tag_color="gray",
+                            )
+                        except Exception:
+                            logger.exception("Failed to auto-tag Domii exempt contact")
 
                 content = ''
                 media_url = None

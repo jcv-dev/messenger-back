@@ -14,7 +14,7 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact
 from .serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
@@ -1858,3 +1858,268 @@ class RateLimiterTests(SimpleTestCase):
         acquire(self.phone_id)
 
         mock_redis.decr.assert_called_once()
+
+
+# ── BotExemptContact Model ─────────────────────────────────────────────────
+
+class BotExemptContactModelTests(APITestCase):
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='botexempt', password='testpass123')
+
+    def test_create_exempt_contact(self):
+        contact = BotExemptContact.objects.create(
+            contact_phone='573009990001',
+            contact_name='Maria Perez',
+            created_by=self.user,
+        )
+        self.assertEqual(str(contact), 'Maria Perez (573009990001)')
+        self.assertEqual(contact.contact_phone, '573009990001')
+
+    def test_str_without_name(self):
+        contact = BotExemptContact.objects.create(contact_phone='573009990002')
+        self.assertIn('—', str(contact))
+        self.assertIn('573009990002', str(contact))
+
+
+class BotExemptContactAPITests(APITestCase):
+    """Test CRUD and permission for BotExemptContact endpoint."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='reguser', password='testpass123')
+        self.token = Token.objects.create(user=self.user)
+        self.admin = User.objects.create_superuser(username='botadmin', password='admin123', email='a@b.com')
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.contact = BotExemptContact.objects.create(
+            contact_phone='573001234567', contact_name='Maria Perez', created_by=self.admin,
+        )
+
+    def test_list_requires_auth(self):
+        response = self.client.get('/api/bot-exempt/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_list_allowed_for_authenticated(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/bot-exempt/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_create_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.post('/api/bot-exempt/', {'contact_phone': '573009999999'})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_create(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/bot-exempt/', {
+            'contact_phone': '573009999999', 'contact_name': 'New Contact',
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['contact_phone'], '573009999999')
+        self.assertEqual(response.data['contact_name'], 'New Contact')
+
+    def test_create_validates_phone_prefix(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/bot-exempt/', {'contact_phone': '1234567890'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('57', str(response.data))
+
+    def test_delete_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.delete(f'/api/bot-exempt/{self.contact.id}/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_delete(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.delete(f'/api/bot-exempt/{self.contact.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(BotExemptContact.objects.filter(id=self.contact.id).exists())
+
+    def test_delete_removes_domii_tag_from_conversations(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        conv = Conversation.objects.create(
+            whatsapp_id='573001234567', contact_name='Test', contact_phone='573001234567',
+        )
+        tag = ConversationTag.create_tag(
+            conversation=conv, tag_name="Domii", expiry_type="never", created_by=self.admin, tag_color="gray",
+        )
+        self.client.delete(f'/api/bot-exempt/{self.contact.id}/')
+        self.assertFalse(ConversationTag.objects.filter(id=tag.id).exists())
+
+    def test_phone_validation_strips_non_digits(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/bot-exempt/', {'contact_phone': '+57 (301) 987-6543'})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['contact_phone'], '573019876543')
+
+
+# ── Webhook Auto-Tag Integration ───────────────────────────────────────────
+
+class WebhookBotExemptAutoTagTests(APITestCase):
+    """When a BotExemptContact exists for an inbound phone, auto-tag with Domii."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(username='adm', password='pass', email='a@b.com')
+        BotExemptContact.objects.create(contact_phone='573001111111', contact_name='Exempt User')
+
+    def test_inbound_from_exempt_contact_adds_domii_tag(self):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'contacts': [{'wa_id': '573001111111', 'profile': {'name': 'Exempt'}}],
+                        'messages': [{
+                            'from': '573001111111', 'id': 'wamid.exempt1',
+                            'type': 'text', 'text': {'body': 'Hello'},
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        conv = Conversation.objects.get(whatsapp_id='573001111111')
+        domii_tags = conv.tags.filter(tag_name="Domii", expires_at__isnull=True)
+        self.assertEqual(domii_tags.count(), 1)
+
+    def test_non_exempt_contact_not_tagged(self):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'contacts': [{'wa_id': '573009999999', 'profile': {'name': 'Normal'}}],
+                        'messages': [{
+                            'from': '573009999999', 'id': 'wamid.nonexempt',
+                            'type': 'text', 'text': {'body': 'Hi'},
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        conv = Conversation.objects.get(whatsapp_id='573009999999')
+        domii_tags = conv.tags.filter(tag_name="Domii")
+        self.assertEqual(domii_tags.count(), 0)
+
+
+# ── Bot Classifier ─────────────────────────────────────────────────────────
+
+class BotClassifierTests(SimpleTestCase):
+
+    def _classify(self, text):
+        from api.bot.classifier import classify
+        return classify(text)
+
+    def test_delivery_keywords(self):
+        self.assertEqual(self._classify('necesito un domicilio'), 'delivery')
+        self.assertEqual(self._classify('cuánto cuesta un envío'), 'delivery')
+        self.assertEqual(self._classify('precio del domicilio'), 'delivery')
+        self.assertEqual(self._classify('domii fijo'), 'delivery')
+
+    def test_escalate_keywords(self):
+        self.assertEqual(self._classify('quiero hablar con un agente'), 'escalate')
+        self.assertEqual(self._classify('atención humana'), 'escalate')
+        self.assertEqual(self._classify('necesito un asesor'), 'escalate')
+
+    def test_faq_keywords(self):
+        self.assertEqual(self._classify('cual es el horario'), 'faq')
+        self.assertEqual(self._classify('como funciona'), 'faq')
+        self.assertEqual(self._classify('cobertura'), 'faq')
+
+    def test_greeting_default(self):
+        self.assertEqual(self._classify('hola'), 'greeting')
+        self.assertEqual(self._classify('buenos días'), 'greeting')
+        self.assertEqual(self._classify('gracias'), 'greeting')
+
+    def test_unrecognized_text(self):
+        self.assertEqual(self._classify('qwertyuiop'), 'greeting')
+
+
+# ── Bot Session ────────────────────────────────────────────────────────────
+
+class BotSessionTests(SimpleTestCase):
+    """Unit tests for bot session CRUD with mocked Redis."""
+
+    def setUp(self):
+        self.conv_id = 42
+
+    @patch('api.bot.session.get_sync_redis')
+    def test_get_session_returns_none_when_empty(self, mock_get_redis):
+        mock_redis = mock_get_redis.return_value
+        mock_redis.hgetall.return_value = {}
+        from api.bot.session import get_session
+        self.assertIsNone(get_session(self.conv_id))
+
+    @patch('api.bot.session.get_sync_redis')
+    def test_create_and_get_session(self, mock_get_redis):
+        mock_redis = mock_get_redis.return_value
+        from api.bot.session import create_session, get_session, REDIS_KEY
+
+        def hgetall_side_effect(key):
+            return {
+                b'state': b'WELCOME',
+                b'mode': b'greeting',
+                b'data': b'{}',
+                b'history': b'[]',
+                b'fallback_count': b'0',
+                b'last_activity': b'1234567890.0',
+            }
+
+        mock_redis.hgetall.side_effect = hgetall_side_effect
+
+        session = create_session(self.conv_id)
+        self.assertEqual(session['state'], 'WELCOME')
+        self.assertEqual(session['mode'], 'greeting')
+
+        loaded = get_session(self.conv_id)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded['state'], 'WELCOME')
+
+    @patch('api.bot.session.get_sync_redis')
+    def test_delete_session(self, mock_get_redis):
+        mock_redis = mock_get_redis.return_value
+        from api.bot.session import delete_session, REDIS_KEY
+        delete_session(self.conv_id)
+        mock_redis.delete.assert_called_once_with(f'{REDIS_KEY}:{self.conv_id}')
+
+
+# ── Bot Dispatcher Unit Tests ──────────────────────────────────────────────
+
+class BotDispatcherTests(SimpleTestCase):
+
+    @patch('api.bot.dispatcher.get_bot_user')
+    @patch('api.bot.dispatcher.ConversationTake.objects.filter')
+    def test_has_active_human_take_true(self, mock_filter, mock_get_bot):
+        mock_take = MagicMock()
+        mock_take.created_by.username = 'agent'
+        mock_filter.return_value.select_related.return_value.first.return_value = mock_take
+        from api.bot.dispatcher import has_active_human_take
+        self.assertTrue(has_active_human_take(1))
+
+    @patch('api.bot.dispatcher.get_bot_user')
+    @patch('api.bot.dispatcher.ConversationTake.objects.filter')
+    def test_has_active_human_take_false_for_bot(self, mock_filter, mock_get_bot):
+        mock_take = MagicMock()
+        mock_take.created_by.username = 'bot'
+        mock_filter.return_value.select_related.return_value.first.return_value = mock_take
+        from api.bot.dispatcher import has_active_human_take
+        self.assertFalse(has_active_human_take(1))
+
+    @patch('api.bot.dispatcher.ConversationTag.objects.filter')
+    def test_has_domii_tag(self, mock_filter):
+        mock_filter.return_value.exists.return_value = True
+        from api.bot.dispatcher import has_domii_tag
+        self.assertTrue(has_domii_tag(1))
+
+    @patch('api.bot.dispatcher.ConversationTag.objects.filter')
+    def test_no_domii_tag(self, mock_filter):
+        mock_filter.return_value.exists.return_value = False
+        from api.bot.dispatcher import has_domii_tag
+        self.assertFalse(has_domii_tag(1))
