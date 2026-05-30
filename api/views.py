@@ -35,6 +35,8 @@ from .serializers import (
 )
 import asyncio
 import json
+import subprocess
+import tempfile
 import logging
 
 from django.core.cache import cache
@@ -104,6 +106,40 @@ def upload_media_to_whatsapp(file_path, phone_number_id, token):
     with urllib.request.urlopen(req) as response:
         res_data = json.loads(response.read().decode())
         return res_data.get('id')
+
+
+def _convert_webm_to_ogg_opus(webm_path):
+    """Convert WebM Opus audio to OGG Opus for WhatsApp compatibility."""
+    try:
+        fd, ogg_path = tempfile.mkstemp(suffix='.ogg', prefix='wa_audio_')
+        os.close(fd)
+    except OSError:
+        return None
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-y', '-i', webm_path,
+             '-c:a', 'libopus', '-b:a', '32k',
+             '-application', 'voip',
+             '-frame_duration', '60',
+             '-vn',
+             ogg_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("ffmpeg WebM to OGG conversion failed: %s", result.stderr[:200])
+            try:
+                os.remove(ogg_path)
+            except OSError:
+                pass
+            return None
+        return ogg_path
+    except Exception as e:
+        logger.warning("ffmpeg WebM to OGG conversion error: %s", e)
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
+        return None
 
 
 def download_whatsapp_media(media_value, token, media_type):
@@ -208,14 +244,28 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
 
             file_path = _resolve_media_path(content)
             if file_path:
+                upload_path = file_path
+                converted_path = None
+                if message_type == 'audio':
+                    _, ext = os.path.splitext(file_path)
+                    if ext.lower() == '.webm':
+                        converted_path = _convert_webm_to_ogg_opus(file_path)
+                        if converted_path:
+                            upload_path = converted_path
                 acquire_rate_capacity(phone_number_id)
                 try:
-                    media_id = upload_media_to_whatsapp(file_path, phone_number_id, token)
+                    media_id = upload_media_to_whatsapp(upload_path, phone_number_id, token)
                 except urllib.error.HTTPError as e:
                     err_body = e.read().decode() if hasattr(e, 'read') else ''
                     logger.warning("Media upload to WhatsApp failed: HTTP %s %s", e.code, err_body[:200])
                 except Exception:
                     logger.warning("Media upload to WhatsApp failed (network/config error)")
+                finally:
+                    if converted_path:
+                        try:
+                            os.remove(converted_path)
+                        except OSError:
+                            pass
 
             if media_id:
                 if message_type == 'audio':
