@@ -24,7 +24,7 @@ def sign_media_url(url):
 
     if url.startswith('/media/'):
         path = url[len('/media/'):]
-        ts = int(time.time())
+        ts = int(time.time() / 60) * 60
         signed = media_signer.sign(f'{path}|{ts}')
         sig_val = signed.rsplit(':', 1)[1]
         return f'/api/media/{path}?sig={sig_val}&t={ts}'
@@ -32,14 +32,14 @@ def sign_media_url(url):
     m = re.match(r'^https?://[^/]+/media/(.+)$', url)
     if m:
         path = m.group(1)
-        ts = int(time.time())
+        ts = int(time.time() / 60) * 60
         signed = media_signer.sign(f'{path}|{ts}')
         sig_val = signed.rsplit(':', 1)[1]
         return f'/api/media/{path}?sig={sig_val}&t={ts}'
 
     # WhatsApp CDN URLs → signed media-proxy URL
     if 'lookaside.fbsbx.com' in url or 'media.whatsapp.net' in url:
-        ts = int(time.time())
+        ts = int(time.time() / 60) * 60
         signed = media_proxy_signer.sign(f'{url}|{ts}')
         sig_val = signed.rsplit(media_proxy_signer.sep, 1)[1]
         encoded = urllib.parse.quote(url, safe='')
