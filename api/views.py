@@ -1278,6 +1278,8 @@ def serve_media(request, path):
         return HttpResponseNotFound()
 
     content_type, _ = mimetypes.guess_type(file_path)
+    if content_type == 'video/webm' and '/audio/' in path:
+        content_type = 'audio/webm'
     if content_type is None:
         MIME_OVERRIDES = {
             '.pdf': 'application/pdf',
