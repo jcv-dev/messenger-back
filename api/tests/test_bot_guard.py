@@ -108,3 +108,82 @@ class SanitizeLlmOutputTests(SimpleTestCase):
         result = sanitize_llm_output("puto ve a https://malo.com")
         self.assertIn("***", result)
         self.assertIn("[enlace no permitido]", result)
+
+
+class ValidateInteractivePayloadTests(SimpleTestCase):
+    def test_button_valid(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("button", {
+            "body": "Elige una opción",
+            "buttons": [
+                {"id": "si", "title": "Sí"},
+                {"id": "no", "title": "No"},
+            ],
+        })
+        self.assertIsNone(result)
+
+    def test_button_too_many(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("button", {
+            "body": "Elige",
+            "buttons": [
+                {"id": "a", "title": "A"},
+                {"id": "b", "title": "B"},
+                {"id": "c", "title": "C"},
+                {"id": "d", "title": "D"},
+            ],
+        })
+        self.assertIsNotNone(result)
+        self.assertIn("Too many", result)
+
+    def test_button_missing_id(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("button", {
+            "body": "Elige",
+            "buttons": [
+                {"id": "a", "title": "A"},
+                {"title": "B"},  # missing id
+            ],
+        })
+        self.assertIsNotNone(result)
+        self.assertIn("missing", result)
+
+    def test_button_empty(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("button", {
+            "body": "Elige",
+            "buttons": [],
+        })
+        self.assertIsNotNone(result)
+        self.assertIn("required", result)
+
+    def test_list_too_many_rows(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("list", {
+            "body": "Elige servicio",
+            "sections": [
+                {"title": "Servicios", "rows": [{"id": str(i), "title": f"Opción {i}"} for i in range(11)]},
+            ],
+        })
+        self.assertIsNotNone(result)
+        self.assertIn("Too many rows", result)
+
+    def test_list_valid(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("list", {
+            "body": "Elige servicio",
+            "sections": [
+                {"title": "Servicios", "rows": [{"id": "dom", "title": "Domicilios"}, {"id": "msj", "title": "Mensajería"}]},
+            ],
+        })
+        self.assertIsNone(result)
+
+    def test_invalid_type(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("unknown", {"body": "test"})
+        self.assertIsNotNone(result)
+
+    def test_empty_body(self):
+        from api.bot.llm import _validate_interactive_payload
+        result = _validate_interactive_payload("button", {"body": "", "buttons": [{"id": "a", "title": "A"}]})
+        self.assertIsNotNone(result)

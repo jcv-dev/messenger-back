@@ -673,6 +673,20 @@ async def handle_with_llm(session, conversation):
             result = await _execute_tool(function_call, conversation, session)
 
             if function_call.name == "send_interactive":
+                if isinstance(result, dict) and "error" in result:
+                    # Validation/payload error — feed result back to LLM so it retries
+                    contents.append(response.candidates[0].content)
+                    contents.append(genai_types.Content(
+                        role="function",
+                        parts=[genai_types.Part.from_function_response(
+                            name=function_call.name,
+                            response={"result": result},
+                        )],
+                    ))
+                    response = await _generate_with_retry(client, model, contents, config)
+                    incr_metric("llm.calls")
+                    continue
+                # Success — break out; the interactive was sent
                 if function_call.args:
                     interactive_text = (function_call.args.get("body") or "")[:300]
                 break
