@@ -9,7 +9,7 @@ from google import genai
 from google.genai import types as genai_types
 
 from . import calculator
-from api.models import ConversationTake, Message
+from api.models import Conversation, ConversationTake, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
