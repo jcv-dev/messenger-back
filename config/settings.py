@@ -199,8 +199,9 @@ else:
         },
     }
 
-# Bot / Calculator
+# Bot / Calculator / Gemini
 DOMII_CALCULATOR_URL = config('DOMII_CALCULATOR_URL', default='http://calculator:8000')
+GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 
 LOGGING = {
     'version': 1,

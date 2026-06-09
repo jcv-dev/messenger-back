@@ -1,11 +1,10 @@
-"""Bot dispatcher — receives Redis SSE events, routes to handlers."""
+"""Bot dispatcher — receives Redis SSE events, routes to LLM handler."""
 
 import asyncio
 import json
 import logging
 import re
 
-from django.conf import settings
 from django.contrib.auth.models import User
 from django.utils import timezone
 
@@ -14,11 +13,20 @@ from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update
 
-from .session import get_session, save_session, create_session, delete_session
-from .classifier import classify
-from .handlers import greeting, faq, escalation, fallback, delivery
+from .session import get_session, save_session, delete_session
+from .llm import handle_with_llm
 
 logger = logging.getLogger("api.bot")
+
+WELCOME_REPLY = (
+    "¡Bienvenido a Domii Tuluá! 🚀\n\n"
+    "Soy el asistente virtual. ¿Qué deseas hacer?\n\n"
+    "1. Calcular un domicilio o mensajería\n"
+    "2. Domii Fijo (domiciliario dedicado)\n"
+    "3. Hablar con un asesor\n"
+    "4. Preguntas frecuentes\n\n"
+    "Responde con el número de la opción."
+)
 
 
 def get_bot_user():
@@ -43,7 +51,7 @@ def has_domii_tag(conversation_id) -> bool:
     ).exists()
 
 
-def send_reply(conversation, text, session=None):
+def send_reply(conversation, text):
     bot = get_bot_user()
     msg = Message.objects.create(
         conversation=conversation,
@@ -87,47 +95,28 @@ async def handle_inbound(event: dict):
     session = get_session(conversation_id)
 
     if session is None:
-        mode = classify(user_text)
-        session = create_session(conversation_id, mode=mode)
-    elif session.get("state") == "WELCOME" and session.get("mode") == "greeting":
-        mode = classify(user_text)
-        session["mode"] = mode
-        session["state"] = "WELCOME"
-        save_session(conversation_id, session)
-
-    session.setdefault("history", []).append({"role": "user", "content": user_text})
+        session = {
+            "history": [],
+            "fallback_count": 0,
+        }
 
     if re.search(r"\b(salir|cancelar|men[uú])\b", user_text, re.I):
         delete_session(conversation_id)
-        reply = greeting.welcome_message()
-        send_reply(conversation, reply)
+        send_reply(conversation, WELCOME_REPLY)
         return
 
-    try:
-        if session["mode"] == "delivery":
-            reply = delivery.advance(session, user_text, conversation)
-        elif session["mode"] == "faq":
-            reply = faq.handle(session, user_text)
-        elif session["mode"] == "escalate":
-            reply = escalation.handle(conversation, session)
-            delete_session(conversation_id)
-        else:
-            reply = greeting.handle(session, user_text, conversation)
-    except fallback.FallbackRequired:
-        session["fallback_count"] = session.get("fallback_count", 0) + 1
-        if session["fallback_count"] >= 3:
-            reply = escalation.handle(conversation, session)
-            delete_session(conversation_id)
-        else:
-            reply = fallback.message(session)
-        save_session(conversation_id, session)
-    except Exception:
-        logger.exception("Bot handler error for conv %s", conversation_id)
-        reply = "Ocurrió un error. Un asesor te atenderá pronto."
-        delete_session(conversation_id)
-        escalation.release(conversation)
+    session.setdefault("history", []).append({"role": "user", "content": user_text})
 
-    send_reply(conversation, reply, session)
+    reply, escalated = await handle_with_llm(session, conversation)
+
+    session["history"].append({"role": "model", "content": reply})
+
+    if escalated:
+        delete_session(conversation_id)
+    else:
+        save_session(conversation_id, session)
+
+    send_reply(conversation, reply)
 
 
 async def bot_loop():

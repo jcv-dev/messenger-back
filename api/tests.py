@@ -21,6 +21,8 @@ from .serializers import (
 )
 from .views import ConversationViewSet, MessageViewSet
 
+# Load bot package so @patch('api.bot.dispatcher.xxx') resolves
+from api import bot as _  # noqa
 
 def get_or_create_tulua_group():
     group, _ = CityGroup.objects.get_or_create(
@@ -2007,39 +2009,6 @@ class WebhookBotExemptAutoTagTests(APITestCase):
         conv = Conversation.objects.get(whatsapp_id='573009999999')
         domii_tags = conv.tags.filter(tag_name="Domii")
         self.assertEqual(domii_tags.count(), 0)
-
-
-# ── Bot Classifier ─────────────────────────────────────────────────────────
-
-class BotClassifierTests(SimpleTestCase):
-
-    def _classify(self, text):
-        from api.bot.classifier import classify
-        return classify(text)
-
-    def test_delivery_keywords(self):
-        self.assertEqual(self._classify('necesito un domicilio'), 'delivery')
-        self.assertEqual(self._classify('cuánto cuesta un envío'), 'delivery')
-        self.assertEqual(self._classify('precio del domicilio'), 'delivery')
-        self.assertEqual(self._classify('domii fijo'), 'delivery')
-
-    def test_escalate_keywords(self):
-        self.assertEqual(self._classify('quiero hablar con un agente'), 'escalate')
-        self.assertEqual(self._classify('atención humana'), 'escalate')
-        self.assertEqual(self._classify('necesito un asesor'), 'escalate')
-
-    def test_faq_keywords(self):
-        self.assertEqual(self._classify('cual es el horario'), 'faq')
-        self.assertEqual(self._classify('como funciona'), 'faq')
-        self.assertEqual(self._classify('cobertura'), 'faq')
-
-    def test_greeting_default(self):
-        self.assertEqual(self._classify('hola'), 'greeting')
-        self.assertEqual(self._classify('buenos días'), 'greeting')
-        self.assertEqual(self._classify('gracias'), 'greeting')
-
-    def test_unrecognized_text(self):
-        self.assertEqual(self._classify('qwertyuiop'), 'greeting')
 
 
 # ── Bot Session ────────────────────────────────────────────────────────────

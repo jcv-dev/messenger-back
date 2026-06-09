@@ -28,8 +28,8 @@ def get_session(conversation_id):
 def save_session(conversation_id, session):
     r = get_sync_redis()
     mapping = {
-        "state": session["state"],
-        "mode": session.get("mode", "greeting"),
+        "state": session.get("state", "llm"),
+        "mode": session.get("mode", "llm"),
         "data": json.dumps(session.get("data", {})),
         "history": json.dumps(session.get("history", [])),
         "fallback_count": session.get("fallback_count", 0),

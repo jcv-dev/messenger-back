@@ -109,8 +109,8 @@ def upload_media_to_whatsapp(file_path, phone_number_id, token):
         return res_data.get('id')
 
 
-def _convert_webm_to_ogg_opus(webm_path):
-    """Convert WebM Opus audio to OGG Opus for WhatsApp compatibility."""
+def _convert_audio_to_ogg_opus(audio_path):
+    """Convert any audio (WebM, MP4, AAC) to OGG Opus for WhatsApp compatibility."""
     try:
         fd, ogg_path = tempfile.mkstemp(suffix='.ogg', prefix='wa_audio_')
         os.close(fd)
@@ -118,7 +118,7 @@ def _convert_webm_to_ogg_opus(webm_path):
         return None
     try:
         result = subprocess.run(
-            ['ffmpeg', '-y', '-i', webm_path,
+            ['ffmpeg', '-y', '-i', audio_path,
              '-c:a', 'libopus', '-b:a', '32k',
              '-application', 'voip',
              '-frame_duration', '60',
@@ -127,7 +127,7 @@ def _convert_webm_to_ogg_opus(webm_path):
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            logger.warning("ffmpeg WebM to OGG conversion failed: %s", result.stderr[:200])
+            logger.warning("ffmpeg audio to OGG conversion failed: %s", result.stderr[:200])
             try:
                 os.remove(ogg_path)
             except OSError:
@@ -135,7 +135,7 @@ def _convert_webm_to_ogg_opus(webm_path):
             return None
         return ogg_path
     except Exception as e:
-        logger.warning("ffmpeg WebM to OGG conversion error: %s", e)
+        logger.warning("ffmpeg audio to OGG conversion error: %s", e)
         try:
             os.remove(ogg_path)
         except OSError:
@@ -249,8 +249,16 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                 converted_path = None
                 if message_type == 'audio':
                     _, ext = os.path.splitext(file_path)
-                    if ext.lower() == '.webm':
-                        converted_path = _convert_webm_to_ogg_opus(file_path)
+                    should_convert = ext.lower() in ('.webm', '.mp4', '.m4a', '.aac')
+                    if not should_convert and message_id:
+                        try:
+                            msg = Message.objects.get(id=message_id)
+                            mime = (msg.metadata or {}).get('mime_type', '')
+                            should_convert = 'mp4' in mime or 'aac' in mime
+                        except Message.DoesNotExist:
+                            pass
+                    if should_convert:
+                        converted_path = _convert_audio_to_ogg_opus(file_path)
                         if converted_path:
                             upload_path = converted_path
                 acquire_rate_capacity(phone_number_id)
