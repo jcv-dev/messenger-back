@@ -254,6 +254,15 @@ async def handle_inbound(event: dict):
             )
             await sync_to_async(delete_session)(conversation_id)
             await _release_bot_take(conversation, escalated=True)
+            bot = await get_bot_user_async()
+            if bot:
+                await sync_to_async(ConversationNote.create_note)(
+                    conversation=conversation,
+                    content="[Bot] Escalado autom\u00e1ticamente \u2014 el bot no pudo procesar la solicitud tras varios intentos",
+                    expiry_type='custom',
+                    custom_expiry_minutes=10,
+                    created_by=bot,
+                )
             await sync_to_async(send_reply)(
                 conversation,
                 "He tenido dificultades para ayudarte. Un asesor humano te atender\xe1 pronto.",

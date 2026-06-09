@@ -16,7 +16,7 @@ from .constants import WELCOME_REPLY
 from .utils import get_bot_user_async
 from .guard import sanitize_llm_output
 from .metrics import incr as incr_metric
-from api.models import Conversation, ConversationTake, Message
+from api.models import Conversation, ConversationNote, ConversationTake, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
@@ -138,6 +138,7 @@ REGLAS:
 - Saluda solo en el primer mensaje. Despu\u00e9s s\u00e9 directo y conciso (m\u00e1x 300 caracteres).
 - Usa calculate_price siempre. NUNCA inventes precios.
 - escalate_to_human si: cliente lo pide, o despu\u00e9s de 3 intentos fallidos.
+- Al escalar, escribe en 'reason' un resumen MUY corto de lo que el cliente necesitaba y d\u00f3nde qued\u00f3 el flujo (m\u00e1x 80 caracteres). Esto ayuda al agente humano a retomar r\u00e1pido.
 - Si el cliente pregunta algo sobre Domii que no sabes responder (ej: estado de un pedido, datos de contacto espec\u00edficos), escala con escalate_to_human explicando el motivo.
 - Si el cliente pregunta algo completamente ajeno a Domii (deportes, clima, noticias, recetas, etc.), responde que solo ayudas con domicilios y mensajer\u00eda en Tulu\u00e1, y redirige al men\u00fa. NO escales en este caso.
 - Al completar pedido: agradece y pregunta si necesita algo m\u00e1s.
@@ -314,13 +315,13 @@ DEFAULT_TOOLS = [
             ),
             genai_types.FunctionDeclaration(
                 name="escalate_to_human",
-                description="Escala la conversaci\u00f3n a un agente humano.",
+                description="Escala a un agente humano. Escribe en 'reason' un resumen MUY corto de lo que el cliente solicitaba y en qu\u00e9 punto del flujo qued\u00f3 (m\u00e1x 80 caracteres).",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
                         "reason": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Raz\u00f3n de la escalaci\u00f3n",
+                            description="Resumen corto (ej: 'Quiere domicilio de La Herradura al centro, ya dio ambas direcciones', 'Cliente insiste en pago con tarjeta')",
                         ),
                     },
                     required=["reason"],
@@ -594,6 +595,16 @@ async def _execute_tool(function_call, conversation, session):
 
         if name == "escalate_to_human":
             await _release_bot_take(conversation, escalated=True)
+            reason = (args.get("reason", "") or "")[:120]
+            bot = await get_bot_user_async()
+            if bot:
+                await sync_to_async(ConversationNote.create_note)(
+                    conversation=conversation,
+                    content=f"[Bot] {reason}",
+                    expiry_type='custom',
+                    custom_expiry_minutes=10,
+                    created_by=bot,
+                )
             incr_metric("tool_calls.succeeded")
             return {
                 "success": True,
@@ -638,7 +649,16 @@ async def handle_with_llm(session, conversation):
     if client is None:
         logger.warning("No Gemini client — escalating conv=%s", conversation.id)
         await _release_bot_take(conversation, escalated=True)
-        return "Un asesor humano te atenderá pronto.", True, False
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content="[Bot] Bot no configurado — escalado autom\u00e1ticamente",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
+        return "Un asesor humano te atender\u00e1 pronto.", True, False
 
     contents = _build_contents(session)
 
@@ -728,8 +748,17 @@ async def handle_with_llm(session, conversation):
         logger.exception("Error en Gemini API para conv %s: %s", conversation.id, e)
         incr_metric("llm.failures")
         session["fallback_count"] = session.get("fallback_count", 0) + 1
-        reply = "Ocurrió un error al procesar tu mensaje. Un asesor te atenderá pronto."
+        reply = "Ocurri\u00f3 un error al procesar tu mensaje. Un asesor te atender\u00e1 pronto."
         await _release_bot_take(conversation, escalated=True)
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content="[Bot] Error del sistema al procesar — escalado autom\u00e1ticamente",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
         escalated = True
 
     return reply.strip(), escalated, interactive_text is not None
