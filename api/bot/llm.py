@@ -498,6 +498,7 @@ async def handle_with_llm(session, conversation):
     max_tool_calls = 5
     tool_call_count = 0
     escalated = False
+    interactive_text = None
 
     try:
         response = await client.aio.models.generate_content(
@@ -519,6 +520,8 @@ async def handle_with_llm(session, conversation):
             result = await _execute_tool(function_call, conversation)
 
             if function_call.name == "send_interactive":
+                if function_call.args:
+                    interactive_text = (function_call.args.get("body") or "")[:300]
                 break
 
             if function_call.name == "escalate_to_human":
@@ -540,7 +543,9 @@ async def handle_with_llm(session, conversation):
                 config=config,
             )
 
-        if response.candidates and response.candidates[0].content.parts:
+        if interactive_text is not None:
+            reply = interactive_text
+        elif response.candidates and response.candidates[0].content.parts:
             reply = response.candidates[0].content.parts[0].text or ""
         else:
             reply = ""
