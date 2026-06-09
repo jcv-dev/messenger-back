@@ -13,7 +13,7 @@ from django.utils import timezone
 from api.models import Conversation, Message, ConversationTake, ConversationTag
 from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
-from api.views import publish_conversation_update
+from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
 from .session import get_session, save_session, delete_session
 from .llm import handle_with_llm
@@ -68,6 +68,12 @@ def send_reply(conversation, text):
     conversation.save(update_fields=["last_message", "last_message_at"])
 
     msg_data = MessageSerializer(msg).data
+
+    _send_pool.submit(
+        send_whatsapp_outbound,
+        'text', text, conversation.contact_phone, msg.id, conversation.id,
+    )
+
     publish_conversation_update(conversation, msg_data)
     return msg
 
