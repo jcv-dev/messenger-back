@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import signal
 from datetime import timedelta
 
 from asgiref.sync import sync_to_async
@@ -16,24 +17,19 @@ from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
+from .constants import WELCOME_REPLY
+from .utils import get_bot_user, get_bot_user_async
+from .lock import conversation_lock
+from .guard import sanitize_user_input
+from .limits import check_inbound_rate
+from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session
 from .llm import handle_with_llm
 
 logger = logging.getLogger("api.bot")
 
-WELCOME_REPLY = (
-    "¡Bienvenido a Domii Tuluá! 🚀\n\n"
-    "Soy el asistente virtual. ¿Qué deseas hacer?\n\n"
-    "1. Calcular un domicilio o mensajería\n"
-    "2. Domii Fijo (domiciliario dedicado)\n"
-    "3. Hablar con un asesor\n"
-    "4. Preguntas frecuentes\n\n"
-    "Responde con el número de la opción."
-)
-
-
-def get_bot_user():
-    return User.objects.filter(username="bot").first()
+_shutdown_event = asyncio.Event()
+_RECONNECT_MAX_DELAY = 60
 
 
 def has_active_human_take(conversation_id) -> bool:
@@ -52,6 +48,18 @@ def has_domii_tag(conversation_id) -> bool:
         tag_name="Domii",
         expires_at__isnull=True,
     ).exists()
+
+
+async def _release_bot_take(conversation):
+    bot = await get_bot_user_async()
+    if not bot:
+        return
+    await sync_to_async(lambda: ConversationTake.objects.filter(
+        created_by=bot,
+        conversation=conversation,
+        expires_at__gt=timezone.now(),
+    ).update(expires_at=timezone.now()))()
+    await sync_to_async(publish_conversation_update)(conversation)
 
 
 def _renew_bot_take(conversation):
@@ -73,6 +81,9 @@ def _renew_bot_take(conversation):
 
 def send_reply(conversation, text):
     bot = get_bot_user()
+    if not bot:
+        logger.error("Cannot send reply: bot user does not exist")
+        return None
     msg = Message.objects.create(
         conversation=conversation,
         direction="outbound",
@@ -106,71 +117,149 @@ async def handle_inbound(event: dict):
 
     conversation_id = conv_data["id"]
 
-    if await sync_to_async(has_active_human_take)(conversation_id):
-        return
+    # --- Concurrency guard: one event per conversation at a time ---
+    async with conversation_lock(conversation_id) as locked:
+        if not locked:
+            incr_metric("locks.failed")
+            logger.debug("Dropping duplicate event for conv=%s (already processing)", conversation_id)
+            return
+        incr_metric("locks.acquired")
 
-    if await sync_to_async(has_domii_tag)(conversation_id):
-        return
+        # --- Human take guard ---
+        if await sync_to_async(has_active_human_take)(conversation_id):
+            return
 
-    try:
-        conversation = await sync_to_async(Conversation.objects.get)(id=conversation_id)
-    except Conversation.DoesNotExist:
-        return
+        # --- Bot-exempt (Domii tag) guard ---
+        if await sync_to_async(has_domii_tag)(conversation_id):
+            return
 
-    await sync_to_async(_renew_bot_take)(conversation)
+        try:
+            conversation = await sync_to_async(Conversation.objects.get)(id=conversation_id)
+        except Conversation.DoesNotExist:
+            return
 
-    user_text = msg_data.get("content", "").strip()
-    session = await sync_to_async(get_session)(conversation_id)
+        await sync_to_async(_renew_bot_take)(conversation)
 
-    if session is None:
-        session = {
-            "history": [],
-            "fallback_count": 0,
-        }
+        # --- Sanitize input ---
+        user_text = msg_data.get("content", "").strip()
+        user_text = sanitize_user_input(user_text)
+        if not user_text:
+            logger.debug("Skipping empty/filtered message for conv=%s", conversation_id)
+            return
 
-    cancel_pattern = re.compile(r"\b(salir|cancelar|men[uú])\b", re.I)
-    if cancel_pattern.search(user_text):
-        await sync_to_async(delete_session)(conversation_id)
-        await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
-        return
+        # --- Inbound rate limit ---
+        if not await check_inbound_rate(conversation_id):
+            incr_metric("messages.rate_limited")
+            logger.warning("Inbound rate limit exceeded for conv=%s", conversation_id)
+            return
 
-    session.setdefault("history", []).append({"role": "user", "content": user_text})
+        incr_metric("messages.processed")
 
-    reply, escalated, sent_interactive = await handle_with_llm(session, conversation)
+        session = await sync_to_async(get_session)(conversation_id)
+        if session is None:
+            session = {
+                "history": [],
+                "fallback_count": 0,
+            }
 
-    session["history"].append({"role": "model", "content": reply})
+        # --- Pre-emptive escalation on too many failures ---
+        if session.get("fallback_count", 0) >= 3:
+            logger.info(
+                "Escalating conv=%s after %d fallbacks",
+                conversation_id, session["fallback_count"],
+            )
+            await sync_to_async(delete_session)(conversation_id)
+            await _release_bot_take(conversation)
+            await sync_to_async(send_reply)(
+                conversation,
+                "He tenido dificultades para ayudarte. Un asesor humano te atender\xe1 pronto.",
+            )
+            return
 
-    if escalated:
-        await sync_to_async(delete_session)(conversation_id)
-    else:
-        await sync_to_async(save_session)(conversation_id, session)
+        # --- Cancel detection (must be the ONLY content in the message) ---
+        cancel_pattern = re.compile(r'^(salir|cancelar|men[úu])[.!?]*\s*$', re.I)
+        if cancel_pattern.search(user_text):
+            incr_metric("cancellations")
+            await sync_to_async(delete_session)(conversation_id)
+            await _release_bot_take(conversation)
+            await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
+            return
 
-    if not sent_interactive and reply.strip():
-        await sync_to_async(send_reply)(conversation, reply)
+        session.setdefault("history", []).append({"role": "user", "content": user_text})
+
+        reply, escalated, sent_interactive = await handle_with_llm(session, conversation)
+
+        session["history"].append({"role": "model", "content": reply})
+
+        if escalated:
+            incr_metric("escalations")
+            await sync_to_async(delete_session)(conversation_id)
+        else:
+            await sync_to_async(save_session)(conversation_id, session)
+
+        if not sent_interactive and reply.strip():
+            await sync_to_async(send_reply)(conversation, reply)
+
+
+async def _subscribe_with_retry():
+    delay = 1
+    while not _shutdown_event.is_set():
+        try:
+            subscriber_id, event_queue, _, _ = await subscribe()
+            return subscriber_id, event_queue
+        except Exception:
+            logger.warning("Redis subscribe failed, retrying in %ds", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _RECONNECT_MAX_DELAY)
+    raise asyncio.CancelledError("Shutting down during subscribe retry")
 
 
 async def bot_loop():
-    subscriber_id, event_queue, _, _ = await subscribe()
-    logger.info("Bot subscribed to Redis SSE (id=%s)", subscriber_id)
+    while not _shutdown_event.is_set():
+        subscriber_id = None
+        event_queue = None
+        try:
+            subscriber_id, event_queue = await _subscribe_with_retry()
+            logger.info("Bot subscribed to Redis SSE (id=%s)", subscriber_id)
 
-    bot = await sync_to_async(get_bot_user)()
-    if bot:
-        await sync_to_async(lambda: ConversationTake.objects.filter(
-            created_by=bot,
-            expires_at__gt=timezone.now(),
-        ).update(expires_at=timezone.now()))()
+            bot = await sync_to_async(get_bot_user)()
+            if bot:
+                await sync_to_async(lambda: ConversationTake.objects.filter(
+                    created_by=bot,
+                    expires_at__gt=timezone.now(),
+                ).update(expires_at=timezone.now()))()
 
-    try:
-        while True:
-            raw = await event_queue.get()
-            try:
-                event = json.loads(raw)
-                await handle_inbound(event)
-            except Exception:
-                logger.exception("Error processing event")
-    finally:
-        await unsubscribe(subscriber_id)
+            while not _shutdown_event.is_set():
+                try:
+                    raw = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                try:
+                    event = json.loads(raw)
+                    await handle_inbound(event)
+                except Exception:
+                    logger.exception("Error processing event")
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("Bot loop error — restarting in 5s")
+            incr_metric("loop.crashes")
+            await asyncio.sleep(5)
+        finally:
+            if subscriber_id is not None:
+                await unsubscribe(subscriber_id)
+
+    logger.info("Bot loop shut down gracefully")
+
+
+def _handle_signal(sig, frame):
+    logger.info("Received signal %s, shutting down...", signal.Signals(sig).name)
+    _shutdown_event.set()
 
 
 def run():
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
     asyncio.run(bot_loop())

@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 
 from asgiref.sync import sync_to_async
 
@@ -7,27 +9,41 @@ from django.utils import timezone
 
 from google import genai
 from google.genai import types as genai_types
+from google.genai import errors as genai_errors
 
 from . import calculator
+from .constants import WELCOME_REPLY
+from .utils import get_bot_user_async
+from .guard import sanitize_llm_output
+from .metrics import incr as incr_metric
 from api.models import Conversation, ConversationTake, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
 logger = logging.getLogger("api.bot.llm")
 
+# ---------------------------------------------------------------------------
+#  Retry configuration
+# ---------------------------------------------------------------------------
+RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_RETRIES = getattr(settings, "BOT_LLM_RETRY_COUNT", 3)
+_BASE_DELAY = 1.0
+
+# ---------------------------------------------------------------------------
+#  Cached system-prompt data
+# ---------------------------------------------------------------------------
 _tools_cache = None
+_tools_cache_lock = asyncio.Lock()
+TOOLS_CACHE_TTL = getattr(settings, "BOT_TOOLS_CACHE_TTL", 300)
 
-
-def _get_bot_user():
-    from django.contrib.auth.models import User
-    return User.objects.filter(username="bot").first()
-
-
-_get_bot_user_async = sync_to_async(_get_bot_user)
+# ---------------------------------------------------------------------------
+#  LLM client singleton
+# ---------------------------------------------------------------------------
+_llm_client = None
 
 
 async def _release_bot_take(conversation):
-    bot = await _get_bot_user_async()
+    bot = await get_bot_user_async()
     if bot:
         await sync_to_async(lambda: ConversationTake.objects.filter(
             created_by=bot,
@@ -37,18 +53,44 @@ async def _release_bot_take(conversation):
     await sync_to_async(publish_conversation_update)(conversation)
 
 
+# ---------------------------------------------------------------------------
+#  System prompt (unchanged except for dynamic-tools injection)
+# ---------------------------------------------------------------------------
+
+def _sanitize_tool_field(val, max_len=200):
+    if not isinstance(val, str):
+        return ""
+    return "".join(ch for ch in val if ord(ch) >= 32 or ch in "\n\r\t")[:max_len].strip()
+
+
 async def _build_system_prompt():
     global _tools_cache
-    if _tools_cache is None:
-        try:
-            _tools_cache = await calculator.get_tools()
-        except Exception:
-            _tools_cache = []
-            logger.warning("Failed to fetch tools from calculator, using empty list")
+    now = time.time()
+
+    async with _tools_cache_lock:
+        if _tools_cache is None or (now - _tools_cache["fetched_at"]) > TOOLS_CACHE_TTL:
+            try:
+                raw_tools = await calculator.get_tools()
+                sanitized = [
+                    {
+                        "key": _sanitize_tool_field(t.get("key", ""), 50),
+                        "label": _sanitize_tool_field(t.get("label", ""), 100),
+                        "description": _sanitize_tool_field(t.get("description", ""), 500),
+                    }
+                    for t in raw_tools
+                    if isinstance(t, dict) and "key" in t
+                ]
+                _tools_cache = {"data": sanitized, "fetched_at": now}
+            except Exception:
+                if _tools_cache is not None:
+                    logger.warning("Failed to refresh tools cache, using stale data")
+                else:
+                    _tools_cache = {"data": [], "fetched_at": now}
+                    logger.warning("Failed to fetch tools from calculator, using empty list")
 
     tools_text = "\n".join(
-        f'  - "{t["key"]}": {t["label"]} — {t["description"]}'
-        for t in (_tools_cache or [])
+        f'  - "{t["key"]}": {t["label"]} - {t["description"]}'
+        for t in (_tools_cache["data"] or [])
     ) or "  - Ninguna disponible"
 
     return f"""Eres el asistente virtual de Domii Tuluá, una empresa de domicilios y mensajería en Tuluá, Colombia.
@@ -145,7 +187,7 @@ FLUJO DOMII FIJO:
 GEOCODING:
 - Usa geocode_search para buscar direcciones por nombre.
 - Si hay múltiples resultados, preséntalos con send_interactive(type="button").
-  El ID de cada botón debe ser el place_id del resultado, title el display_name.
+- El ID de cada botón debe ser el place_id del resultado, title el display_name.
 - Ejemplo: send_interactive(type="button", body="Selecciona la dirección correcta:",
     buttons=[{{"id":"ChIJvX8...","title":"La Herradura, Tuluá"}},
              {{"id":"ChIJTU8...","title":"La Herradura, Palmira"}}])
@@ -363,114 +405,206 @@ DEFAULT_TOOLS = [
 ]
 
 
-_llm_client = None
-
-
 def _get_client():
     global _llm_client
     if _llm_client is None:
         key = settings.GEMINI_API_KEY
         if not key:
-            raise RuntimeError("GEMINI_API_KEY no está configurada")
+            logger.error("GEMINI_API_KEY not configured — bot will auto-escalate all conversations")
+            return None
         _llm_client = genai.Client(api_key=key)
     return _llm_client
 
 
-async def _execute_tool(function_call, conversation):
+# ---------------------------------------------------------------------------
+#  Interactive payload validation
+# ---------------------------------------------------------------------------
+
+def _validate_interactive_payload(itype: str, args: dict) -> str | None:
+    """Returns ``None`` if valid, error message string if invalid."""
+    if itype not in ("button", "list"):
+        return f"Invalid interactive type: {itype!r}"
+    body = args.get("body", "")
+    if not body or not body.strip():
+        return "Interactive body is required"
+    if itype == "button":
+        buttons = args.get("buttons", [])
+        if not buttons:
+            return "Buttons required for type=button"
+        if len(buttons) > 3:
+            return f"Too many buttons ({len(buttons)}), max 3"
+        for i, b in enumerate(buttons):
+            if not b.get("id") or not b.get("title"):
+                return f"Button {i} missing id or title"
+    elif itype == "list":
+        sections = args.get("sections", [])
+        if not sections:
+            return "Sections required for type=list"
+        total_rows = 0
+        for si, sec in enumerate(sections):
+            rows = sec.get("rows", [])
+            total_rows += len(rows)
+            for ri, row in enumerate(rows):
+                if not row.get("id") or not row.get("title"):
+                    return f"Section {si} row {ri} missing id or title"
+        if total_rows > 10:
+            return f"Too many rows ({total_rows}), max 10"
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  Retry wrapper for Gemini API
+# ---------------------------------------------------------------------------
+
+async def _generate_with_retry(client, model, contents, config):
+    last_error = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return await client.aio.models.generate_content(
+                model=model, contents=contents, config=config,
+            )
+        except genai_errors.APIError as e:
+            status = getattr(e, "code", None) or getattr(e, "status_code", None)
+            if status in RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+                delay = _BASE_DELAY * (2 ** attempt)
+                logger.warning("Gemini API %s, retry %d/%d in %.1fs",
+                               status, attempt + 1, _MAX_RETRIES, delay)
+                incr_metric("llm.retries")
+                await asyncio.sleep(delay)
+                last_error = e
+                continue
+            raise
+        except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            if attempt < _MAX_RETRIES:
+                delay = _BASE_DELAY * (2 ** attempt)
+                logger.warning("Gemini connection error, retry %d/%d in %.1fs",
+                               attempt + 1, _MAX_RETRIES, delay)
+                incr_metric("llm.retries")
+                await asyncio.sleep(delay)
+                last_error = e
+                continue
+            raise
+    raise last_error  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+#  Tool execution
+# ---------------------------------------------------------------------------
+
+async def _execute_tool(function_call, conversation, session):
     name = function_call.name
     args = dict(function_call.args) if function_call.args else {}
 
-    if name == "calculate_price":
-        profile = args.get("profile", "usuario_final")
-        segments = args.get("segments", [])
-        tools = args.get("tools", [])
-        payment_method = args.get("payment_method", "efectivo")
-        acompanante = args.get("acompanante", False)
-        result = await calculator.calculate_price(
-            profile=profile,
-            segments=segments,
-            tools=tools,
-            payment_method=payment_method,
-            acompanante=acompanante,
-        )
-        return result
+    try:
+        if name == "calculate_price":
+            profile = args.get("profile", "usuario_final")
+            segments = args.get("segments", [])
+            tools = args.get("tools", [])
+            payment_method = args.get("payment_method", "efectivo")
+            acompanante = args.get("acompanante", False)
+            result = await calculator.calculate_price(
+                profile=profile,
+                segments=segments,
+                tools=tools,
+                payment_method=payment_method,
+                acompanante=acompanante,
+            )
+            incr_metric("tool_calls.succeeded")
+            return result
 
-    if name == "geocode_search":
-        query = args.get("query", "")
-        result = await calculator.geocode_search(query=query)
-        return result
+        if name == "geocode_search":
+            query = args.get("query", "")
+            result = await calculator.geocode_search(query=query)
+            incr_metric("tool_calls.succeeded")
+            return result
 
-    if name == "geocode_details":
-        place_id = args.get("place_id", "")
-        result = await calculator.geocode_details(place_id=place_id)
-        return result
+        if name == "geocode_details":
+            place_id = args.get("place_id", "")
+            result = await calculator.geocode_details(place_id=place_id)
+            incr_metric("tool_calls.succeeded")
+            return result
 
-    if name == "send_interactive":
-        itype = args.get("type", "button")
-        body = args.get("body", "")
-        header = args.get("header")
-        footer = args.get("footer")
+        if name == "send_interactive":
+            itype = args.get("type", "button")
+            body = args.get("body", "")
+            header = args.get("header")
+            footer = args.get("footer")
 
-        interactive_payload = {"type": itype}
-        if header:
-            interactive_payload["header"] = {"type": "text", "text": header}
-        interactive_payload["body"] = {"text": body}
-        if footer:
-            interactive_payload["footer"] = {"text": footer}
+            # Validate payload before sending
+            validation_error = _validate_interactive_payload(itype, args)
+            if validation_error:
+                logger.warning("Invalid interactive payload: %s", validation_error)
+                return {"error": f"Payload inválido: {validation_error}"}
 
-        if itype == "button":
-            buttons = args.get("buttons", [])
-            interactive_payload["action"] = {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
-                    for b in buttons[:3]
-                ],
+            interactive_payload = {"type": itype}
+            if header:
+                interactive_payload["header"] = {"type": "text", "text": header}
+            interactive_payload["body"] = {"text": body}
+            if footer:
+                interactive_payload["footer"] = {"text": footer}
+
+            if itype == "button":
+                buttons = args.get("buttons", [])
+                interactive_payload["action"] = {
+                    "buttons": [
+                        {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
+                        for b in buttons[:3]
+                    ],
+                }
+            elif itype == "list":
+                button_label = (args.get("button_label") or "Opciones")[:20]
+                sections = args.get("sections", [])
+                interactive_payload["action"] = {
+                    "button": button_label,
+                    "sections": sections,
+                }
+
+            _send_pool.submit(
+                send_whatsapp_outbound,
+                'interactive', interactive_payload,
+                conversation.contact_phone, None, conversation.id,
+            )
+
+            bot = await get_bot_user_async()
+            last_msg_text = body[:255] or 'Mensaje interactivo'
+            msg = await sync_to_async(Message.objects.create)(
+                conversation=conversation,
+                direction="outbound",
+                message_type="interactive",
+                content=last_msg_text,
+                sender_name="Bot",
+                sender=bot,
+                metadata={"interactive": interactive_payload},
+            )
+            await sync_to_async(lambda: Conversation.objects.filter(
+                id=conversation.id,
+            ).update(
+                last_message=last_msg_text,
+                last_message_at=timezone.now(),
+            ))()
+            msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
+            await sync_to_async(publish_conversation_update)(conversation, msg_data)
+
+            return {"success": True, "message": "Mensaje interactivo enviado"}
+
+        if name == "escalate_to_human":
+            await _release_bot_take(conversation)
+            return {
+                "success": True,
+                "message": "La conversación ha sido escalada a un agente humano.",
             }
-        elif itype == "list":
-            button_label = (args.get("button_label") or "Opciones")[:20]
-            sections = args.get("sections", [])
-            interactive_payload["action"] = {
-                "button": button_label,
-                "sections": sections,
-            }
 
-        _send_pool.submit(
-            send_whatsapp_outbound,
-            'interactive', interactive_payload,
-            conversation.contact_phone, None, conversation.id,
-        )
+        return {"error": f"Función desconocida: {name}"}
+    except Exception as e:
+        logger.warning("Tool %s failed: %s", name, e)
+        incr_metric("tool_calls.failed")
+        session["fallback_count"] = session.get("fallback_count", 0) + 1
+        return {"error": str(e), "hint": "Por favor verifica los datos e intenta de nuevo."}
 
-        bot = await _get_bot_user_async()
-        last_msg_text = body[:255] or 'Mensaje interactivo'
-        msg = await sync_to_async(Message.objects.create)(
-            conversation=conversation,
-            direction="outbound",
-            message_type="interactive",
-            content=last_msg_text,
-            sender_name="Bot",
-            sender=bot,
-            metadata={"interactive": interactive_payload},
-        )
-        await sync_to_async(lambda: Conversation.objects.filter(
-            id=conversation.id,
-        ).update(
-            last_message=last_msg_text,
-            last_message_at=timezone.now(),
-        ))()
-        msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
-        await sync_to_async(publish_conversation_update)(conversation, msg_data)
 
-        return {"success": True, "message": "Mensaje interactivo enviado"}
-
-    if name == "escalate_to_human":
-        await _release_bot_take(conversation)
-        return {
-            "success": True,
-            "message": "La conversación ha sido escalada a un agente humano.",
-        }
-
-    return {"error": f"Función desconocida: {name}"}
-
+# ---------------------------------------------------------------------------
+#  Content builder
+# ---------------------------------------------------------------------------
 
 def _build_contents(session):
     history = session.get("history", [])
@@ -486,23 +620,34 @@ def _build_contents(session):
     return contents
 
 
+# ---------------------------------------------------------------------------
+#  Main entry point
+# ---------------------------------------------------------------------------
+
 async def handle_with_llm(session, conversation):
     logger.info("LLM handling conv=%s", conversation.id)
+
     client = _get_client()
+    if client is None:
+        logger.warning("No Gemini client — escalating conv=%s", conversation.id)
+        await _release_bot_take(conversation)
+        return "Un asesor humano te atenderá pronto.", True, False
 
     contents = _build_contents(session)
 
     if not contents:
-        reply = "¡Bienvenido a Domii Tuluá! 🚀\n\nSoy el asistente virtual. ¿Qué deseas hacer?\n\n1. Calcular un domicilio o mensajería\n2. Domii Fijo (domiciliario dedicado)\n3. Hablar con un asesor\n4. Preguntas frecuentes\n\nResponde con el número de la opción."
-        return reply, False
+        return WELCOME_REPLY, False, False
 
     system_prompt = await _build_system_prompt()
+
+    temperature = getattr(settings, "BOT_LLM_TEMPERATURE", 0.25)
+    max_tokens = getattr(settings, "BOT_LLM_MAX_OUTPUT_TOKENS", 1024)
 
     config = genai_types.GenerateContentConfig(
         system_instruction=system_prompt,
         tools=DEFAULT_TOOLS,
-        temperature=0.7,
-        max_output_tokens=512,
+        temperature=temperature,
+        max_output_tokens=max_tokens,
     )
 
     model = "gemini-3.1-flash-lite"
@@ -512,11 +657,8 @@ async def handle_with_llm(session, conversation):
     interactive_text = None
 
     try:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config,
-        )
+        response = await _generate_with_retry(client, model, contents, config)
+        incr_metric("llm.calls")
 
         while (
             tool_call_count < max_tool_calls
@@ -528,7 +670,7 @@ async def handle_with_llm(session, conversation):
             tool_call_count += 1
             logger.info("LLM tool call: %s (attempt %d)", function_call.name, tool_call_count)
 
-            result = await _execute_tool(function_call, conversation)
+            result = await _execute_tool(function_call, conversation, session)
 
             if function_call.name == "send_interactive":
                 if function_call.args:
@@ -548,11 +690,8 @@ async def handle_with_llm(session, conversation):
                 )],
             ))
 
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config,
-            )
+            response = await _generate_with_retry(client, model, contents, config)
+            incr_metric("llm.calls")
 
         if interactive_text is not None:
             reply = interactive_text
@@ -560,8 +699,14 @@ async def handle_with_llm(session, conversation):
             reply = response.candidates[0].content.parts[0].text or ""
         else:
             reply = ""
+
+        # --- Output sanitization ---
+        reply = sanitize_llm_output(reply)
+
     except Exception as e:
         logger.exception("Error en Gemini API para conv %s: %s", conversation.id, e)
+        incr_metric("llm.failures")
+        session["fallback_count"] = session.get("fallback_count", 0) + 1
         reply = "Ocurrió un error al procesar tu mensaje. Un asesor te atenderá pronto."
         await _release_bot_take(conversation)
         escalated = True

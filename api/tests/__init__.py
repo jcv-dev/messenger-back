@@ -14,12 +14,12 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact
-from .serializers import (
+from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact
+from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
 )
-from .views import ConversationViewSet, MessageViewSet
+from api.views import ConversationViewSet, MessageViewSet
 
 # Load bot package so @patch('api.bot.dispatcher.xxx') resolves
 from api import bot as _  # noqa
@@ -179,7 +179,7 @@ class SerializerStructureTests(SimpleTestCase):
 
     def test_no_serializer_uses_fields_all(self):
         from rest_framework import serializers
-        from . import serializers as s_module
+        from api import serializers as s_module
         for name in dir(s_module):
             obj = getattr(s_module, name)
             if isinstance(obj, type) and issubclass(obj, serializers.ModelSerializer) and obj is not serializers.ModelSerializer:

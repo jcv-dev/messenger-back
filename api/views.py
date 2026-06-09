@@ -1262,10 +1262,9 @@ def whatsapp_webhook(request):
 
                 if msg_id:
                     dedup_key = f"wamid_dedup:{msg_id}"
-                    if cache.get(dedup_key):
+                    if not cache.add(dedup_key, True, 86400):
                         logger.info('Skipping duplicate message %s (redis cache)', msg_id)
                         continue
-                    cache.set(dedup_key, True, 86400)
                     if Message.objects.filter(whatsapp_message_id=msg_id).exists():
                         logger.info('Skipping duplicate message %s', msg_id)
                         continue

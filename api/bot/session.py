@@ -3,8 +3,9 @@ import time
 from django.conf import settings
 from api.redis_client import get_sync_redis
 
-SESSION_TTL = 300
+SESSION_TTL = 600  # 10 minutes (exceeds the 5-minute bot take)
 REDIS_KEY = "bot:session"
+HISTORY_MAX_STORED = 40  # keep 2x what the LLM uses
 
 
 def get_session(conversation_id):
@@ -27,6 +28,11 @@ def get_session(conversation_id):
 
 def save_session(conversation_id, session):
     r = get_sync_redis()
+    # Truncate history before storing to avoid unbounded Redis growth
+    history = session.get("history", [])
+    if len(history) > HISTORY_MAX_STORED:
+        session["history"] = history[-HISTORY_MAX_STORED:]
+
     mapping = {
         "state": session.get("state", "llm"),
         "mode": session.get("mode", "llm"),

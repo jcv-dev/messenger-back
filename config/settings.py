@@ -203,6 +203,16 @@ else:
 DOMII_CALCULATOR_URL = config('DOMII_CALCULATOR_URL', default='http://calculator:8000')
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 
+# Bot hardening
+BOT_MAX_USER_MESSAGE_LENGTH = config('BOT_MAX_USER_MESSAGE_LENGTH', default=1000, cast=int)
+BOT_LLM_TEMPERATURE = config('BOT_LLM_TEMPERATURE', default=0.25, cast=float)
+BOT_LLM_MAX_OUTPUT_TOKENS = config('BOT_LLM_MAX_OUTPUT_TOKENS', default=1024, cast=int)
+BOT_LLM_RETRY_COUNT = config('BOT_LLM_RETRY_COUNT', default=3, cast=int)
+BOT_TOOLS_CACHE_TTL = config('BOT_TOOLS_CACHE_TTL', default=300, cast=int)
+BOT_INBOUND_RATE_LIMIT = config('BOT_INBOUND_RATE_LIMIT', default=10, cast=int)
+_raw_url_domains = config('BOT_ALLOWED_OUTPUT_URL_DOMAINS', default='')
+BOT_ALLOWED_OUTPUT_URL_DOMAINS = [h.strip() for h in _raw_url_domains.split(',') if h.strip()]
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,

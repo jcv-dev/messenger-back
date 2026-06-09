@@ -32,11 +32,7 @@ def publish(event: dict[str, Any]) -> None:
         logger.info("SSE published seq=%s type=%s", seq, event.get('type'))
     except Exception:
         reset_sync_redis()
-        logger.warning("Redis publish failed, resetting client for retry")
-        try:
-            get_sync_redis().publish(REDIS_CHANNEL, payload)
-        except Exception:
-            logger.exception("Failed to publish SSE event (retry)")
+        logger.exception("Failed to publish SSE event seq=%s", seq)
 
 
 # --- async subscribe/unsubscribe (called from async SSE view) ---
