@@ -239,6 +239,8 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
 
         if message_type == 'text':
             payload['text'] = {"body": content}
+        elif message_type == 'interactive':
+            payload['interactive'] = content
         elif message_type in ['sticker', 'image', 'video', 'audio', 'document']:
             parsed = urllib.parse.urlparse(content)
             media_id = None
@@ -1220,6 +1222,24 @@ def whatsapp_webhook(request):
                         last_msg_text = nm.get(nm_type, {}).get('caption', '') or f'Edited {nm_type}'
                     else:
                         last_msg_text = 'Edited message'
+
+                elif msg_type == 'interactive':
+                    inter = msg.get('interactive', {})
+                    itype = inter.get('type', '')
+                    if itype == 'list_reply':
+                        lr = inter.get('list_reply', {})
+                        content = lr.get('id', '')
+                        meta = {'interactive_type': 'list_reply', 'interactive_reply': lr}
+                        last_msg_text = lr.get('title', content)
+                    elif itype == 'button_reply':
+                        br = inter.get('button_reply', {})
+                        content = br.get('id', '')
+                        meta = {'interactive_type': 'button_reply', 'interactive_reply': br}
+                        last_msg_text = br.get('title', content)
+                    else:
+                        content = ''
+                        meta = {'interactive_type': itype}
+                        last_msg_text = 'Interactive'
 
                 else:
                     content = msg.get('text', {}).get('body', '') if isinstance(msg.get('text'), dict) else msg.get('text', '')

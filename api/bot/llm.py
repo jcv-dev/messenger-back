@@ -9,8 +9,9 @@ from google import genai
 from google.genai import types as genai_types
 
 from . import calculator
-from api.models import ConversationTake
-from api.views import publish_conversation_update
+from api.models import ConversationTake, Message
+from api.serializers import MessageSerializer
+from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
 logger = logging.getLogger("api.bot.llm")
 
@@ -63,6 +64,28 @@ FORMATO DE WHATSAPP (importante):
 - Listas usa: "1. item\n2. item\n3. item"
 - Saltos de línea: usa \n entre párrafos
 - Precios y totales siempre en negrita: *$4,700 COP*
+
+MENSAJES INTERACTIVOS:
+- No uses interactivos para todo. Mezcla naturalmente según el contexto.
+- USA send_interactive cuando el usuario deba elegir entre opciones concretas:
+  * Menú inicial: type="button" con 3-4 botones
+  * Selección de perfil: type="button" (cliente final / negocio)
+  * Selección de servicio: type="list" con los 5 tipos de servicio
+  * Método de pago: type="button" (efectivo / Nequi)
+  * Confirmaciones sí/no: type="button"
+  * Herramientas: type="list"
+- USA TEXTO NORMAL para:
+  * Saludos y bienvenidas
+  * Explicaciones del servicio
+  * Resultados de precios (formatea bien con *negrita*)
+  * Resultados de geocoding (muestra opciones)
+  * Respuestas de preguntas frecuentes
+  * Conversación natural sin opciones fijas
+- send_interactive(type="button") → hasta 3 botones
+- send_interactive(type="list") → hasta 10 opciones en secciones
+- IDs cortos y descriptivos: "domicilios", "efectivo", "si", "no", "cliente_final"
+- Después de un interactivo, no repitas la pregunta en texto
+- Cuando el usuario responda a un interactivo, llegará como texto con el ID
 
 Tu función es ayudar a los clientes a calcular el precio de un domicilio, solicitar un Domii Fijo (domiciliario dedicado), responder preguntas frecuentes, o escalar a un agente humano cuando sea necesario.
 
@@ -242,6 +265,73 @@ DEFAULT_TOOLS = [
                 ),
             ),
             genai_types.FunctionDeclaration(
+                name="send_interactive",
+                description="Envía un mensaje interactivo con botones o lista de opciones. Úsala para menús, selecciones y confirmaciones en vez de texto numerado.",
+                parameters=genai_types.Schema(
+                    type=genai_types.Type.OBJECT,
+                    properties={
+                        "type": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            enum=["button", "list"],
+                            description="button para hasta 3 botones de respuesta rápida, list para una lista de opciones",
+                        ),
+                        "header": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Texto del encabezado (opcional, máximo 60 caracteres)",
+                        ),
+                        "body": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Texto principal del mensaje",
+                        ),
+                        "footer": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Texto del pie de página (opcional, máximo 60 caracteres)",
+                        ),
+                        "button_label": genai_types.Schema(
+                            type=genai_types.Type.STRING,
+                            description="Texto del botón para listas (type=list). Máximo 20 caracteres.",
+                        ),
+                        "buttons": genai_types.Schema(
+                            type=genai_types.Type.ARRAY,
+                            items=genai_types.Schema(
+                                type=genai_types.Type.OBJECT,
+                                properties={
+                                    "id": genai_types.Schema(type=genai_types.Type.STRING, description="ID único que identifica la opción"),
+                                    "title": genai_types.Schema(type=genai_types.Type.STRING, description="Texto visible del botón (máximo 20 caracteres)"),
+                                },
+                                required=["id", "title"],
+                            ),
+                            description="Botones para type=button. Máximo 3 botones.",
+                        ),
+                        "sections": genai_types.Schema(
+                            type=genai_types.Type.ARRAY,
+                            items=genai_types.Schema(
+                                type=genai_types.Type.OBJECT,
+                                properties={
+                                    "title": genai_types.Schema(type=genai_types.Type.STRING, description="Título de la sección (máximo 24 caracteres)"),
+                                    "rows": genai_types.Schema(
+                                        type=genai_types.Type.ARRAY,
+                                        items=genai_types.Schema(
+                                            type=genai_types.Type.OBJECT,
+                                            properties={
+                                                "id": genai_types.Schema(type=genai_types.Type.STRING, description="ID único de la fila"),
+                                                "title": genai_types.Schema(type=genai_types.Type.STRING, description="Título de la fila (máximo 24 caracteres)"),
+                                                "description": genai_types.Schema(type=genai_types.Type.STRING, description="Descripción breve (máximo 72 caracteres, opcional)"),
+                                            },
+                                            required=["id", "title"],
+                                        ),
+                                        description="Filas de la sección. Máximo 10 filas combinadas entre todas las secciones.",
+                                    ),
+                                },
+                                required=["title", "rows"],
+                            ),
+                            description="Secciones para type=list. Cada sección tiene título y filas.",
+                        ),
+                    },
+                    required=["type", "body"],
+                ),
+            ),
+            genai_types.FunctionDeclaration(
                 name="escalate_to_human",
                 description="Escala la conversación a un agente humano cuando el cliente lo solicite o no se pueda ayudar.",
                 parameters=genai_types.Schema(
@@ -301,6 +391,62 @@ async def _execute_tool(function_call, conversation):
         place_id = args.get("place_id", "")
         result = await calculator.geocode_details(place_id=place_id)
         return result
+
+    if name == "send_interactive":
+        itype = args.get("type", "button")
+        body = args.get("body", "")
+        header = args.get("header")
+        footer = args.get("footer")
+
+        interactive_payload = {"type": itype}
+        if header:
+            interactive_payload["header"] = {"type": "text", "text": header}
+        interactive_payload["body"] = {"text": body}
+        if footer:
+            interactive_payload["footer"] = {"text": footer}
+
+        if itype == "button":
+            buttons = args.get("buttons", [])
+            interactive_payload["action"] = {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
+                    for b in buttons[:3]
+                ],
+            }
+        elif itype == "list":
+            button_label = (args.get("button_label") or "Opciones")[:20]
+            sections = args.get("sections", [])
+            interactive_payload["action"] = {
+                "button": button_label,
+                "sections": sections,
+            }
+
+        _send_pool.submit(
+            send_whatsapp_outbound,
+            'interactive', interactive_payload,
+            conversation.contact_phone, None, conversation.id,
+        )
+
+        bot = await _get_bot_user_async()
+        last_msg_text = body[:255] or 'Mensaje interactivo'
+        await sync_to_async(lambda: (
+            Message.objects.create(
+                conversation=conversation,
+                direction="outbound",
+                message_type="interactive",
+                content=last_msg_text,
+                sender_name="Bot",
+                sender=bot,
+                metadata={"interactive": interactive_payload},
+            ),
+            Conversation.objects.filter(id=conversation.id).update(
+                last_message=last_msg_text,
+                last_message_at=timezone.now(),
+            ),
+        ))()
+        await sync_to_async(publish_conversation_update)(conversation)
+
+        return {"success": True, "message": "Mensaje interactivo enviado"}
 
     if name == "escalate_to_human":
         await _release_bot_take(conversation)

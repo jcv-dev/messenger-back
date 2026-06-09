@@ -68,6 +68,7 @@ def _renew_bot_take(conversation):
         created_by=bot,
         duration_minutes=5,
     )
+    publish_conversation_update(conversation)
 
 
 def send_reply(conversation, text):
