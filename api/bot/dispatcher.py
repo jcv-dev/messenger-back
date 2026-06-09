@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import timedelta
 
 from asgiref.sync import sync_to_async
 
@@ -53,6 +54,22 @@ def has_domii_tag(conversation_id) -> bool:
     ).exists()
 
 
+def _renew_bot_take(conversation):
+    bot = get_bot_user()
+    if not bot:
+        return
+    ConversationTake.objects.filter(
+        created_by=bot,
+        conversation=conversation,
+        expires_at__gt=timezone.now(),
+    ).update(expires_at=timezone.now())
+    ConversationTake.create_take(
+        conversation=conversation,
+        created_by=bot,
+        duration_minutes=5,
+    )
+
+
 def send_reply(conversation, text):
     bot = get_bot_user()
     msg = Message.objects.create(
@@ -98,6 +115,8 @@ async def handle_inbound(event: dict):
         conversation = await sync_to_async(Conversation.objects.get)(id=conversation_id)
     except Conversation.DoesNotExist:
         return
+
+    await sync_to_async(_renew_bot_take)(conversation)
 
     user_text = msg_data.get("content", "").strip()
     session = await sync_to_async(get_session)(conversation_id)
