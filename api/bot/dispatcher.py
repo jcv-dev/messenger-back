@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import signal
 from datetime import timedelta
@@ -30,6 +31,18 @@ logger = logging.getLogger("api.bot")
 
 _shutdown_event = asyncio.Event()
 _RECONNECT_MAX_DELAY = 60
+
+_MAX_CONCURRENT = int(os.environ.get("BOT_MAX_CONCURRENT_TASKS", "50"))
+_task_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+_pending_tasks: set[asyncio.Task] = set()
+
+
+async def _handle_with_semaphore(event: dict):
+    async with _task_semaphore:
+        try:
+            await handle_inbound(event)
+        except Exception:
+            logger.exception("Error processing event in bot task")
 
 
 def has_active_human_take(conversation_id) -> bool:
@@ -237,9 +250,11 @@ async def bot_loop():
 
                 try:
                     event = json.loads(raw)
-                    await handle_inbound(event)
+                    task = asyncio.create_task(_handle_with_semaphore(event))
+                    _pending_tasks.add(task)
+                    task.add_done_callback(_pending_tasks.discard)
                 except Exception:
-                    logger.exception("Error processing event")
+                    logger.exception("Error creating bot task")
 
         except asyncio.CancelledError:
             break
@@ -250,6 +265,16 @@ async def bot_loop():
         finally:
             if subscriber_id is not None:
                 await unsubscribe(subscriber_id)
+
+    if _pending_tasks:
+        logger.info("Waiting for %d pending bot tasks...", len(_pending_tasks))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*list(_pending_tasks), return_exceptions=True),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for %d pending tasks", len(_pending_tasks))
 
     logger.info("Bot loop shut down gracefully")
 
