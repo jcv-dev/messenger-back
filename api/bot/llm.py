@@ -84,7 +84,7 @@ MENSAJES INTERACTIVOS:
 - send_interactive(type="button") → hasta 3 botones
 - send_interactive(type="list") → hasta 10 opciones en secciones
 - IDs cortos y descriptivos: "domicilios", "efectivo", "si", "no", "cliente_final"
-- Después de un interactivo, no repitas la pregunta en texto
+- Después de send_interactive, detente por completo. No generes más texto ni llames más herramientas. Espera la respuesta del usuario.
 - Cuando el usuario responda a un interactivo, llegará como texto con el ID
 
 Tu función es ayudar a los clientes a calcular el precio de un domicilio, solicitar un Domii Fijo (domiciliario dedicado), responder preguntas frecuentes, o escalar a un agente humano cuando sea necesario.
@@ -429,22 +429,23 @@ async def _execute_tool(function_call, conversation):
 
         bot = await _get_bot_user_async()
         last_msg_text = body[:255] or 'Mensaje interactivo'
-        await sync_to_async(lambda: (
-            Message.objects.create(
-                conversation=conversation,
-                direction="outbound",
-                message_type="interactive",
-                content=last_msg_text,
-                sender_name="Bot",
-                sender=bot,
-                metadata={"interactive": interactive_payload},
-            ),
-            Conversation.objects.filter(id=conversation.id).update(
-                last_message=last_msg_text,
-                last_message_at=timezone.now(),
-            ),
+        msg = await sync_to_async(Message.objects.create)(
+            conversation=conversation,
+            direction="outbound",
+            message_type="interactive",
+            content=last_msg_text,
+            sender_name="Bot",
+            sender=bot,
+            metadata={"interactive": interactive_payload},
+        )
+        await sync_to_async(lambda: Conversation.objects.filter(
+            id=conversation.id,
+        ).update(
+            last_message=last_msg_text,
+            last_message_at=timezone.now(),
         ))()
-        await sync_to_async(publish_conversation_update)(conversation)
+        msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
+        await sync_to_async(publish_conversation_update)(conversation, msg_data)
 
         return {"success": True, "message": "Mensaje interactivo enviado"}
 
@@ -514,6 +515,9 @@ async def handle_with_llm(session, conversation):
             logger.info("LLM tool call: %s (attempt %d)", function_call.name, tool_call_count)
 
             result = await _execute_tool(function_call, conversation)
+
+            if function_call.name == "send_interactive":
+                break
 
             if function_call.name == "escalate_to_human":
                 escalated = True
