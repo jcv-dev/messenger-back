@@ -276,3 +276,19 @@ class SSEToken(models.Model):
 
     def is_valid(self):
         return not self.used and self.expires_at > timezone.now()
+
+
+class BotExemptContact(models.Model):
+    """Phone numbers pre-registered as not handled by the bot."""
+    contact_phone = models.CharField(max_length=50, unique=True)
+    contact_name = models.CharField(max_length=255, blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.contact_name or '—'} ({self.contact_phone})"
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Bot Exempt Contact"
+        verbose_name_plural = "Bot Exempt Contacts"

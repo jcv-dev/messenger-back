@@ -6,7 +6,14 @@ from pathlib import Path
 import os
 
 try:
-    from decouple import config
+    from decouple import Config, RepositoryEnv
+
+    dotenv_file = os.environ.get('DOTENV_FILE')
+    if dotenv_file and os.path.isfile(dotenv_file):
+        _cfg = Config(RepositoryEnv(dotenv_file))
+        config = _cfg.get
+    else:
+        from decouple import config
 except ModuleNotFoundError:
     def config(key, default=None, cast=None):
         value = os.environ.get(key, default)
@@ -191,6 +198,9 @@ else:
             'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         },
     }
+
+# Bot / Calculator
+DOMII_CALCULATOR_URL = config('DOMII_CALCULATOR_URL', default='http://calculator:8000')
 
 LOGGING = {
     'version': 1,

@@ -2,7 +2,7 @@
 Admin configuration for API
 """
 from django.contrib import admin
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, UserProfile
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, UserProfile, BotExemptContact
 
 
 @admin.register(Conversation)
@@ -57,3 +57,9 @@ class UserProfileAdmin(admin.ModelAdmin):
     list_display = ['user', 'group']
     list_filter = ['group']
     search_fields = ['user__username', 'user__email']
+
+
+@admin.register(BotExemptContact)
+class BotExemptContactAdmin(admin.ModelAdmin):
+    list_display = ['contact_phone', 'contact_name', 'created_by', 'created_at']
+    search_fields = ['contact_phone', 'contact_name']
