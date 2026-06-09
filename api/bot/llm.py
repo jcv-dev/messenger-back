@@ -153,6 +153,8 @@ GEOCODING:
 - Si la dirección no necesita geocodificación (ej: dirección escrita completa), puedes pasarla directamente sin coordenadas
 
 REGLAS IMPORTANTES:
+- NO saludes en cada mensaje. Solo saluda en el primer mensaje de la conversación.
+- Si el cliente ya está en medio de un flujo (eligiendo perfil, servicio, pago, etc.), responde directo y conciso sin preámbulos ni saludos.
 - Respuestas concisas (máximo 300 caracteres)
 - Si el cliente se desvía, guíalo de vuelta amablemente
 - Usa la herramienta escalate_to_human si:
@@ -489,7 +491,7 @@ async def handle_with_llm(session, conversation):
         system_instruction=system_prompt,
         tools=DEFAULT_TOOLS,
         temperature=0.7,
-        max_output_tokens=1024,
+        max_output_tokens=512,
     )
 
     model = "gemini-3.1-flash-lite"
