@@ -77,7 +77,7 @@ class SessionTests(SimpleTestCase):
         saved_mapping = mock_r.hset.call_args[1]["mapping"]
         import json
         saved_history = json.loads(saved_mapping["history"])
-        self.assertLessEqual(len(saved_history), 40)
+        self.assertLessEqual(len(saved_history), 20)
         # Most recent entries should be kept
         self.assertEqual(saved_history[-1]["content"], "49")
 

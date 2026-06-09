@@ -42,7 +42,7 @@ TOOLS_CACHE_TTL = getattr(settings, "BOT_TOOLS_CACHE_TTL", 300)
 _llm_client = None
 
 
-async def _release_bot_take(conversation):
+async def _release_bot_take(conversation, escalated=False):
     bot = await get_bot_user_async()
     if bot:
         await sync_to_async(lambda: ConversationTake.objects.filter(
@@ -50,7 +50,7 @@ async def _release_bot_take(conversation):
             conversation=conversation,
             expires_at__gt=timezone.now(),
         ).update(expires_at=timezone.now()))()
-    await sync_to_async(publish_conversation_update)(conversation)
+    await sync_to_async(publish_conversation_update)(conversation, escalated=escalated)
 
 
 # ---------------------------------------------------------------------------
@@ -93,131 +93,55 @@ async def _build_system_prompt():
         for t in (_tools_cache["data"] or [])
     ) or "  - Ninguna disponible"
 
-    return f"""Eres el asistente virtual de Domii Tuluá, una empresa de domicilios y mensajería en Tuluá, Colombia.
+    return f"""Eres el asistente virtual de Domii Tulu\u00e1, empresa de domicilios y mensajer\u00eda en Tulu\u00e1, Colombia.
 
-IDIOMA:
-- Responde SIEMPRE en español colombiano. NUNCA uses inglés bajo ninguna circunstancia.
-- Sé amable, profesional y cercano.
+IDIOMA: Responde SIEMPRE en espa\u00f1ol colombiano. S\u00e9 amable, profesional y cercano.
 
-FORMATO DE WHATSAPP (importante):
-- *texto* = negrita (UN solo asterisco a cada lado, NO dos)
-- _texto_ = cursiva
-- ~texto~ = tachado
-- Listas usa: "1. item\n2. item\n3. item"
-- Saltos de línea: usa \n entre párrafos
+FORMATO WHATSAPP:
+- *texto* = negrita, _texto_ = cursiva, ~texto~ = tachado
 - Precios y totales siempre en negrita: *$4,700 COP*
+- send_interactive(type="button") \u2192 hasta 3 botones, IDs cortos
+- send_interactive(type="list") \u2192 hasta 10 opciones en secciones
+- Despu\u00e9s de send_interactive, DETENTE. No generes m\u00e1s texto ni llames m\u00e1s herramientas.
+- USA send_interactive para: men\u00fa inicial, perfil, servicio, pago, confirmaciones s\u00ed/no, resultados de geocoding
+- USA TEXTO NORMAL para: explicaciones, resultados de precios, preguntas frecuentes, conversaci\u00f3n natural
 
-MENSAJES INTERACTIVOS:
-- No uses interactivos para todo. Mezcla naturalmente según el contexto.
-- USA send_interactive cuando el usuario deba elegir entre opciones concretas:
-  * Menú inicial: type="button" — "Cotizar servicio", "Domii Fijo", "Preguntas", "Asesor"
-  * Selección de perfil: type="button" — "Cliente final", "Negocio"
-  * Selección de servicio: type="list" con los 5 tipos de servicio
-  * Método de pago: type="button" — "Efectivo", "Nequi"
-  * Confirmaciones sí/no: type="button" — "Sí", "No"
-  * Resultados de geocoding: type="button" con place_id como ID
-- USA TEXTO NORMAL para:
-  * Explicaciones del servicio
-  * Resultados de precios (formatea bien con *negrita*)
-  * Respuestas de preguntas frecuentes
-  * Conversación natural sin opciones fijas
-- send_interactive(type="button") → hasta 3 botones
-- send_interactive(type="list") → hasta 10 opciones en secciones
-- IDs cortos y descriptivos: "domicilios", "efectivo", "si", "no", "cliente_final"
-- Después de send_interactive, detente por completo. No generes más texto ni llames más herramientas. Espera la respuesta del usuario.
-- Cuando el usuario responda a un interactivo, llegará como texto con el ID
+SERVICIOS: Domicilios, Mensajer\u00eda, Compras por encargo, Tr\u00e1mites, Bancarios, Domii Fijo (domiciliario dedicado por horas/d\u00edas).
+HORARIOS: {settings.BOT_OPERATING_HOURS}.
+COBERTURA: Tulu\u00e1 urbano y veredas. Fuera del \u00e1rea (Cali, Buga) = tarifas fijas.
+PAGO: Efectivo (sin recargo) o Nequi (+$500). Pago al recibir.
 
-Tu función es ayudar a los clientes a cotizar un servicio de domicilio o mensajería, solicitar un Domii Fijo (domiciliario dedicado), responder preguntas frecuentes, o escalar a un agente humano cuando sea necesario.
-
-SERVICIOS:
-- Domicilios: envíos de todo tipo dentro de Tuluá
-- Mensajería: envíos urgentes de documentos o paquetes pequeños
-- Compras por encargo
-- Trámites: gestión de documentos
-- Bancarios: diligencias bancarias
-- Domii Fijo: domiciliario dedicado por horas/días (para negocios)
-
-HORARIOS:
-- Lunes a sábado: 8:00 AM a 8:00 PM
-- Domingos y festivos: 9:00 AM a 6:00 PM
-
-COBERTURA:
-- Casco urbano de Tuluá y veredas cercanas
-- Destinos fuera del área (Cali, Buga, etc.) aplican tarifas fijas
-
-MÉTODOS DE PAGO:
-- Efectivo (sin recargo)
-- Nequi (+$500 COP de recargo)
-- El pago se realiza al recibir el domicilio
-
-HERRAMIENTAS DISPONIBLES:
+HERRAMIENTAS:
 {tools_text}
 
-FLUJO PARA COTIZAR UN SERVICIO:
-1. Perfil: usuario final (usuario_final) o negocio (negocio)
-2. Tipo de servicio: domicilios, mensajería, compras por encargo, trámites o bancarios
-3. Dirección de origen — si el cliente da un nombre (ej: "La herradura" o "centro"), usa geocode_search para buscar direcciones. Si hay varios resultados, preséntalos con send_interactive(type="list") usando title para el nombre corto (barrio/zona, máx 24 chars) y description para la dirección completa (máx 72 chars). Si un solo resultado, usa geocode_details. Después de resolver, el sistema envía automáticamente un mapa con la ubicación — SIEMPRE confirma la dirección con el usuario antes de continuar
-4. Dirección de destino — igual que origen, usa geocoding si es necesario. Siempre confirma después de resolver
-5. ¿Más paradas? Si sí, volver al paso 3. Si no, continuar.
-6. Herramientas adicionales: las herramientas disponibles vienen del sistema y son dinámicas. Comunica al usuario las herramientas disponibles con sus descripciones y pídele que escriba cuáles necesita (ej: "canasta y maletín", "solo canasta", "ninguna"). El usuario puede escribir varias. Extrae los tool keys del texto del usuario. Si el usuario no necesita herramientas, tools=[] .
-7. Método de pago: efectivo o Nequi
-8. ¿Necesitas que el domiciliario lleve un acompañante? (ej: para cargar objetos pesados como tortas, paquetes grandes) → sí o no
-9. Calcular precio usando la herramienta calculate_price (REQUIERE coordenadas lat/lng de geocode_details — si las omites, fallará)
-10. Cuando calculate_price devuelva el resultado, preséntalo al cliente:
-    - Total: $X COP
-    - Distancia: X km
-    - Método de pago: efectivo/Nequi
-    - Si Nequi, el total incluye +$500 de recargo
-    - Si está lloviendo (weather.is_raining), puede haber recargo por lluvia
-    - Pregunta si confirma el pedido
-11. Si confirma, pregunta el nombre y teléfono de la persona que recibirá el pedido
-12. Indicar que el pedido ha sido enviado exitosamente con los datos ingresados
+FLUJO COTIZAR SERVICIO:
+1. Perfil: usuario_final o negocio
+2. Tipo servicio: domicilios, mensajer\u00eda, compras por encargo, tr\u00e1mites, bancarios
+3-4. Origen y destino: usa geocode_search si no hay coordenadas. Si m\u00faltiples resultados \u2192 send_interactive(type="list"), title m\u00e1x 24 chars (barrio/zona), description m\u00e1x 72 chars (direcci\u00f3n). Si un solo resultado \u2192 geocode_details directo. Despu\u00e9s de geocode_details el sistema env\u00eda ubicaci\u00f3n en mapa. SIEMPRE confirma la direcci\u00f3n con el usuario.
+5. \u00bfM\u00e1s paradas? (repetir desde 3 si s\u00ed)
+6. Herramientas: el usuario escribe cu\u00e1les necesita (ej: "canasta y malet\u00edn", "ninguna"). Extrae los tool keys.
+7. Pago: efectivo o Nequi
+8. \u00bfAcompa\u00f1ante? (objetos pesados) \u2192 s\u00ed/no
+9. calculate_price \u2014 REQUIERE coordenadas (lat, lng) de geocode_details. Si faltan, falla.
+10. Resultado: muestra *total*, distancia, m\u00e9todo de pago. Si Nequi, +$500. Pregunta si confirma.
+11-12. Si confirma: nombre y tel\u00e9fono del receptor \u2192 pedido enviado.
 
 FLUJO DOMII FIJO:
-1. Nombre del negocio
-2. Dirección del negocio
-3. Teléfono del negocio
-4. Fecha del servicio
-5. Hora de inicio
-6. Hora de fin
-7. Volumen estimado (1-5, 5-15, o +15 pedidos)
-8. Mostrar resumen y confirmar
-9. Indicar que la solicitud ha sido enviada
-
-GEOCODING:
-- Usa geocode_search para buscar direcciones por nombre (incluyendo "centro").
-- Si hay múltiples resultados, preséntalos con send_interactive(type="list").
-  * title: nombre corto del lugar o barrio (máximo 24 caracteres)
-  * description: dirección completa (máximo 72 caracteres)
-  * id: el place_id del resultado
-- Si el display_name es muy largo, extrae el barrio/zona para title y pon la dirección completa en description.
-- Cuando el usuario seleccione, recibirás el place_id como texto. Llama geocode_details.
-- Si hay un solo resultado, usa geocode_details directamente.
-- Después de geocode_details, el sistema envía automáticamente un mapa con la ubicación (map_sent=true en el resultado). Tú debes confirmar la dirección con el usuario: "Usaré: [dirección]. ¿Es correcta?" usando send_interactive(type="button") con Sí/No.
-- Si el usuario dice No, vuelve a preguntar la dirección o busca alternativas con geocode_search.
-- Si no hay resultados, informa: "No encontré esa dirección. Intenta con más detalles (barrio, puntos de referencia) o comparte tu ubicación."
-- Las coordenadas (lat, lng) son REQUERIDAS por calculate_price. Si intentas llamar calculate_price sin coordenadas, recibirás un error. SIEMPRE obtén coordenadas con geocode_details antes de calculate_price.
-- Si el usuario da una dirección precisa (ej: "Calle 10 #20-30, Tuluá"), haz geocode_search con esa dirección para obtener el place_id y luego geocode_details para las coordenadas.
+1. Nombre negocio \u2192 2. Direcci\u00f3n \u2192 3. Tel\u00e9fono \u2192 4. Fecha \u2192 5. Hora inicio \u2192 6. Hora fin \u2192 7. Volumen (1-5, 5-15, +15) \u2192 8. Resumen y confirmar \u2192 9. Solicitud enviada.
 
 ERRORES:
-- Si calculate_price falla o devuelve error (ej: "Faltan coordenadas"), llama geocode_details para obtener las coordenadas y luego reintenta calculate_price.
-- Si geocode_search no encuentra nada, sugiere alternativas: "No encontré esa dirección. Intenta con más detalles o comparte tu ubicación por WhatsApp."
-- Si geocode_details falla, pide al usuario que describa la dirección con más detalle o que comparta su ubicación por WhatsApp.
-- Si un error ocurre al enviar el pedido, informa con claridad: "Ocurrió un error al procesar tu pedido. Un asesor te ayudará."
-- NUNCA muestres errores técnicos (códigos, JSON, tracebacks) al usuario.
-- Si el problema persiste después de intentar ayudar, ofrece escalate_to_human.
+- calculate_price sin coordenadas \u2192 geocode_details y reintenta.
+- Sin resultados de geocoding \u2192 "Comparte tu ubicaci\u00f3n por WhatsApp o da m\u00e1s detalles."
+- Error al enviar pedido \u2192 informa claramente, ofrece escalate_to_human. NUNCA muestres errores t\u00e9cnicos.
 
-REGLAS IMPORTANTES:
-- NO saludes en cada mensaje. Solo saluda en el primer mensaje de la conversación.
-- Si el cliente ya está en medio de un flujo (eligiendo perfil, servicio, pago, etc.), responde directo y conciso sin preámbulos ni saludos.
-- Respuestas concisas (máximo 300 caracteres)
-- Si el cliente se desvía, guíalo de vuelta amablemente
-- Usa la herramienta escalate_to_human si:
-  1. El cliente pide explícitamente un asesor humano (agente, persona, asesor, operador)
-  2. Después de 3 intentos el cliente no logra completar el flujo
-- Para calcular precios USA SIEMPRE la herramienta calculate_price (nunca inventes precios)
-- Después de completar un pedido, agradece al cliente y pregunta si necesita algo más
-- Si el cliente escribe "salir", "cancelar" o "menú", responde SOLO con el mensaje de bienvenida estándar"""
+REGLAS:
+- Saluda solo en el primer mensaje. Despu\u00e9s s\u00e9 directo y conciso (m\u00e1x 300 caracteres).
+- Usa calculate_price siempre. NUNCA inventes precios.
+- escalate_to_human si: cliente lo pide, o despu\u00e9s de 3 intentos fallidos.
+- Si el cliente pregunta algo sobre Domii que no sabes responder (ej: estado de un pedido, datos de contacto espec\u00edficos), escala con escalate_to_human explicando el motivo.
+- Si el cliente pregunta algo completamente ajeno a Domii (deportes, clima, noticias, recetas, etc.), responde que solo ayudas con domicilios y mensajer\u00eda en Tulu\u00e1, y redirige al men\u00fa. NO escales en este caso.
+- Al completar pedido: agradece y pregunta si necesita algo m\u00e1s.
+- Si el cliente escribe "salir", "cancelar" o "men\u00fa", responde con el mensaje de bienvenida."""
 
 
 DEFAULT_TOOLS = [
@@ -225,14 +149,14 @@ DEFAULT_TOOLS = [
         function_declarations=[
             genai_types.FunctionDeclaration(
                 name="calculate_price",
-                description="Calcula el precio de un domicilio. Llámala cuando tengas todos los datos del cliente (perfil, segmentos, herramientas, método de pago, acompañante).",
+                description="Calcula el precio del domicilio con todos los datos requeridos.",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
                         "profile": genai_types.Schema(
                             type=genai_types.Type.STRING,
                             enum=["usuario_final", "negocio"],
-                            description="usuario_final para cliente final, negocio para negocio",
+                            description="Cliente final o negocio",
                         ),
                         "segments": genai_types.Schema(
                             type=genai_types.Type.ARRAY,
@@ -242,33 +166,33 @@ DEFAULT_TOOLS = [
                                     "service_type": genai_types.Schema(
                                         type=genai_types.Type.STRING,
                                         enum=["domicilios", "mensajeria", "purchases", "tramites", "bancarios"],
-                                        description="Tipo de servicio para este segmento",
+                                        description="Tipo de servicio",
                                     ),
                                     "description": genai_types.Schema(
                                         type=genai_types.Type.STRING,
-                                        description="Descripción opcional del segmento",
+                                        description="Opcional",
                                     ),
                                     "origin": genai_types.Schema(
                                         type=genai_types.Type.OBJECT,
                                         properties={
-                                            "address": genai_types.Schema(type=genai_types.Type.STRING, description="Dirección de origen"),
-                                            "lat": genai_types.Schema(type=genai_types.Type.NUMBER, description="Latitud (null si no se conoce)", nullable=True),
-                                            "lng": genai_types.Schema(type=genai_types.Type.NUMBER, description="Longitud (null si no se conoce)", nullable=True),
+                                            "address": genai_types.Schema(type=genai_types.Type.STRING, description="Direcci\u00f3n"),
+                                            "lat": genai_types.Schema(type=genai_types.Type.NUMBER, nullable=True),
+                                            "lng": genai_types.Schema(type=genai_types.Type.NUMBER, nullable=True),
                                         },
                                         required=["address", "lat", "lng"],
                                     ),
                                     "destination": genai_types.Schema(
                                         type=genai_types.Type.OBJECT,
                                         properties={
-                                            "address": genai_types.Schema(type=genai_types.Type.STRING, description="Dirección de destino"),
-                                            "lat": genai_types.Schema(type=genai_types.Type.NUMBER, description="Latitud (null si no se conoce)", nullable=True),
-                                            "lng": genai_types.Schema(type=genai_types.Type.NUMBER, description="Longitud (null si no se conoce)", nullable=True),
+                                            "address": genai_types.Schema(type=genai_types.Type.STRING, description="Direcci\u00f3n"),
+                                            "lat": genai_types.Schema(type=genai_types.Type.NUMBER, nullable=True),
+                                            "lng": genai_types.Schema(type=genai_types.Type.NUMBER, nullable=True),
                                         },
                                         required=["address", "lat", "lng"],
                                     ),
                                     "instructions": genai_types.Schema(
                                         type=genai_types.Type.STRING,
-                                        description="Instrucciones adicionales para el domiciliario",
+                                        description="Instrucciones extra",
                                         nullable=True,
                                     ),
                                 },
@@ -278,16 +202,16 @@ DEFAULT_TOOLS = [
                         "tools": genai_types.Schema(
                             type=genai_types.Type.ARRAY,
                             items=genai_types.Schema(type=genai_types.Type.STRING),
-                            description="Lista de herramientas adicionales (keys del sistema de herramientas)",
+                            description="Herramientas adicionales (tool keys)",
                         ),
                         "payment_method": genai_types.Schema(
                             type=genai_types.Type.STRING,
                             enum=["efectivo", "nequi"],
-                            description="Método de pago",
+                            description="M\u00e9todo de pago",
                         ),
                         "acompanante": genai_types.Schema(
                             type=genai_types.Type.BOOLEAN,
-                            description="true si el domiciliario necesita un acompañante para cargar objetos pesados, false si no",
+                            description="Requiere acompa\u00f1ante para objetos pesados",
                         ),
                     },
                     required=["profile", "segments", "payment_method", "acompanante"],
@@ -295,13 +219,13 @@ DEFAULT_TOOLS = [
             ),
             genai_types.FunctionDeclaration(
                 name="geocode_search",
-                description="Busca direcciones por nombre para geocodificación. Devuelve una lista de resultados con display_name (nombre legible) y place_id (para obtener coordenadas). Úsala cuando el cliente dé direcciones por nombre (ej: 'La herradura', 'supercentro').",
+                description="Busca direcciones por nombre. Devuelve lista con display_name y place_id.",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
                         "query": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Dirección o lugar a buscar",
+                            description="Direcci\u00f3n o lugar a buscar",
                         ),
                     },
                     required=["query"],
@@ -309,13 +233,13 @@ DEFAULT_TOOLS = [
             ),
             genai_types.FunctionDeclaration(
                 name="geocode_details",
-                description="Obtiene coordenadas exactas (lat, lng) de un place_id obtenido con geocode_search. Llámala después de que el usuario confirme la dirección correcta.",
+                description="Obtiene coordenadas (lat, lng) de un place_id. Requerido antes de calculate_price.",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
                         "place_id": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Place ID del resultado de geocode_search",
+                            description="Place ID de geocode_search",
                         ),
                     },
                     required=["place_id"],
@@ -323,66 +247,66 @@ DEFAULT_TOOLS = [
             ),
             genai_types.FunctionDeclaration(
                 name="send_interactive",
-                description="Envía un mensaje interactivo con botones o lista de opciones. Úsala para menús, selecciones y confirmaciones en vez de texto numerado.",
+                description="Env\u00eda mensaje interactivo (botones o lista) para men\u00fas y selecciones.",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
                         "type": genai_types.Schema(
                             type=genai_types.Type.STRING,
                             enum=["button", "list"],
-                            description="button para hasta 3 botones de respuesta rápida, list para una lista de opciones",
+                            description="button (m\u00e1x 3 botones) o list (hasta 10 filas)",
                         ),
                         "header": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Texto del encabezado (opcional, máximo 60 caracteres)",
+                            description="Encabezado opcional (m\u00e1x 60)",
                         ),
                         "body": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Texto principal del mensaje",
+                            description="Texto principal",
                         ),
                         "footer": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Texto del pie de página (opcional, máximo 60 caracteres)",
+                            description="Pie opcional (m\u00e1x 60)",
                         ),
                         "button_label": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Texto del botón para listas (type=list). Máximo 20 caracteres.",
+                            description="Texto del bot\u00f3n para listas (m\u00e1x 20)",
                         ),
                         "buttons": genai_types.Schema(
                             type=genai_types.Type.ARRAY,
                             items=genai_types.Schema(
                                 type=genai_types.Type.OBJECT,
                                 properties={
-                                    "id": genai_types.Schema(type=genai_types.Type.STRING, description="ID único que identifica la opción"),
-                                    "title": genai_types.Schema(type=genai_types.Type.STRING, description="Texto visible del botón (máximo 20 caracteres)"),
+                                    "id": genai_types.Schema(type=genai_types.Type.STRING, description="ID \u00fanico"),
+                                    "title": genai_types.Schema(type=genai_types.Type.STRING, description="Texto del bot\u00f3n (m\u00e1x 20)"),
                                 },
                                 required=["id", "title"],
                             ),
-                            description="Botones para type=button. Máximo 3 botones.",
+                            description="Botones para type=button (m\u00e1x 3)",
                         ),
                         "sections": genai_types.Schema(
                             type=genai_types.Type.ARRAY,
                             items=genai_types.Schema(
                                 type=genai_types.Type.OBJECT,
                                 properties={
-                                    "title": genai_types.Schema(type=genai_types.Type.STRING, description="Título de la sección (máximo 24 caracteres)"),
+                                    "title": genai_types.Schema(type=genai_types.Type.STRING, description="T\u00edtulo de secci\u00f3n (m\u00e1x 24)"),
                                     "rows": genai_types.Schema(
                                         type=genai_types.Type.ARRAY,
                                         items=genai_types.Schema(
                                             type=genai_types.Type.OBJECT,
                                             properties={
-                                                "id": genai_types.Schema(type=genai_types.Type.STRING, description="ID único de la fila"),
-                                                "title": genai_types.Schema(type=genai_types.Type.STRING, description="Título de la fila (máximo 24 caracteres)"),
-                                                "description": genai_types.Schema(type=genai_types.Type.STRING, description="Descripción breve (máximo 72 caracteres, opcional)"),
+                                                "id": genai_types.Schema(type=genai_types.Type.STRING, description="ID \u00fanico"),
+                                                "title": genai_types.Schema(type=genai_types.Type.STRING, description="T\u00edtulo (m\u00e1x 24)"),
+                                                "description": genai_types.Schema(type=genai_types.Type.STRING, description="Descripci\u00f3n (m\u00e1x 72)"),
                                             },
                                             required=["id", "title"],
                                         ),
-                                        description="Filas de la sección. Máximo 10 filas combinadas entre todas las secciones.",
+                                        description="Filas (m\u00e1x 10 combinadas)",
                                     ),
                                 },
                                 required=["title", "rows"],
                             ),
-                            description="Secciones para type=list. Cada sección tiene título y filas.",
+                            description="Secciones para type=list",
                         ),
                     },
                     required=["type", "body"],
@@ -390,13 +314,13 @@ DEFAULT_TOOLS = [
             ),
             genai_types.FunctionDeclaration(
                 name="escalate_to_human",
-                description="Escala la conversación a un agente humano cuando el cliente lo solicite o no se pueda ayudar.",
+                description="Escala la conversaci\u00f3n a un agente humano.",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
                         "reason": genai_types.Schema(
                             type=genai_types.Type.STRING,
-                            description="Razón de la escalación",
+                            description="Raz\u00f3n de la escalaci\u00f3n",
                         ),
                     },
                     required=["reason"],
@@ -669,7 +593,7 @@ async def _execute_tool(function_call, conversation, session):
             return {"success": True, "message": "Mensaje interactivo enviado"}
 
         if name == "escalate_to_human":
-            await _release_bot_take(conversation)
+            await _release_bot_take(conversation, escalated=True)
             incr_metric("tool_calls.succeeded")
             return {
                 "success": True,
@@ -691,10 +615,11 @@ async def _execute_tool(function_call, conversation, session):
 def _build_contents(session):
     history = session.get("history", [])
     contents = []
-    for msg in history[-20:]:
+    for msg in history[-10:]:
         role = "user" if msg.get("role") == "user" else "model"
         text = msg.get("content", "")
         if text:
+            text = text[:300]
             contents.append(genai_types.Content(
                 role=role,
                 parts=[genai_types.Part.from_text(text=text)],
@@ -712,7 +637,7 @@ async def handle_with_llm(session, conversation):
     client = _get_client()
     if client is None:
         logger.warning("No Gemini client — escalating conv=%s", conversation.id)
-        await _release_bot_take(conversation)
+        await _release_bot_take(conversation, escalated=True)
         return "Un asesor humano te atenderá pronto.", True, False
 
     contents = _build_contents(session)
@@ -733,7 +658,7 @@ async def handle_with_llm(session, conversation):
     )
 
     model = "gemini-3.1-flash-lite"
-    max_tool_calls = 5
+    max_tool_calls = 4
     tool_call_count = 0
     escalated = False
     interactive_text = None
@@ -804,7 +729,7 @@ async def handle_with_llm(session, conversation):
         incr_metric("llm.failures")
         session["fallback_count"] = session.get("fallback_count", 0) + 1
         reply = "Ocurrió un error al procesar tu mensaje. Un asesor te atenderá pronto."
-        await _release_bot_take(conversation)
+        await _release_bot_take(conversation, escalated=True)
         escalated = True
 
     return reply.strip(), escalated, interactive_text is not None

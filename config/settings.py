@@ -203,6 +203,12 @@ else:
 DOMII_CALCULATOR_URL = config('DOMII_CALCULATOR_URL', default='http://calculator:8000')
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 
+# Bot operating hours — used in system prompt and FAQ router
+BOT_OPERATING_HOURS = config(
+    'BOT_OPERATING_HOURS',
+    default='Lunes a sábado 8:00 AM a 8:00 PM, domingos y festivos 9:00 AM a 6:00 PM',
+)
+
 # Bot hardening
 BOT_MAX_USER_MESSAGE_LENGTH = config('BOT_MAX_USER_MESSAGE_LENGTH', default=1000, cast=int)
 BOT_LLM_TEMPERATURE = config('BOT_LLM_TEMPERATURE', default=0.25, cast=float)

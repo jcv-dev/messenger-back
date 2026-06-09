@@ -29,6 +29,7 @@ from . import metrics
 from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session
 from .llm import handle_with_llm
+from .router import try_route_message
 
 logger = logging.getLogger("api.bot")
 
@@ -133,7 +134,7 @@ def has_domii_tag(conversation_id) -> bool:
     ).exists()
 
 
-async def _release_bot_take(conversation):
+async def _release_bot_take(conversation, escalated=False):
     bot = await get_bot_user_async()
     if not bot:
         return
@@ -142,7 +143,7 @@ async def _release_bot_take(conversation):
         conversation=conversation,
         expires_at__gt=timezone.now(),
     ).update(expires_at=timezone.now()))()
-    await sync_to_async(publish_conversation_update)(conversation)
+    await sync_to_async(publish_conversation_update)(conversation, escalated=escalated)
 
 
 def _renew_bot_take(conversation):
@@ -252,7 +253,7 @@ async def handle_inbound(event: dict):
                 conversation_id, session["fallback_count"],
             )
             await sync_to_async(delete_session)(conversation_id)
-            await _release_bot_take(conversation)
+            await _release_bot_take(conversation, escalated=True)
             await sync_to_async(send_reply)(
                 conversation,
                 "He tenido dificultades para ayudarte. Un asesor humano te atender\xe1 pronto.",
@@ -266,6 +267,16 @@ async def handle_inbound(event: dict):
             await sync_to_async(delete_session)(conversation_id)
             await _release_bot_take(conversation)
             await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
+            return
+
+        # --- Pre-LLM routing: handle greetings, thanks, FAQ without LLM ---
+        routed_reply = try_route_message(session, user_text)
+        if routed_reply is not None:
+            session.setdefault("history", []).append({"role": "user", "content": user_text})
+            session["history"].append({"role": "model", "content": routed_reply})
+            await sync_to_async(save_session)(conversation_id, session)
+            await sync_to_async(send_reply)(conversation, routed_reply)
+            incr_metric("messages.routed")
             return
 
         session.setdefault("history", []).append({"role": "user", "content": user_text})

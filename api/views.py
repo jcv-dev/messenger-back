@@ -16,7 +16,7 @@ from django.views.decorators.cache import cache_page
 from django.db import transaction
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
-from django.db.models import OuterRef, Subquery, Q, Count, Prefetch
+from django.db.models import Exists, OuterRef, Subquery, Q, Count, Prefetch
 from django.core.signing import BadSignature
 import threading
 import hmac
@@ -64,7 +64,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-def publish_conversation_update(conversation, message=None):
+def publish_conversation_update(conversation, message=None, escalated=False):
     try:
         payload = {
             'type': 'conversation.updated',
@@ -72,6 +72,8 @@ def publish_conversation_update(conversation, message=None):
         }
         if message is not None:
             payload['message'] = message
+        if escalated:
+            payload['escalated'] = True
         publish(payload)
     except Exception:
         logger.exception("Failed to publish SSE conversation update")
@@ -429,6 +431,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
             except Exception:
                 qs = qs.none()
 
+            # Exclude conversations taken by another human (non-bot, non-self)
+            other_human_takes = ConversationTake.objects.filter(
+                conversation=OuterRef('pk'),
+                expires_at__gt=now,
+            ).exclude(created_by=user).exclude(created_by__username='bot')
+            qs = qs.annotate(
+                _has_other_human_take=Exists(other_human_takes)
+            ).filter(_has_other_human_take=False)
+
         return qs.annotate(
             _last_msg_sender=Subquery(last_msg.values('sender_name')[:1]),
             _last_msg_direction=Subquery(last_msg.values('direction')[:1]),
@@ -514,9 +525,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 conversation=conversation,
                 expires_at__gt=timezone.now(),
             ).first()
-            if existing and existing.created_by != request.user and not request.user.is_staff:
+            if existing and existing.created_by != request.user and not request.user.is_staff and existing.created_by.username != 'bot':
                 return Response(
-                    {'error': 'Conversation is currently taken by another user'},
+                    {'error': 'Esta conversación ya está tomada por otro usuario'},
                     status=status.HTTP_409_CONFLICT,
                 )
 
@@ -543,9 +554,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
             expires_at__gt=timezone.now(),
         ).first()
         if active_take:
-            if active_take.created_by != request.user and not request.user.is_staff:
+            if active_take.created_by != request.user and not request.user.is_staff and active_take.created_by.username != 'bot':
                 return Response(
-                    {'error': 'Only the current owner or an admin can release'},
+                    {'error': 'Solo el propietario o un administrador pueden liberar'},
                     status=status.HTTP_403_FORBIDDEN,
                 )
             active_take.delete()
@@ -888,7 +899,21 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return Message.objects.select_related('conversation', 'context_message').all()
+        user = self.request.user
+        qs = Message.objects.select_related('conversation', 'context_message').all()
+
+        if user.is_authenticated and not user.is_staff:
+            from django.utils import timezone as tz
+            now = tz.now()
+            other_takes = ConversationTake.objects.filter(
+                conversation=OuterRef('conversation'),
+                expires_at__gt=now,
+            ).exclude(created_by=user).exclude(created_by__username='bot')
+            qs = qs.annotate(
+                _msg_other_take=Exists(other_takes)
+            ).filter(_msg_other_take=False)
+
+        return qs
 
 
 from rest_framework.pagination import PageNumberPagination

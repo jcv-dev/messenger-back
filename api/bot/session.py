@@ -5,7 +5,7 @@ from api.redis_client import get_sync_redis
 
 SESSION_TTL = 600  # 10 minutes (exceeds the 5-minute bot take)
 REDIS_KEY = "bot:session"
-HISTORY_MAX_STORED = 40  # keep 2x what the LLM uses
+HISTORY_MAX_STORED = 20  # keep 2x what the LLM uses
 
 
 def get_session(conversation_id):
