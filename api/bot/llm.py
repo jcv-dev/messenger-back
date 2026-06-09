@@ -147,8 +147,8 @@ GEOCODING:
 - Si hay múltiples resultados, preséntalos con send_interactive(type="button").
   El ID de cada botón debe ser el place_id del resultado, title el display_name.
 - Ejemplo: send_interactive(type="button", body="Selecciona la dirección correcta:",
-    buttons=[{"id":"ChIJvX8...","title":"La Herradura, Tuluá"},
-             {"id":"ChIJTU8...","title":"La Herradura, Palmira"}])
+    buttons=[{{"id":"ChIJvX8...","title":"La Herradura, Tuluá"}},
+             {{"id":"ChIJTU8...","title":"La Herradura, Palmira"}}])
 - Cuando el usuario seleccione, recibirás el place_id como texto. Llama geocode_details.
 - Si hay un solo resultado, usa geocode_details directamente sin preguntar.
 - Si no hay resultados, informa al usuario: "No encontré esa dirección. Intenta con más detalles (barrio, puntos de referencia) o comparte tu ubicación."
