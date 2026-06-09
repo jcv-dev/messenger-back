@@ -334,7 +334,7 @@ async def handle_with_llm(session, conversation):
         max_output_tokens=1024,
     )
 
-    model = "gemini-2.0-flash-001"
+    model = "gemini-3.5-flash"
     max_tool_calls = 5
     tool_call_count = 0
     escalated = False
