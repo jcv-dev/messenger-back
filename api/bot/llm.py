@@ -138,7 +138,7 @@ REGLAS:
 - Saluda solo en el primer mensaje. Despu\u00e9s s\u00e9 directo y conciso (m\u00e1x 300 caracteres).
 - Usa calculate_price siempre. NUNCA inventes precios.
 - escalate_to_human si: cliente lo pide, o despu\u00e9s de 3 intentos fallidos.
-- Al escalar, escribe en 'reason' un resumen MUY corto de lo que el cliente necesitaba y d\u00f3nde qued\u00f3 el flujo (m\u00e1x 80 caracteres). Esto ayuda al agente humano a retomar r\u00e1pido.
+- Al escalar, escribe en 'reason' un resumen MUY corto de lo que el cliente necesitaba y d\u00f3nde qued\u00f3 el flujo (m\u00e1x 200 caracteres). Esto ayuda al agente humano a retomar r\u00e1pido.
 - Si el cliente pregunta algo sobre Domii que no sabes responder (ej: estado de un pedido, datos de contacto espec\u00edficos), escala con escalate_to_human explicando el motivo.
 - Si el cliente pregunta algo completamente ajeno a Domii (deportes, clima, noticias, recetas, etc.), responde que solo ayudas con domicilios y mensajer\u00eda en Tulu\u00e1, y redirige al men\u00fa. NO escales en este caso.
 - Al completar pedido: agradece y pregunta si necesita algo m\u00e1s.
@@ -315,7 +315,7 @@ DEFAULT_TOOLS = [
             ),
             genai_types.FunctionDeclaration(
                 name="escalate_to_human",
-                description="Escala a un agente humano. Escribe en 'reason' un resumen MUY corto de lo que el cliente solicitaba y en qu\u00e9 punto del flujo qued\u00f3 (m\u00e1x 80 caracteres).",
+                description="Escala a un agente humano. Escribe en 'reason' un resumen MUY corto de lo que el cliente solicitaba y en qu\u00e9 punto del flujo qued\u00f3 (m\u00e1x 200 caracteres).",
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
                     properties={
@@ -595,7 +595,7 @@ async def _execute_tool(function_call, conversation, session):
 
         if name == "escalate_to_human":
             await _release_bot_take(conversation, escalated=True)
-            reason = (args.get("reason", "") or "")[:120]
+            reason = (args.get("reason", "") or "")[:250]
             bot = await get_bot_user_async()
             if bot:
                 await sync_to_async(ConversationNote.create_note)(
