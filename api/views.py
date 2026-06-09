@@ -241,6 +241,8 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
             payload['text'] = {"body": content}
         elif message_type == 'interactive':
             payload['interactive'] = content
+        elif message_type == 'location':
+            payload['location'] = content
         elif message_type in ['sticker', 'image', 'video', 'audio', 'document']:
             parsed = urllib.parse.urlparse(content)
             media_id = None

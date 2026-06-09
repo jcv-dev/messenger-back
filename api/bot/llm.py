@@ -156,8 +156,8 @@ HERRAMIENTAS DISPONIBLES:
 FLUJO PARA COTIZAR UN SERVICIO:
 1. Perfil: usuario final (usuario_final) o negocio (negocio)
 2. Tipo de servicio: domicilios, mensajería, compras por encargo, trámites o bancarios
-3. Dirección de origen — si el cliente da un nombre (ej: "La herradura"), usa geocode_search para buscar direcciones. Si hay varios resultados, preséntalos con send_interactive(type="button") donde cada botón tenga id=place_id y title=display_name. Si un solo resultado, usa geocode_details directamente. Si dice "centro" usa "Tuluá centro" con lat 4.0847, lng -76.1954
-4. Dirección de destino — igual que origen, usa geocoding si es necesario
+3. Dirección de origen — si el cliente da un nombre (ej: "La herradura" o "centro"), usa geocode_search para buscar direcciones. Si hay varios resultados, preséntalos con send_interactive(type="list") usando title para el nombre corto (barrio/zona, máx 24 chars) y description para la dirección completa (máx 72 chars). Si un solo resultado, usa geocode_details. Después de resolver, el sistema envía automáticamente un mapa con la ubicación — SIEMPRE confirma la dirección con el usuario antes de continuar
+4. Dirección de destino — igual que origen, usa geocoding si es necesario. Siempre confirma después de resolver
 5. ¿Más paradas? Si sí, volver al paso 3. Si no, continuar.
 6. Herramientas adicionales: las herramientas disponibles vienen del sistema y son dinámicas. Comunica al usuario las herramientas disponibles con sus descripciones y pídele que escriba cuáles necesita (ej: "canasta y maletín", "solo canasta", "ninguna"). El usuario puede escribir varias. Extrae los tool keys del texto del usuario. Si el usuario no necesita herramientas, tools=[] .
 7. Método de pago: efectivo o Nequi
@@ -185,22 +185,24 @@ FLUJO DOMII FIJO:
 9. Indicar que la solicitud ha sido enviada
 
 GEOCODING:
-- Usa geocode_search para buscar direcciones por nombre.
-- Si hay múltiples resultados, preséntalos con send_interactive(type="button").
-- El ID de cada botón debe ser el place_id del resultado, title el display_name.
-- Ejemplo: send_interactive(type="button", body="Selecciona la dirección correcta:",
-    buttons=[{{"id":"ChIJvX8...","title":"La Herradura, Tuluá"}},
-             {{"id":"ChIJTU8...","title":"La Herradura, Palmira"}}])
+- Usa geocode_search para buscar direcciones por nombre (incluyendo "centro").
+- Si hay múltiples resultados, preséntalos con send_interactive(type="list").
+  * title: nombre corto del lugar o barrio (máximo 24 caracteres)
+  * description: dirección completa (máximo 72 caracteres)
+  * id: el place_id del resultado
+- Si el display_name es muy largo, extrae el barrio/zona para title y pon la dirección completa en description.
 - Cuando el usuario seleccione, recibirás el place_id como texto. Llama geocode_details.
-- Si hay un solo resultado, usa geocode_details directamente sin preguntar.
-- Si no hay resultados, informa al usuario: "No encontré esa dirección. Intenta con más detalles (barrio, puntos de referencia) o comparte tu ubicación."
+- Si hay un solo resultado, usa geocode_details directamente.
+- Después de geocode_details, el sistema envía automáticamente un mapa con la ubicación (map_sent=true en el resultado). Tú debes confirmar la dirección con el usuario: "Usaré: [dirección]. ¿Es correcta?" usando send_interactive(type="button") con Sí/No.
+- Si el usuario dice No, vuelve a preguntar la dirección o busca alternativas con geocode_search.
+- Si no hay resultados, informa: "No encontré esa dirección. Intenta con más detalles (barrio, puntos de referencia) o comparte tu ubicación."
 - Las coordenadas (lat, lng) son necesarias para calculate_price.
-- Si el usuario da una dirección precisa (ej: "Calle 10 #20-30, Tuluá"), pásala directamente sin geocoding.
+- Si el usuario da una dirección precisa (ej: "Calle 10 #20-30, Tuluá"), pásala directamente sin geocoding. Aún así confírmala antes de calculate_price.
 
 ERRORES:
 - Si calculate_price falla o devuelve error, EXPLICA al usuario qué falta (ej: "Necesito la dirección de destino", "Faltan herramientas por seleccionar").
 - Si geocode_search no encuentra nada, sugiere alternativas: "No encontré esa dirección. Intenta con más detalles o comparte tu ubicación por WhatsApp."
-- Si geocode_details falla, pide al usuario confirmar la dirección manualmente.
+- Si geocode_details falla, pide al usuario que describa la dirección con más detalle o que comparta su ubicación por WhatsApp.
 - Si un error ocurre al enviar el pedido, informa con claridad: "Ocurrió un error al procesar tu pedido. Un asesor te ayudará."
 - NUNCA muestres errores técnicos (códigos, JSON, tracebacks) al usuario.
 - Si el problema persiste después de intentar ayudar, ofrece escalate_to_human.
@@ -522,6 +524,43 @@ async def _execute_tool(function_call, conversation, session):
             place_id = args.get("place_id", "")
             result = await calculator.geocode_details(place_id=place_id)
             incr_metric("tool_calls.succeeded")
+
+            lat = result.get("lat") if isinstance(result, dict) else None
+            lng = result.get("lng") if isinstance(result, dict) else None
+            if lat is not None and lng is not None and "error" not in result:
+                display_name = (result.get("display_name") or result.get("name") or "")[:300]
+                location_payload = {
+                    "longitude": float(lng),
+                    "latitude": float(lat),
+                    "name": display_name[:100] or "Ubicación",
+                    "address": display_name,
+                }
+                bot = await get_bot_user_async()
+                msg = await sync_to_async(Message.objects.create)(
+                    conversation=conversation,
+                    direction="outbound",
+                    message_type="location",
+                    content=f"{location_payload['name']} ({lat}, {lng})",
+                    sender_name="Bot",
+                    sender=bot,
+                    metadata={"location": location_payload},
+                )
+                await sync_to_async(lambda: Conversation.objects.filter(
+                    id=conversation.id,
+                ).update(
+                    last_message=f"📍 {location_payload['name']}"[:255],
+                    last_message_at=timezone.now(),
+                ))()
+                msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
+                await sync_to_async(publish_conversation_update)(conversation, msg_data)
+                _send_pool.submit(
+                    send_whatsapp_outbound,
+                    'location', location_payload,
+                    conversation.contact_phone, msg.id, conversation.id,
+                )
+                result = dict(result)
+                result["map_sent"] = True
+
             return result
 
         if name == "send_interactive":
@@ -556,7 +595,20 @@ async def _execute_tool(function_call, conversation, session):
                 sections = args.get("sections", [])
                 interactive_payload["action"] = {
                     "button": button_label,
-                    "sections": sections,
+                    "sections": [
+                        {
+                            "title": (sec.get("title", "") or "")[:24],
+                            "rows": [
+                                {
+                                    "id": row["id"],
+                                    "title": (row.get("title", "") or "")[:24],
+                                    "description": (row.get("description", "") or "")[:72],
+                                }
+                                for row in sec.get("rows", [])[:10]
+                            ],
+                        }
+                        for sec in sections
+                    ],
                 }
 
             _send_pool.submit(

@@ -13,7 +13,7 @@ from asgiref.sync import sync_to_async
 from django.contrib.auth.models import User
 from django.utils import timezone
 
-from api.models import Conversation, Message, ConversationTake, ConversationTag
+from api.models import Conversation, Message, ConversationNote, ConversationTake, ConversationTag
 from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
@@ -31,6 +31,7 @@ logger = logging.getLogger("api.bot")
 
 _shutdown_event = asyncio.Event()
 _RECONNECT_MAX_DELAY = 60
+_CLEANUP_INTERVAL = 60
 
 _MAX_CONCURRENT = int(os.environ.get("BOT_MAX_CONCURRENT_TASKS", "50"))
 _task_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
@@ -43,6 +44,50 @@ async def _handle_with_semaphore(event: dict):
             await handle_inbound(event)
         except Exception:
             logger.exception("Error processing event in bot task")
+
+
+async def _cleanup_expired_items():
+    now = await sync_to_async(timezone.now)()
+
+    async def _conv_ids(qs):
+        ids = await sync_to_async(lambda: list(qs.values_list('conversation_id', flat=True)))()
+        return set(ids)
+
+    affected = set()
+    affected |= await _conv_ids(ConversationTake.objects.filter(expires_at__lt=now))
+    affected |= await _conv_ids(ConversationTag.objects.filter(expires_at__lt=now, expires_at__isnull=False))
+    affected |= await _conv_ids(ConversationNote.objects.filter(expires_at__lt=now, expires_at__isnull=False))
+
+    if not affected:
+        return
+
+    await sync_to_async(lambda: ConversationTake.objects.filter(expires_at__lt=now).delete())()
+    await sync_to_async(lambda: ConversationTag.objects.filter(expires_at__lt=now, expires_at__isnull=False).delete())()
+    await sync_to_async(lambda: ConversationNote.objects.filter(expires_at__lt=now, expires_at__isnull=False).delete())()
+
+    logger.info("Cleaned up expired takes/tags/notes affecting %d conversations", len(affected))
+
+    for conv_id in affected:
+        try:
+            conversation = await sync_to_async(Conversation.objects.get)(id=conv_id)
+            await sync_to_async(publish_conversation_update)(conversation)
+        except Conversation.DoesNotExist:
+            pass
+
+
+async def _cleanup_loop():
+    while not _shutdown_event.is_set():
+        try:
+            for _ in range(_CLEANUP_INTERVAL):
+                if _shutdown_event.is_set():
+                    return
+                await asyncio.sleep(1)
+            await _cleanup_expired_items()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Error in cleanup loop")
+            await asyncio.sleep(10)
 
 
 def has_active_human_take(conversation_id) -> bool:
@@ -228,43 +273,52 @@ async def _subscribe_with_retry():
 
 
 async def bot_loop():
-    while not _shutdown_event.is_set():
-        subscriber_id = None
-        event_queue = None
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    try:
+        while not _shutdown_event.is_set():
+            subscriber_id = None
+            event_queue = None
+            try:
+                subscriber_id, event_queue = await _subscribe_with_retry()
+                logger.info("Bot subscribed to Redis SSE (id=%s)", subscriber_id)
+
+                bot = await sync_to_async(get_bot_user)()
+                if bot:
+                    await sync_to_async(lambda: ConversationTake.objects.filter(
+                        created_by=bot,
+                        expires_at__gt=timezone.now(),
+                    ).update(expires_at=timezone.now()))()
+
+                while not _shutdown_event.is_set():
+                    try:
+                        raw = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+
+                    try:
+                        event = json.loads(raw)
+                        task = asyncio.create_task(_handle_with_semaphore(event))
+                        _pending_tasks.add(task)
+                        task.add_done_callback(_pending_tasks.discard)
+                    except Exception:
+                        logger.exception("Error creating bot task")
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Bot loop error — restarting in 5s")
+                incr_metric("loop.crashes")
+                await asyncio.sleep(5)
+            finally:
+                if subscriber_id is not None:
+                    await unsubscribe(subscriber_id)
+
+    finally:
+        cleanup_task.cancel()
         try:
-            subscriber_id, event_queue = await _subscribe_with_retry()
-            logger.info("Bot subscribed to Redis SSE (id=%s)", subscriber_id)
-
-            bot = await sync_to_async(get_bot_user)()
-            if bot:
-                await sync_to_async(lambda: ConversationTake.objects.filter(
-                    created_by=bot,
-                    expires_at__gt=timezone.now(),
-                ).update(expires_at=timezone.now()))()
-
-            while not _shutdown_event.is_set():
-                try:
-                    raw = await asyncio.wait_for(event_queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-
-                try:
-                    event = json.loads(raw)
-                    task = asyncio.create_task(_handle_with_semaphore(event))
-                    _pending_tasks.add(task)
-                    task.add_done_callback(_pending_tasks.discard)
-                except Exception:
-                    logger.exception("Error creating bot task")
-
+            await cleanup_task
         except asyncio.CancelledError:
-            break
-        except Exception:
-            logger.exception("Bot loop error — restarting in 5s")
-            incr_metric("loop.crashes")
-            await asyncio.sleep(5)
-        finally:
-            if subscriber_id is not None:
-                await unsubscribe(subscriber_id)
+            pass
 
     if _pending_tasks:
         logger.info("Waiting for %d pending bot tasks...", len(_pending_tasks))
