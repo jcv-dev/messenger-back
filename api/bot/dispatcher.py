@@ -5,6 +5,8 @@ import json
 import logging
 import re
 
+from asgiref.sync import sync_to_async
+
 from django.contrib.auth.models import User
 from django.utils import timezone
 
@@ -80,19 +82,19 @@ async def handle_inbound(event: dict):
 
     conversation_id = conv_data["id"]
 
-    if has_active_human_take(conversation_id):
+    if await sync_to_async(has_active_human_take)(conversation_id):
         return
 
-    if has_domii_tag(conversation_id):
+    if await sync_to_async(has_domii_tag)(conversation_id):
         return
 
     try:
-        conversation = Conversation.objects.get(id=conversation_id)
+        conversation = await sync_to_async(Conversation.objects.get)(id=conversation_id)
     except Conversation.DoesNotExist:
         return
 
     user_text = msg_data.get("content", "").strip()
-    session = get_session(conversation_id)
+    session = await sync_to_async(get_session)(conversation_id)
 
     if session is None:
         session = {
@@ -100,9 +102,10 @@ async def handle_inbound(event: dict):
             "fallback_count": 0,
         }
 
-    if re.search(r"\b(salir|cancelar|men[uú])\b", user_text, re.I):
-        delete_session(conversation_id)
-        send_reply(conversation, WELCOME_REPLY)
+    cancel_pattern = re.compile(r"\b(salir|cancelar|men[uú])\b", re.I)
+    if cancel_pattern.search(user_text):
+        await sync_to_async(delete_session)(conversation_id)
+        await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
         return
 
     session.setdefault("history", []).append({"role": "user", "content": user_text})
@@ -112,25 +115,23 @@ async def handle_inbound(event: dict):
     session["history"].append({"role": "model", "content": reply})
 
     if escalated:
-        delete_session(conversation_id)
+        await sync_to_async(delete_session)(conversation_id)
     else:
-        save_session(conversation_id, session)
+        await sync_to_async(save_session)(conversation_id, session)
 
-    send_reply(conversation, reply)
+    await sync_to_async(send_reply)(conversation, reply)
 
 
 async def bot_loop():
     subscriber_id, event_queue, _, _ = await subscribe()
     logger.info("Bot subscribed to Redis SSE (id=%s)", subscriber_id)
 
-    bot = get_bot_user()
+    bot = await sync_to_async(get_bot_user)()
     if bot:
-        ConversationTake.objects.filter(
+        await sync_to_async(lambda: ConversationTake.objects.filter(
             created_by=bot,
             expires_at__gt=timezone.now(),
-        ).update(
-            expires_at=timezone.now(),
-        )
+        ).update(expires_at=timezone.now()))()
 
     try:
         while True:

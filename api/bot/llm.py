@@ -1,5 +1,7 @@
 import logging
 
+from asgiref.sync import sync_to_async
+
 from django.conf import settings
 from django.utils import timezone
 
@@ -20,15 +22,18 @@ def _get_bot_user():
     return User.objects.filter(username="bot").first()
 
 
-def _release_bot_take(conversation):
-    bot = _get_bot_user()
+_get_bot_user_async = sync_to_async(_get_bot_user)
+
+
+async def _release_bot_take(conversation):
+    bot = await _get_bot_user_async()
     if bot:
-        ConversationTake.objects.filter(
+        await sync_to_async(lambda: ConversationTake.objects.filter(
             created_by=bot,
             conversation=conversation,
             expires_at__gt=timezone.now(),
-        ).update(expires_at=timezone.now())
-    publish_conversation_update(conversation)
+        ).update(expires_at=timezone.now()))()
+    await sync_to_async(publish_conversation_update)(conversation)
 
 
 async def _build_system_prompt():
@@ -287,7 +292,7 @@ async def _execute_tool(function_call, conversation):
         return result
 
     if name == "escalate_to_human":
-        _release_bot_take(conversation)
+        await _release_bot_take(conversation)
         return {
             "success": True,
             "message": "La conversación ha sido escalada a un agente humano.",
@@ -379,7 +384,7 @@ async def handle_with_llm(session, conversation):
     except Exception as e:
         logger.exception("Error en Gemini API para conv %s: %s", conversation.id, e)
         reply = "Ocurrió un error al procesar tu mensaje. Un asesor te atenderá pronto."
-        _release_bot_take(conversation)
+        await _release_bot_take(conversation)
         escalated = True
 
     return reply.strip(), escalated
