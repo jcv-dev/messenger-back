@@ -145,7 +145,8 @@ async def handle_inbound(event: dict):
     else:
         await sync_to_async(save_session)(conversation_id, session)
 
-    await sync_to_async(send_reply)(conversation, reply)
+    if reply.strip():
+        await sync_to_async(send_reply)(conversation, reply)
 
 
 async def bot_loop():
