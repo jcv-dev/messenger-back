@@ -515,6 +515,20 @@ async def _execute_tool(function_call, conversation, session):
                         if dest.get("lat") is None or dest.get("lng") is None:
                             return {"error": f"Faltan coordenadas para el destino del segmento {i+1}. Usa geocode_details para obtenerlas."}
 
+            stored_coords = session.get("pending_coords", [])
+            if stored_coords:
+                coord_idx = 0
+                for seg in segments:
+                    if isinstance(seg, dict):
+                        for field in ("origin", "destination"):
+                            if isinstance(seg.get(field), dict) and coord_idx < len(stored_coords):
+                                seg[field]["lat"] = stored_coords[coord_idx]["lat"]
+                                seg[field]["lng"] = stored_coords[coord_idx]["lng"]
+                                coord_idx += 1
+                session["pending_coords"] = stored_coords[coord_idx:]
+                if not session["pending_coords"]:
+                    session.pop("pending_coords", None)
+
             result = await calculator.calculate_price(
                 profile=profile,
                 segments=segments,
@@ -539,6 +553,9 @@ async def _execute_tool(function_call, conversation, session):
             lat = result.get("lat") if isinstance(result, dict) else None
             lng = result.get("lng") if isinstance(result, dict) else None
             if lat is not None and lng is not None and "error" not in result:
+                session.setdefault("pending_coords", []).append(
+                    {"lat": float(lat), "lng": float(lng)},
+                )
                 display_name = (result.get("display_name") or result.get("name") or "")[:300]
                 location_payload = {
                     "longitude": float(lng),
