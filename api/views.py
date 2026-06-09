@@ -874,6 +874,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
             Q(notes__content__icontains=q)
         )
 
+        # Only return conversations that have at least one message
+        base_qs = base_qs.annotate(
+            _msg_count=Count('messages')
+        ).filter(_msg_count__gt=0)
+
         user = request.user
         if user.is_authenticated and not user.is_staff:
             try:
@@ -882,6 +887,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     base_qs = base_qs.filter(group_id=profile.group_id)
             except Exception:
                 return Response({'results': []})
+
+            # Exclude conversations taken by another human (non-bot, non-self)
+            other_human_takes = ConversationTake.objects.filter(
+                conversation=OuterRef('pk'),
+                expires_at__gt=now,
+            ).exclude(created_by=user).exclude(created_by__username='bot')
+            base_qs = base_qs.annotate(
+                _has_other_human_take=Exists(other_human_takes)
+            ).filter(_has_other_human_take=False)
 
         queryset = base_qs.distinct().order_by('-last_message_at', '-created_at').prefetch_related(
             Prefetch('tags', queryset=ConversationTag.objects.select_related('created_by__profile__group').filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))),
