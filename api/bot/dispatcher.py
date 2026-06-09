@@ -136,7 +136,7 @@ async def handle_inbound(event: dict):
 
     session.setdefault("history", []).append({"role": "user", "content": user_text})
 
-    reply, escalated = await handle_with_llm(session, conversation)
+    reply, escalated, sent_interactive = await handle_with_llm(session, conversation)
 
     session["history"].append({"role": "model", "content": reply})
 
@@ -145,7 +145,7 @@ async def handle_inbound(event: dict):
     else:
         await sync_to_async(save_session)(conversation_id, session)
 
-    if reply.strip():
+    if not sent_interactive and reply.strip():
         await sync_to_async(send_reply)(conversation, reply)
 
 

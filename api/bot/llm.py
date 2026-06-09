@@ -555,4 +555,4 @@ async def handle_with_llm(session, conversation):
         await _release_bot_take(conversation)
         escalated = True
 
-    return reply.strip(), escalated
+    return reply.strip(), escalated, interactive_text is not None
