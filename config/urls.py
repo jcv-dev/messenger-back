@@ -1,6 +1,8 @@
 """
 URL configuration for WhatsApp Messenger
 """
+import logging
+
 from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
@@ -19,14 +21,74 @@ def health_check(request):
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAdminUser])
 def bot_status(request):
-    from api.bot.metrics import snapshot, reset
+    import time as _time
     from api.bot.lock import _LOCK_TTL
     from api.bot.limits import _WINDOW
-    from django.db import connection
-    metrics = snapshot()
+    from api.redis_client import get_sync_redis
+
+    METRIC_NAMES = [
+        "messages.processed",
+        "messages.rate_limited",
+        "locks.acquired",
+        "locks.failed",
+        "llm.calls",
+        "llm.retries",
+        "llm.failures",
+        "tool_calls.succeeded",
+        "tool_calls.failed",
+        "cancellations",
+        "escalations",
+        "loop.crashes",
+    ]
+
+    now = int(_time.time())
+    start = now - 86400
+    first_minute = start // 60 * 60
+    last_minute = now // 60 * 60
+    bucket_count = (last_minute - first_minute) // 60 + 1
+    if bucket_count < 1:
+        bucket_count = 1
+
+    metrics = {}
+    series = {}
+
+    try:
+        r = get_sync_redis()
+        pipe = r.pipeline()
+        for name in METRIC_NAMES:
+            pipe.hgetall(f"bot:metrics:{name}")
+        results = pipe.execute()
+    except Exception:
+        logging.getLogger(__name__).exception("Redis error reading bot metrics")
+        results = []
+
+    if results:
+        for name, raw in zip(METRIC_NAMES, results):
+            name_series = [0] * bucket_count
+            total = 0
+            if raw:
+                for ts_str, count_str in raw.items():
+                    ts = int(ts_str)
+                    if ts >= first_minute:
+                        idx = (ts - first_minute) // 60
+                        if 0 <= idx < bucket_count:
+                            count = int(count_str)
+                            name_series[idx] = count
+                            total += count
+            series[name] = name_series
+            metrics[name] = total
+    else:
+        for name in METRIC_NAMES:
+            series[name] = [0] * bucket_count
+            metrics[name] = 0
+
     return JsonResponse({
         "healthy": True,
         "metrics": metrics,
+        "series": series,
+        "from_ts": first_minute,
+        "to_ts": last_minute,
+        "bucket_count": bucket_count,
         "config": {
             "lock_ttl": _LOCK_TTL,
             "rate_window": _WINDOW,

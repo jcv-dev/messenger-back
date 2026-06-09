@@ -6,10 +6,12 @@ import logging
 import os
 import re
 import signal
+import time
 from datetime import timedelta
 
 from asgiref.sync import sync_to_async
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.utils import timezone
 
@@ -23,6 +25,7 @@ from .utils import get_bot_user, get_bot_user_async
 from .lock import conversation_lock
 from .guard import sanitize_user_input
 from .limits import check_inbound_rate
+from . import metrics
 from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session
 from .llm import handle_with_llm
@@ -46,7 +49,29 @@ async def _handle_with_semaphore(event: dict):
             logger.exception("Error processing event in bot task")
 
 
+async def _flush_metrics_to_redis():
+    snapshot_data = await sync_to_async(metrics.snapshot)()
+    if not snapshot_data:
+        return
+
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+        minute_ts = int(time.time()) // 60 * 60
+        pipe = r.pipeline()
+        for name, count in snapshot_data.items():
+            pipe.hincrby(f"bot:metrics:{name}", str(minute_ts), count)
+            pipe.expire(f"bot:metrics:{name}", 86400)
+        await pipe.execute()
+        await r.aclose()
+        await sync_to_async(metrics.reset)()
+    except Exception:
+        logger.exception("Failed to flush metrics to Redis")
+
+
 async def _cleanup_expired_items():
+    await _flush_metrics_to_redis()
+
     now = await sync_to_async(timezone.now)()
 
     async def _conv_ids(qs):

@@ -162,7 +162,7 @@ FLUJO PARA COTIZAR UN SERVICIO:
 6. Herramientas adicionales: las herramientas disponibles vienen del sistema y son dinámicas. Comunica al usuario las herramientas disponibles con sus descripciones y pídele que escriba cuáles necesita (ej: "canasta y maletín", "solo canasta", "ninguna"). El usuario puede escribir varias. Extrae los tool keys del texto del usuario. Si el usuario no necesita herramientas, tools=[] .
 7. Método de pago: efectivo o Nequi
 8. ¿Necesitas que el domiciliario lleve un acompañante? (ej: para cargar objetos pesados como tortas, paquetes grandes) → sí o no
-9. Calcular precio usando la herramienta calculate_price
+9. Calcular precio usando la herramienta calculate_price (REQUIERE coordenadas lat/lng de geocode_details — si las omites, fallará)
 10. Cuando calculate_price devuelva el resultado, preséntalo al cliente:
     - Total: $X COP
     - Distancia: X km
@@ -196,11 +196,11 @@ GEOCODING:
 - Después de geocode_details, el sistema envía automáticamente un mapa con la ubicación (map_sent=true en el resultado). Tú debes confirmar la dirección con el usuario: "Usaré: [dirección]. ¿Es correcta?" usando send_interactive(type="button") con Sí/No.
 - Si el usuario dice No, vuelve a preguntar la dirección o busca alternativas con geocode_search.
 - Si no hay resultados, informa: "No encontré esa dirección. Intenta con más detalles (barrio, puntos de referencia) o comparte tu ubicación."
-- Las coordenadas (lat, lng) son necesarias para calculate_price.
-- Si el usuario da una dirección precisa (ej: "Calle 10 #20-30, Tuluá"), pásala directamente sin geocoding. Aún así confírmala antes de calculate_price.
+- Las coordenadas (lat, lng) son REQUERIDAS por calculate_price. Si intentas llamar calculate_price sin coordenadas, recibirás un error. SIEMPRE obtén coordenadas con geocode_details antes de calculate_price.
+- Si el usuario da una dirección precisa (ej: "Calle 10 #20-30, Tuluá"), haz geocode_search con esa dirección para obtener el place_id y luego geocode_details para las coordenadas.
 
 ERRORES:
-- Si calculate_price falla o devuelve error, EXPLICA al usuario qué falta (ej: "Necesito la dirección de destino", "Faltan herramientas por seleccionar").
+- Si calculate_price falla o devuelve error (ej: "Faltan coordenadas"), llama geocode_details para obtener las coordenadas y luego reintenta calculate_price.
 - Si geocode_search no encuentra nada, sugiere alternativas: "No encontré esa dirección. Intenta con más detalles o comparte tu ubicación por WhatsApp."
 - Si geocode_details falla, pide al usuario que describa la dirección con más detalle o que comparta su ubicación por WhatsApp.
 - Si un error ocurre al enviar el pedido, informa con claridad: "Ocurrió un error al procesar tu pedido. Un asesor te ayudará."
@@ -504,6 +504,17 @@ async def _execute_tool(function_call, conversation, session):
             tools = args.get("tools", [])
             payment_method = args.get("payment_method", "efectivo")
             acompanante = args.get("acompanante", False)
+
+            for i, seg in enumerate(segments):
+                if isinstance(seg, dict):
+                    origin = seg.get("origin", {})
+                    dest = seg.get("destination", {})
+                    if isinstance(origin, dict) and isinstance(dest, dict):
+                        if origin.get("lat") is None or origin.get("lng") is None:
+                            return {"error": f"Faltan coordenadas para el origen del segmento {i+1}. Usa geocode_details para obtenerlas."}
+                        if dest.get("lat") is None or dest.get("lng") is None:
+                            return {"error": f"Faltan coordenadas para el destino del segmento {i+1}. Usa geocode_details para obtenerlas."}
+
             result = await calculator.calculate_price(
                 profile=profile,
                 segments=segments,
@@ -637,10 +648,12 @@ async def _execute_tool(function_call, conversation, session):
             msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
             await sync_to_async(publish_conversation_update)(conversation, msg_data)
 
+            incr_metric("tool_calls.succeeded")
             return {"success": True, "message": "Mensaje interactivo enviado"}
 
         if name == "escalate_to_human":
             await _release_bot_take(conversation)
+            incr_metric("tool_calls.succeeded")
             return {
                 "success": True,
                 "message": "La conversación ha sido escalada a un agente humano.",
