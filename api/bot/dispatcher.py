@@ -41,6 +41,9 @@ _MAX_CONCURRENT = int(os.environ.get("BOT_MAX_CONCURRENT_TASKS", "50"))
 _task_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 _pending_tasks: set[asyncio.Task] = set()
 
+_ESCALATED_KEY = "bot:escalated:{conv_id}"
+_ESCALATED_TTL = 600  # 10 minutes
+
 
 async def _handle_with_semaphore(event: dict):
     async with _task_semaphore:
@@ -145,6 +148,19 @@ async def _release_bot_take(conversation, escalated=False):
     ).update(expires_at=timezone.now()))()
     await sync_to_async(publish_conversation_update)(conversation, escalated=escalated)
 
+    if escalated:
+        try:
+            import redis.asyncio as aioredis
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            await r.setex(
+                _ESCALATED_KEY.format(conv_id=str(conversation.id)),
+                _ESCALATED_TTL,
+                "1",
+            )
+            await r.aclose()
+        except Exception:
+            logger.exception("Failed to set escalation flag for conv=%s", conversation.id)
+
 
 def _renew_bot_take(conversation):
     bot = get_bot_user()
@@ -221,6 +237,18 @@ async def handle_inbound(event: dict):
             conversation = await sync_to_async(Conversation.objects.get)(id=conversation_id)
         except Conversation.DoesNotExist:
             return
+
+        # --- Escalation cooldown — don't re-take after escalation ---
+        try:
+            import redis.asyncio as aioredis
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            escalated = await r.get(_ESCALATED_KEY.format(conv_id=str(conversation_id)))
+            await r.aclose()
+            if escalated:
+                logger.debug("Skipping conv=%s — escalation cooldown active", conversation_id)
+                return
+        except Exception:
+            pass  # fails open — if Redis is down, don't block
 
         await sync_to_async(_renew_bot_take)(conversation)
 

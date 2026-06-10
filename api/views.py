@@ -34,6 +34,7 @@ from .serializers import (
     UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
     media_signer, sign_media_url,
 )
+from .redis_client import get_sync_redis
 import asyncio
 import json
 import subprocess
@@ -532,6 +533,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 )
 
             ConversationTake.objects.filter(conversation=conversation).delete()
+            get_sync_redis().delete(f"bot:escalated:{conversation.id}")
             duration_minutes = serializer.validated_data.get('duration_minutes', 30)
             take = ConversationTake.create_take(
                 conversation=conversation,

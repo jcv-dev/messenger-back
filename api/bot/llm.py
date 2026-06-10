@@ -52,6 +52,19 @@ async def _release_bot_take(conversation, escalated=False):
         ).update(expires_at=timezone.now()))()
     await sync_to_async(publish_conversation_update)(conversation, escalated=escalated)
 
+    if escalated:
+        try:
+            import redis.asyncio as aioredis
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            await r.setex(
+                f"bot:escalated:{conversation.id}",
+                600,
+                "1",
+            )
+            await r.aclose()
+        except Exception:
+            logger.exception("Failed to set escalation flag for conv=%s", conversation.id)
+
 
 # ---------------------------------------------------------------------------
 #  System prompt (unchanged except for dynamic-tools injection)
