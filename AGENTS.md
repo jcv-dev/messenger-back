@@ -35,11 +35,41 @@ The bot runs as a **separate async process** managed by supervisord (`python man
 
 - **Event loop**: `asyncio.run(bot_loop())` in `api/bot/dispatcher.py`. Subscribes to Redis SSE channel, processes inbound messages sequentially (but spawns concurrent tasks capped by `BOT_MAX_CONCURRENT_TASKS`, default 50).
 - **Conversation locking**: `api/bot/lock.py` — Redis `SET NX EX` per conversation (60s TTL). Prevents duplicate processing across workers/restarts. Fails open if Redis is down.
-- **LLM**: Gemini via `google-genai`. Tools: `calculate_price`, `geocode_search`, `geocode_details`, `send_interactive`, `escalate_to_human`. Defined in `api/bot/llm.py`.
-- **Session storage**: Redis hash `bot:session:{conv_id}` (TTL 600s). Stores LLM chat history, fallback count, and `pending_coords` list.
+- **LLM**: Gemini via `google-genai`. Tools: `calculate_price`, `geocode_search`, `geocode_details`, `send_interactive`, `escalate_to_human`. Defined in `api/bot/llm.py`. Model: `gemini-3.1-flash-lite`. Temperature: `BOT_LLM_TEMPERATURE` (default 0.25). Max output: `BOT_LLM_MAX_OUTPUT_TOKENS` (default 1024).
+- **Pre-LLM router**: `api/bot/router.py` intercepts greetings, thanks, and FAQ questions before the LLM. Matched via regex; saves a full LLM call. FAQ responses for hours/payment/coverage/services/Domii Fijo. Only fires on short messages (≤100 chars) with precise question-form patterns to avoid false matches on flow messages.
+- **System prompt**: Built dynamically in `_build_system_prompt()` (llm.py). Tool list fetched from calculator service (cached, TTL `BOT_TOOLS_CACHE_TTL`, default 300s). Operating hours come from `BOT_OPERATING_HOURS` env var — used in both the prompt and the FAQ router.
+- **Session storage**: Redis hash `bot:session:{conv_id}` (TTL 600s). Stores LLM chat history, fallback count, and `pending_coords` list. History sent to LLM: last 10 entries, each truncated to 300 chars. Stored in Redis: last 20 entries (`HISTORY_MAX_STORED`).
 - **Inbound rate limit**: Per-conversation sliding window in `api/bot/limits.py` (default 10 msg/min).
-- **Metrics**: In-process `BotMetrics` counters in `api/bot/metrics.py`. Flushed to Redis hashes (`bot:metrics:{name}`) every 60s by the cleanup loop. Read by `GET /api/bot/status/`. 24h TTL, per-minute buckets.
+- **Metrics**: In-process `BotMetrics` counters in `api/bot/metrics.py`. Flushed to Redis hashes (`bot:metrics:{name}`) every 60s by the cleanup loop. Read by `GET /api/bot/status/`. 24h TTL, per-minute buckets. New metric: `messages.routed` (counts pre-LLM router hits).
 - **Cleanup loop**: Runs every 60s inside the bot process. Deletes expired takes/tags/notes from DB and publishes SSE events for affected conversations.
+
+## Conversation visibility & take permissions
+
+- **Visibility**: Non-staff users only see conversations that are free, taken by themselves, or taken by the bot. Conversations taken by another human are filtered out via `Exists` subquery in `get_queryset()` (annotates `_has_other_human_take`). Staff sees all.
+- **Take permissions**: Any user can take a bot-owned conversation. The `take_conversation` endpoint allows overriding if the existing take's `created_by.username == 'bot'`. Taking deletes ALL existing takes atomically before creating the new one — so the bot won't process the next inbound message (guarded by `has_active_human_take()`).
+- **Release permissions**: Any user can release a bot-owned conversation. The `release_conversation` endpoint allows releasing if `active_take.created_by.username == 'bot'`.
+- **Search**: `search` action also filters out other-human-taken conversations and excludes conversations with zero messages (annotates `_msg_count=Count('messages')`, filters `> 0`). Uses `Exists` subquery — no extra round-trips.
+- **Messages**: `MessageViewSet.get_queryset()` applies the same other-human-take filter — users can't read messages from conversations taken by another human.
+- These filters use `Exists(OtherModel.objects.filter(...))` subqueries — evaluated once by the query planner, not per row. No n+1 queries.
+
+## Escalation notes
+
+When the bot escalates a conversation, it automatically creates a `ConversationNote` so the human agent can see a summary without reading history.
+
+| Escalation path | Note content |
+|-----------------|-------------|
+| LLM calls `escalate_to_human` with `reason` | `[Bot] {reason}` (LLM-written, capped at 250 chars) |
+| 3+ `fallback_count` (`dispatcher.py`) | `[Bot] Escalado automáticamente — el bot no pudo procesar la solicitud tras varios intentos` |
+| LLM API exception (`llm.py`) | `[Bot] Error del sistema al procesar — escalado automáticamente` |
+| No Gemini API key (`llm.py`) | `[Bot] Bot no configurado — escalado automáticamente` |
+
+All notes: `expiry_type='custom'`, `custom_expiry_minutes=10`, `created_by=bot`. The LLM is prompted (in both the tool declaration and the `REGLAS` block) to write a very short summary in `reason` — what the client needed and where the flow stopped.
+
+## SSE events
+
+- `publish_conversation_update(conversation, message=None, escalated=False)` — broadcasts to all subscribers via Redis pub/sub on channel `sse:events`.
+- When `escalated=True`, the payload includes `"escalated": true`. The frontend plays an alert sound for all users regardless of tab.
+- Released conversations (bot escalation or manual release) have `active_take = null` in the SSE patch — `applyConversationPatch` adds them to every user's list if absent, making them instantly visible.
 
 ## Coordinates override (important gotcha)
 

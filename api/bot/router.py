@@ -26,7 +26,7 @@ PAYMENT_RESPONSE = (
 )
 
 COVERAGE_RESPONSE = (
-    "Cubrimos el casco urbano de Tulu\u00e1 y veredas cercanas. "
+    "Cubrimos el casco urbano de Tulu\u00e1 y el Valle del Cauca. "
     "Para destinos fuera del \u00e1rea (Cali, Buga, etc.) aplican tarifas fijas."
 )
 
