@@ -466,7 +466,15 @@ class MessageViewSetTests(APITestCase):
         self.assertEqual(response.data['content'], 'Test message content')
 
     def test_queryset_uses_select_related(self):
-        qs = MessageViewSet().get_queryset()
+        from rest_framework.test import APIRequestFactory
+        factory = APIRequestFactory()
+        request = factory.get('/api/messages/')
+        request.user = self.user
+        request.auth = self.token
+        view = MessageViewSet()
+        view.request = request
+        view.action = 'list'
+        qs = view.get_queryset()
         str_qs = str(qs.query)
         self.assertIn('INNER JOIN', str_qs)
 

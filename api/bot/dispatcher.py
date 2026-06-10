@@ -82,6 +82,17 @@ async def _cleanup_expired_items():
         ids = await sync_to_async(lambda: list(qs.values_list('conversation_id', flat=True)))()
         return set(ids)
 
+    # Capture expired bot takes before deletion
+    bot = await get_bot_user_async()
+    bot_take_conv_ids: set[int] = set()
+    if bot:
+        bot_take_conv_ids = await _conv_ids(
+            ConversationTake.objects.filter(
+                created_by=bot,
+                expires_at__lt=now,
+            )
+        )
+
     affected = set()
     affected |= await _conv_ids(ConversationTake.objects.filter(expires_at__lt=now))
     affected |= await _conv_ids(ConversationTag.objects.filter(expires_at__lt=now, expires_at__isnull=False))
@@ -93,6 +104,20 @@ async def _cleanup_expired_items():
     await sync_to_async(lambda: ConversationTake.objects.filter(expires_at__lt=now).delete())()
     await sync_to_async(lambda: ConversationTag.objects.filter(expires_at__lt=now, expires_at__isnull=False).delete())()
     await sync_to_async(lambda: ConversationNote.objects.filter(expires_at__lt=now, expires_at__isnull=False).delete())()
+
+    # Mark conversations as resolved_by_bot if their bot take expired without escalation
+    for conv_id in bot_take_conv_ids:
+        try:
+            import redis.asyncio as aioredis
+            r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+            flag = await r.get(_ESCALATED_KEY.format(conv_id=str(conv_id)))
+            await r.aclose()
+            if not flag:
+                await sync_to_async(Conversation.objects.filter(id=conv_id).update)(
+                    resolved_by_bot=True,
+                )
+        except Exception:
+            logger.exception("Error checking escalation for conv=%s", conv_id)
 
     logger.info("Cleaned up expired takes/tags/notes affecting %d conversations", len(affected))
 
@@ -237,6 +262,11 @@ async def handle_inbound(event: dict):
             conversation = await sync_to_async(Conversation.objects.get)(id=conversation_id)
         except Conversation.DoesNotExist:
             return
+
+        # --- Reset resolved_by_bot — conversation is active again ---
+        if conversation.resolved_by_bot:
+            conversation.resolved_by_bot = False
+            await sync_to_async(conversation.save)(update_fields=['resolved_by_bot'])
 
         # --- Escalation cooldown — don't re-take after escalation ---
         try:

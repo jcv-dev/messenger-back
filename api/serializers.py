@@ -239,7 +239,7 @@ class ConversationSerializer(serializers.ModelSerializer):
         model = Conversation
         fields = [
             'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
-            'last_message_at', 'status', 'tags', 'active_tags', 'notes',
+            'last_message_at', 'status', 'resolved_by_bot', 'tags', 'active_tags', 'notes',
             'active_notes', 'active_take', 'unread_count', 'group',
             'created_at', 'updated_at'
         ]
@@ -281,7 +281,7 @@ class ConversationListSerializer(serializers.ModelSerializer):
         model = Conversation
         fields = [
             'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
-            'last_message_at', 'status', 'active_tags', 'active_take', 'unread_count', 'created_at',
+            'last_message_at', 'status', 'resolved_by_bot', 'active_tags', 'active_take', 'unread_count', 'created_at',
             'last_message_sender', 'last_message_direction', 'group',
         ]
 

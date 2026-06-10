@@ -90,6 +90,7 @@ class Conversation(models.Model):
         choices=[('active', 'Active'), ('resolved', 'Resolved'), ('archived', 'Archived')],
         default='active'
     )
+    resolved_by_bot = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 

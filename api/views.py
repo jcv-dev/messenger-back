@@ -432,14 +432,16 @@ class ConversationViewSet(viewsets.ModelViewSet):
             except Exception:
                 qs = qs.none()
 
-            # Exclude conversations taken by another human (non-bot, non-self)
-            other_human_takes = ConversationTake.objects.filter(
-                conversation=OuterRef('pk'),
-                expires_at__gt=now,
-            ).exclude(created_by=user).exclude(created_by__username='bot')
-            qs = qs.annotate(
-                _has_other_human_take=Exists(other_human_takes)
-            ).filter(_has_other_human_take=False)
+            # Only filter out other-human-taken conversations for list views
+            # Detail actions rely on action-level permission checks instead
+            if self.action in ('list', 'active_conversations'):
+                other_human_takes = ConversationTake.objects.filter(
+                    conversation=OuterRef('pk'),
+                    expires_at__gt=now,
+                ).exclude(created_by=user).exclude(created_by__username='bot')
+                qs = qs.annotate(
+                    _has_other_human_take=Exists(other_human_takes)
+                ).filter(_has_other_human_take=False)
 
         return qs.annotate(
             _last_msg_sender=Subquery(last_msg.values('sender_name')[:1]),
@@ -532,6 +534,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_409_CONFLICT,
                 )
 
+            if conversation.resolved_by_bot:
+                conversation.resolved_by_bot = False
+                conversation.save(update_fields=['resolved_by_bot'])
             ConversationTake.objects.filter(conversation=conversation).delete()
             get_sync_redis().delete(f"bot:escalated:{conversation.id}")
             duration_minutes = serializer.validated_data.get('duration_minutes', 30)
@@ -813,6 +818,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 conversation.contact_phone = contact_phone
             if conversation.status != 'active':
                 conversation.status = 'active'
+            if conversation.resolved_by_bot:
+                conversation.resolved_by_bot = False
             conversation.save()
 
         message = Message.objects.create(
@@ -921,13 +928,14 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         if user.is_authenticated and not user.is_staff:
             from django.utils import timezone as tz
             now = tz.now()
-            other_takes = ConversationTake.objects.filter(
-                conversation=OuterRef('conversation'),
-                expires_at__gt=now,
-            ).exclude(created_by=user).exclude(created_by__username='bot')
-            qs = qs.annotate(
-                _msg_other_take=Exists(other_takes)
-            ).filter(_msg_other_take=False)
+            if self.action == 'list':
+                other_takes = ConversationTake.objects.filter(
+                    conversation=OuterRef('conversation'),
+                    expires_at__gt=now,
+                ).exclude(created_by=user).exclude(created_by__username='bot')
+                qs = qs.annotate(
+                    _msg_other_take=Exists(other_takes)
+                ).filter(_msg_other_take=False)
 
         return qs
 
