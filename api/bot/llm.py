@@ -16,6 +16,7 @@ from .constants import WELCOME_REPLY
 from .utils import get_bot_user_async
 from .guard import sanitize_llm_output
 from .metrics import incr as incr_metric
+from .session import build_state_summary
 from api.models import Conversation, ConversationNote, ConversationTake, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
@@ -671,14 +672,18 @@ async def handle_with_llm(session, conversation):
                 custom_expiry_minutes=10,
                 created_by=bot,
             )
-        return "Un asesor humano te atender\u00e1 pronto.", True, False
+        return "Un asesor humano te atender\u00e1 pronto.", True, False, function_calls_made
 
     contents = _build_contents(session)
 
     if not contents:
-        return WELCOME_REPLY, False, False
+        return WELCOME_REPLY, False, False, function_calls_made
 
     system_prompt = await _build_system_prompt()
+
+    state_summary = build_state_summary(session)
+    if state_summary:
+        system_prompt = state_summary + "\n\n" + system_prompt
 
     temperature = getattr(settings, "BOT_LLM_TEMPERATURE", 0.25)
     max_tokens = getattr(settings, "BOT_LLM_MAX_OUTPUT_TOKENS", 1024)
@@ -695,6 +700,7 @@ async def handle_with_llm(session, conversation):
     tool_call_count = 0
     escalated = False
     interactive_text = None
+    function_calls_made = []
 
     try:
         response = await _generate_with_retry(client, model, contents, config)
@@ -709,6 +715,7 @@ async def handle_with_llm(session, conversation):
             function_call = response.candidates[0].content.parts[0].function_call
             tool_call_count += 1
             logger.info("LLM tool call: %s (attempt %d)", function_call.name, tool_call_count)
+            function_calls_made.append(function_call.name)
 
             result = await _execute_tool(function_call, conversation, session)
 
@@ -733,6 +740,7 @@ async def handle_with_llm(session, conversation):
 
             if function_call.name == "escalate_to_human":
                 escalated = True
+                break
 
             contents.append(response.candidates[0].content)
 
@@ -747,7 +755,13 @@ async def handle_with_llm(session, conversation):
             response = await _generate_with_retry(client, model, contents, config)
             incr_metric("llm.calls")
 
-        if interactive_text is not None:
+        if escalated:
+            reply = (
+                result.get("message")
+                if isinstance(result, dict)
+                else "Un asesor humano te atender\u00e1 pronto."
+            )
+        elif interactive_text is not None:
             reply = interactive_text
         elif response.candidates and response.candidates[0].content.parts:
             reply = response.candidates[0].content.parts[0].text or ""
@@ -774,4 +788,4 @@ async def handle_with_llm(session, conversation):
             )
         escalated = True
 
-    return reply.strip(), escalated, interactive_text is not None
+    return reply.strip(), escalated, interactive_text is not None, function_calls_made

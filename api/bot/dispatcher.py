@@ -27,7 +27,7 @@ from .guard import sanitize_user_input
 from .limits import check_inbound_rate
 from . import metrics
 from .metrics import incr as incr_metric
-from .session import get_session, save_session, delete_session
+from .session import get_session, save_session, delete_session, extract_state_from_turn
 from .llm import handle_with_llm
 from .router import try_route_message
 
@@ -194,8 +194,7 @@ def _renew_bot_take(conversation):
     ConversationTake.objects.filter(
         created_by=bot,
         conversation=conversation,
-        expires_at__gt=timezone.now(),
-    ).update(expires_at=timezone.now())
+    ).delete()
     ConversationTake.create_take(
         conversation=conversation,
         created_by=bot,
@@ -348,7 +347,7 @@ async def handle_inbound(event: dict):
 
         session.setdefault("history", []).append({"role": "user", "content": user_text})
 
-        reply, escalated, sent_interactive = await handle_with_llm(session, conversation)
+        reply, escalated, sent_interactive, function_calls = await handle_with_llm(session, conversation)
 
         session["history"].append({"role": "model", "content": reply})
 
@@ -356,6 +355,7 @@ async def handle_inbound(event: dict):
             incr_metric("escalations")
             await sync_to_async(delete_session)(conversation_id)
         else:
+            extract_state_from_turn(session, user_text)
             await sync_to_async(save_session)(conversation_id, session)
 
         if not sent_interactive and reply.strip():
