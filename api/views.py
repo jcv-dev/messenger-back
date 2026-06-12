@@ -128,7 +128,9 @@ def _convert_audio_to_ogg_opus(audio_path, actual_duration=None):
         return None
     try:
         cmd = [
-            'ffmpeg', '-y', '-i', audio_path,
+            'ffmpeg', '-y',
+            '-fflags', '+genpts',  # discard broken container timestamps (MediaRecorder chunks)
+            '-i', audio_path,
             '-c:a', 'libopus', '-b:a', '32k',
             '-application', 'voip',
             '-frame_duration', '60',
