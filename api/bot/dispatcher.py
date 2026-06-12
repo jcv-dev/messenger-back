@@ -321,7 +321,7 @@ async def handle_inbound(event: dict):
 # ── State machine handler ─────────────────────────────────────────────────
 
 _FAQ_PATTERNS_CANCEL = re.compile(
-    r"^(salir|cancelar|men[úu]|d[eé]jame|ya\s+no\s+(quiero|necesito)|no\s+m[áa]s)[.!]*\s*$",
+    r"\b(?:salir|cancelar|cancel|men[úu]|d[eé]jame|ya\s+no\s+(?:quiero|necesito)|no\s+m[áa]s)\b",
     re.I,
 )
 _FAQ_PATTERNS_ESCALATE = re.compile(
@@ -330,12 +330,25 @@ _FAQ_PATTERNS_ESCALATE = re.compile(
     r"p[aá]same\s+con|quiero\s+(que\s+)?(me\s+)?(atienda|hable|ayuden|una\s+persona)|"
     r"necesito\s+(ayuda|hablar|una\s+persona|un\s+asesor)|"
     r"ay[uú]dame|ay[uú]da\s+por\s+favor|"
-    r"no\s+(funciona|sirve|entiende|entiendo|sirves)|"
+    r"no\s+(funciona|sirve|sirves)|"
     r"esto\s+no|mejor\s+(hablo|llamo|quiero)\s+con|"
     r"comun[ií]came|transfi[eé]reme|"
     r"qu[eé]\s+pereza|qu[eé]\s+fastidio)\b",
     re.I | re.MULTILINE,
 )
+
+# Prevent false cancel when "cancelar" means "pagar" in Colombian Spanish
+_PAYMENT_WORDS = re.compile(r"\b(cuenta|factura|pago|recibo|total|tarjeta|transferencia|nequi|bancolombia|daviplata|billetera|efectivo|pedido|servicio|pesos|valor)\b", re.I)
+
+
+def _is_actual_cancel(user_text: str) -> bool:
+    """Check if user_text is a real cancel intent, not Colombian 'cancelar = pagar'."""
+    if not _FAQ_PATTERNS_CANCEL.search(user_text):
+        return False
+    # "cancelar" in Colombia often means "pagar" — skip if payment context
+    if "cancelar" in user_text.lower() and _PAYMENT_WORDS.search(user_text):
+        return False
+    return True
 
 
 async def _handle_with_state_machine(session, conversation, conversation_id, user_text,
@@ -369,16 +382,14 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
         return
 
     # --- Global keywords (checked before state machine) ---
-    if _FAQ_PATTERNS_CANCEL.search(user_text):
+    if not button_id and _is_actual_cancel(user_text):
         incr_metric("cancellations")
         await sync_to_async(delete_session)(conversation_id)
         await _release_bot_take(conversation)
-        welcome = state_flow.get_welcome_interactive()
         await sync_to_async(send_reply)(
             conversation,
-            "\u00a1Bienvenido a Domii Tulu\u00e1! \u00bfQu\u00e9 deseas hacer?",
+            "\u00a1Hasta luego! Cuando necesites algo, solo escr\u00edbeme.",
         )
-        await sync_to_async(_send_interactive_payload)(conversation, welcome)
         return
 
     if _FAQ_PATTERNS_ESCALATE.search(user_text):
@@ -542,12 +553,14 @@ async def _handle_with_llm_legacy(session, conversation, conversation_id, user_t
         return
 
     # --- Cancel detection ---
-    cancel_pattern = re.compile(r'^(salir|cancelar|men[úu])[.!?]*\s*$', re.I)
-    if cancel_pattern.search(user_text):
+    if _is_actual_cancel(user_text):
         incr_metric("cancellations")
         await sync_to_async(delete_session)(conversation_id)
         await _release_bot_take(conversation)
-        await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
+        await sync_to_async(send_reply)(
+            conversation,
+            "\u00a1Hasta luego! Cuando necesites algo, solo escr\u00edbeme.",
+        )
         return
 
     # --- Pre-LLM routing: handle greetings, thanks, FAQ without LLM ---

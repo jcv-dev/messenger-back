@@ -404,7 +404,8 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
                 _text_msg("¿Cuál es el nombre de tu negocio?"),
             ])
         if button_id == "escalate":
-            return FlowResult(escalate=True, escalate_reason="Cliente solicitó asesor desde el menú principal")
+            return FlowResult(escalate=True, escalate_reason="Cliente solicitó asesor desde el menú principal",
+                              messages=[_text_msg("Un asesor te atenderá pronto.")])
         if button_id == "faq":
             return FlowResult(messages=[
                 _text_msg(
@@ -1043,10 +1044,9 @@ async def handle_confirm_quote(session: dict, text: str, button_id: str | None,
             _text_msg("Vamos a empezar de nuevo. ¿Qué servicio necesitas?"),
         ], send_interactive=_service_type_list())
     if value == "cancel":
-        # Back to welcome
         return FlowResult(state=WELCOME, messages=[
-            _text_msg("Pedido cancelado. ¿Necesitas algo más?"),
-        ], send_interactive=_welcome_interactive())
+            _text_msg("Pedido cancelado. \u00a1Hasta luego!"),
+        ])
     return FlowResult(fallback=True, messages=[
         _text_msg("Elige 'Confirmar', 'Cambiar' o 'Cancelar'."),
     ], send_interactive=_interactive("button", "¿Confirmas?", buttons=[
@@ -1216,12 +1216,12 @@ async def handle_fijo_volume(session: dict, text: str, button_id: str | None,
     df = session["domii_fijo_data"]
     summary = (
         f"*Resumen Domii Fijo:*\n\n"
-        f"*Negocio:* {df.get('business_name', 'N/E')}\n"
-        f"*Dirección:* {df.get('address', 'N/E')}\n"
+        f"*Negocio:* {(df.get('business_name', 'N/E') or '')[:80]}\n"
+        f"*Dirección:* {(df.get('address', 'N/E') or '')[:80]}\n"
         f"*Teléfono:* {df.get('phone', 'N/E')}\n"
-        f"*Fecha:* {df.get('date', 'N/E')}\n"
-        f"*Horario:* {df.get('start_time', 'N/E')} - {df.get('end_time', 'N/E')}\n"
-        f"*Volumen:* {df.get('volume', 'N/E')}\n\n"
+        f"*Fecha:* {(df.get('date', 'N/E') or '')[:30]}\n"
+        f"*Horario:* {(df.get('start_time', 'N/E') or '')[:10]} - {(df.get('end_time', 'N/E') or '')[:10]}\n"
+        f"*Volumen:* {(df.get('volume', 'N/E') or '')[:20]}\n\n"
         "¿Confirmas?"
     )
     return FlowResult(state=CONFIRMING_FIJO, messages=[
@@ -1239,14 +1239,14 @@ async def handle_fijo_confirm(session: dict, text: str, button_id: str | None,
     if value == "confirm":
         df = session["domii_fijo_data"]
         lines = [
-            "*Domii Tuluá - Domii Fijo*",
+            "*Domii Tulu\u00e1 - Domii Fijo*",
             "",
-            f"*Empresa:* {df.get('business_name', 'N/E')}",
-            f"*Dirección:* {df.get('address', 'N/E')}",
-            f"*Teléfono:* {df.get('phone', 'N/E')}",
-            f"*Fecha:* {df.get('date', 'N/E')}",
-            f"*Horario:* {df.get('start_time', 'N/E')} - {df.get('end_time', 'N/E')}",
-            f"*Volumen:* {df.get('volume', 'N/E')}",
+            f"*Empresa:* {(df.get('business_name', 'N/E') or '')[:80]}",
+            f"*Direcci\u00f3n:* {(df.get('address', 'N/E') or '')[:80]}",
+            f"*Tel\u00e9fono:* {df.get('phone', 'N/E')}",
+            f"*Fecha:* {(df.get('date', 'N/E') or '')[:30]}",
+            f"*Horario:* {(df.get('start_time', 'N/E') or '')[:10]} - {(df.get('end_time', 'N/E') or '')[:10]}",
+            f"*Volumen:* {(df.get('volume', 'N/E') or '')[:20]}",
             "",
             "*Nota:* Sujeto a disponibilidad de flota.",
         ]
@@ -1256,7 +1256,7 @@ async def handle_fijo_confirm(session: dict, text: str, button_id: str | None,
         ])
     if value == "cancel":
         return FlowResult(state=WELCOME, messages=[
-            _text_msg("Solicitud cancelada. ¿Necesitas algo más?"),
+            _text_msg("Solicitud cancelada. \u00a1Hasta luego!"),
         ])
     return FlowResult(fallback=True, messages=[
         _text_msg("Elige 'Confirmar' o 'Cancelar'."),
@@ -1296,14 +1296,45 @@ _CONFUSION_PATTERNS = re.compile(
     r"(no\s+(entiendo|s[eé]|comprendo|entend[ií]|le\s+entiendo|le\s+se|"
     r"sab[ií]a|tengo\s+idea|capto|me\s+queda\s+claro|s[eé]\s+qu[eé]|"
     r"entend[ií]\s+bien|le\s+entend[ií]))|"
-    r"repite|otra\s+vez|expl[ií]came|c[oó]mo\s+(es|as[ií]|hago|digo|así)|"
-    r"c[oó]mo\s+es\s+|c[oó]mo\s+as[ií]|"
+    r"sigo\s+sin\s+(entender|comprender|saber)|"
+    r"repite|otra\s+vez|expl[ií]came|me\s+explicas?\b|c[oó]mo\s+as[ií]|"
     r"perd[oó]n|disculpa|disculpe|"
     r"no\s+(me\s+)?(acuerdo|recuerdo)|"
+    r"no\s+(le|te)\s+entend[ií]|"
+    r"no\s+(te\s+)?capto|"
     r"nunca\s+entend[ií]|nunca\s+comprend[ií]|"
     r"(ay[úu]dame|ayuda|me\s+ayudas)",  # frequent in confusion context too
     re.I,
 )
+
+# ── Global cancel/escalate patterns (same as dispatcher) ───────────────────
+_GLOBAL_CANCEL = re.compile(
+    r"\b(?:salir|cancelar|cancel|men[úu]|d[eé]jame|ya\s+no\s+(?:quiero|necesito)|no\s+m[áa]s)\b",
+    re.I,
+)
+_GLOBAL_ESCALATE = re.compile(
+    r"\b(agente|asesor|humano|persona|operador|"
+    r"hablar\s+con|atenci[oó]n|atender|atenderme|"
+    r"p[aá]same\s+con|quiero\s+(que\s+)?(me\s+)?(atienda|hable|ayuden|una\s+persona)|"
+    r"necesito\s+(ayuda|hablar|una\s+persona|un\s+asesor)|"
+    r"ay[uú]dame|ay[uú]da\s+por\s+favor|"
+    r"no\s+(funciona|sirve|sirves)|"
+    r"esto\s+no|mejor\s+(hablo|llamo|quiero)\s+con|"
+    r"comun[ií]came|transfi[eé]reme|"
+    r"qu[eé]\s+pereza|qu[eé]\s+fastidio)\b",
+    re.I | re.MULTILINE,
+)
+
+# Prevent false cancel when "cancelar" means "pagar" in Colombian Spanish
+_PAYMENT_WORDS = re.compile(r"\b(cuenta|factura|pago|recibo|total|tarjeta|transferencia|nequi|bancolombia|daviplata|billetera|efectivo|pedido|servicio|pesos|valor)\b", re.I)
+
+
+def _is_actual_cancel(text: str) -> bool:
+    if not _GLOBAL_CANCEL.search(text):
+        return False
+    if "cancelar" in text.lower() and _PAYMENT_WORDS.search(text):
+        return False
+    return True
 
 
 _STATE_EXPLANATIONS: dict[str, str] = {
@@ -1432,6 +1463,21 @@ async def advance(conversation, session: dict, user_text: str,
     """
     state_name = session.get("state") or WELCOME
 
+    # ── Global cancel/escalate keywords (checked before confusion) ──
+    if not button_id and _is_actual_cancel(user_text):
+        session.clear()
+        return FlowResult(state=WELCOME, messages=[
+            _text_msg("\u00a1Hasta luego! Cuando necesites algo, solo escr\u00edbeme."),
+        ])
+
+    if not button_id and _GLOBAL_ESCALATE.search(user_text):
+        session.clear()
+        return FlowResult(
+            escalate=True,
+            escalate_reason="Cliente solicit\u00f3 asesor durante la conversaci\u00f3n",
+            messages=[_text_msg("Un asesor te atender\u00e1 pronto.")],
+        )
+
     # ── Confusion detection (only for free text, not button taps) ──
     if not button_id and _CONFUSION_PATTERNS.search(user_text):
         count = session.get("confusion_count", 0) + 1
@@ -1456,7 +1502,7 @@ async def advance(conversation, session: dict, user_text: str,
         return FlowResult(
             state=state_name,
             messages=[_text_msg(
-                f"Te explico de nuevo:\n\n{explanation}\n\n"
+                f"\u00a1Con gusto! Esto es lo que puedes hacer:\n\n{explanation}\n\n"
                 "Si prefieres, escribe *asesor* para hablar con una persona."
             )],
             fallback=False,
@@ -1485,7 +1531,7 @@ async def advance(conversation, session: dict, user_text: str,
     return result
 
 
-async def get_welcome_interactive() -> dict:
+def get_welcome_interactive() -> dict:
     """Return the WELCOME interactive payload (used for initial greeting)."""
     return _welcome_interactive()
 
