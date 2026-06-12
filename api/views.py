@@ -115,11 +115,9 @@ def upload_media_to_whatsapp(file_path, phone_number_id, token):
 def _convert_audio_to_ogg_opus(audio_path, actual_duration=None):
     """Convert any audio (WebM, MP4, AAC) to OGG Opus for WhatsApp compatibility.
 
-    Args:
-        audio_path: Path to the source audio file.
-        actual_duration: Known-good duration in seconds. If provided, forces
-            ffmpeg to write correct duration metadata into the output OGG,
-            preventing WhatsApp from showing wrong playback length.
+    Uses a PCM intermediate to strip all container metadata, producing clean
+    OGG Opus output regardless of broken input timestamps (e.g., Chrome
+    MediaRecorder WebM chunks that reset timestamps every 250ms).
     """
     try:
         fd, ogg_path = tempfile.mkstemp(suffix='.ogg', prefix='wa_audio_')
@@ -127,23 +125,41 @@ def _convert_audio_to_ogg_opus(audio_path, actual_duration=None):
     except OSError:
         return None
     try:
-        cmd = [
+        # First pass: decode to raw PCM to strip ALL container metadata.
+        # PCM has no timestamps, so broken WebM cluster timestamps are irrelevant.
+        pcm_cmd = [
             'ffmpeg', '-y',
-            '-fflags', '+genpts',  # discard broken container timestamps (MediaRecorder chunks)
             '-i', audio_path,
+            '-f', 's16le', '-ac', '1', '-ar', '48000',
+            '-',
+        ]
+        pcm = subprocess.run(pcm_cmd, capture_output=True, timeout=30)
+        if pcm.returncode != 0:
+            logger.warning("ffmpeg PCM decode failed: %s",
+                           pcm.stderr.decode('utf-8', errors='replace')[:200])
+            try:
+                os.remove(ogg_path)
+            except OSError:
+                pass
+            return None
+
+        # Second pass: re-encode clean PCM to OGG Opus with exact duration.
+        ogg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 's16le', '-ar', '48000', '-ac', '1',
+            '-i', '-',
             '-c:a', 'libopus', '-b:a', '32k',
             '-application', 'voip',
             '-frame_duration', '60',
             '-vn',
         ]
         if actual_duration is not None and actual_duration > 0:
-            cmd.extend(['-t', f'{actual_duration:.1f}'])
-        cmd.append(ogg_path)
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
-        )
+            ogg_cmd.extend(['-af', f'atrim=0:{actual_duration:.1f}'])
+        ogg_cmd.append(ogg_path)
+        result = subprocess.run(ogg_cmd, input=pcm.stdout, capture_output=True, timeout=30)
         if result.returncode != 0:
-            logger.warning("ffmpeg audio to OGG conversion failed: %s", result.stderr[:200])
+            logger.warning("ffmpeg OGG re-encode failed: %s",
+                           result.stderr.decode('utf-8', errors='replace')[:200])
             try:
                 os.remove(ogg_path)
             except OSError:
@@ -281,6 +297,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                         except Message.DoesNotExist:
                             pass
                     if should_convert:
+                        logger.info("Converting audio for message %s: actual_duration=%s", message_id, actual_duration)
                         converted_path = _convert_audio_to_ogg_opus(file_path, actual_duration=actual_duration)
                         if converted_path:
                             upload_path = converted_path
@@ -755,11 +772,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 context_wamid = context_msg.whatsapp_message_id if context_msg else None
-                _send_pool.submit(
+                transaction.on_commit(lambda: _send_pool.submit(
                     send_whatsapp_outbound,
                     message_type, content, conversation.contact_phone, message.id, conversation.id,
                     context_wamid=context_wamid,
-                )
+                ))
 
             serializer = MessageSerializer(message)
             publish_conversation_update(conversation, serializer.data)
@@ -872,10 +889,10 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.save()
 
         if message_type not in ('edit', 'reaction'):
-            _send_pool.submit(
+            transaction.on_commit(lambda: _send_pool.submit(
                 send_whatsapp_outbound,
                 message_type, content, conversation.contact_phone, message.id, conversation.id,
-            )
+            ))
 
         publish_conversation_update(conversation)
 
