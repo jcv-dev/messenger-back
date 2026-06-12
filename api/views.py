@@ -340,6 +340,22 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                             pass
                     payload[message_type] = media_payload
             else:
+                if message_type == 'audio':
+                    if message_id:
+                        try:
+                            failed_msg = Message.objects.get(id=message_id)
+                            meta = failed_msg.metadata or {}
+                            meta['send_error'] = 'Audio upload to WhatsApp failed. Cannot send via link fallback.'
+                            meta['send_error_code'] = 500
+                            failed_msg.metadata = meta
+                            failed_msg.save(update_fields=['metadata'])
+                            if conversation_id:
+                                conv = Conversation.objects.get(id=conversation_id)
+                                publish_conversation_update(conv, MessageSerializer(failed_msg).data)
+                        except Exception:
+                            logger.exception('Failed to update send_error for message %d', message_id)
+                    return
+
                 hostname = parsed.hostname
                 if hostname is None or hostname in ('localhost', '127.0.0.1', ''):
                     public_host = next((h for h in settings.ALLOWED_HOSTS if h not in ('localhost', '127.0.0.1', '*', '')), None)
@@ -350,28 +366,18 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                         return
                 else:
                     hostname = parsed.hostname
-                if message_type == 'audio':
-                    is_voice = False
-                    if message_id:
-                        try:
-                            msg = Message.objects.get(id=message_id)
-                            is_voice = (msg.metadata or {}).get('voice', False)
-                        except Message.DoesNotExist:
-                            pass
-                    payload['audio'] = {"link": content, "voice": is_voice}
-                else:
-                    media_payload = {"link": content}
-                    if message_type == 'document' and message_id:
-                        try:
-                            msg = Message.objects.get(id=message_id)
-                            meta = msg.metadata or {}
-                            if meta.get('filename'):
-                                media_payload['filename'] = meta['filename']
-                            if msg.content:
-                                media_payload['caption'] = msg.content
-                        except Message.DoesNotExist:
-                            pass
-                    payload[message_type] = media_payload
+                media_payload = {"link": content}
+                if message_type == 'document' and message_id:
+                    try:
+                        msg = Message.objects.get(id=message_id)
+                        meta = msg.metadata or {}
+                        if meta.get('filename'):
+                            media_payload['filename'] = meta['filename']
+                        if msg.content:
+                            media_payload['caption'] = msg.content
+                    except Message.DoesNotExist:
+                        pass
+                payload[message_type] = media_payload
         else:
             payload['type'] = 'text'
             payload['text'] = {"body": content}
