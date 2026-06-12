@@ -358,6 +358,30 @@ def _handler(name: str):
 
 # ── WELCOME ────────────────────────────────────────────────────────────────
 
+_GREET_ALT = (
+    # single-word
+    r"hola+s*|holi(?:s|wi)?|ol[aa]+"
+    r"|buen[ao]s?|buenas?"
+    r"|hey+|e+y+|h[ea]llo|hi\b"
+    r"|al[\u00f3o]+|halo"
+    r"|tal|bien"
+    # multi-word
+    r"|(?:muy\s+)?buen(?:[oa]s?)?\s+d[\u00edi]as?"  # buenos días / buen día
+    r"|(?:muy\s+)?buenas?\s+tardes?"              # buenas tardes / buena tarde
+    r"|(?:muy\s+)?buenas?\s+noches?"              # buenas noches / buena noche
+    r"|qu[\u00e9e]\s+tal"
+    r"|qu[\u00e9e]\s+hubo"
+    r"|qu[\u00e9e]\s+m[\u00e1a]s"
+    r"|c[\u00f3o]mo\s+(?:est[\u00e1a]s?\b|va\b|v[\u00e1a]s?\b)"  # cómo estás / como vas
+)
+_GREETING_RE = re.compile(
+    r"^(?:" + _GREET_ALT + r")"
+    r"(?:\s+(?:" + _GREET_ALT + r"))*"
+    r"(?:[\s,.]*(?:todo\s+bien|bien|gracias))*"
+    r"[\s.!]*$",
+    re.IGNORECASE,
+)
+
 @_handler(WELCOME)
 async def handle_welcome(session: dict, text: str, button_id: str | None,
                          conversation) -> FlowResult:
@@ -390,6 +414,9 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
                     "¿Necesitas algo más? elige una opción del menú."
                 ),
             ], send_interactive=_welcome_interactive())
+
+    if _GREETING_RE.match(text.strip()):
+        return FlowResult(state=WELCOME, messages=[], send_interactive=_welcome_interactive())
 
     intent = await _llm_classify_intent(text, WELCOME)
     if intent == "cotizar":
