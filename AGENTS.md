@@ -43,6 +43,81 @@ The bot runs as a **separate async process** managed by supervisord (`python man
 - **Metrics**: In-process `BotMetrics` counters in `api/bot/metrics.py`. Flushed to Redis hashes (`bot:metrics:{name}`) every 60s by the cleanup loop. Read by `GET /api/bot/status/`. 24h TTL, per-minute buckets. New metric: `messages.routed` (counts pre-LLM router hits).
 - **Cleanup loop**: Runs every 60s inside the bot process. Deletes expired takes/tags/notes from DB and publishes SSE events for affected conversations.
 
+### State machine (new)
+
+The bot has two modes controlled by the `BOT_STATE_MACHINE` env var (`1`/`true` to enable):
+
+| Mode | Files | Description |
+|---|---|---|
+| **State machine** (enabled) | `flow.py`, `llm_fallback.py` | State-driven flow, interactive messages, LLM only for free-text classification |
+| **Legacy LLM** (disabled — default) | `llm.py`, `router.py` | LLM drives entire conversation (original behavior) |
+
+#### State machine architecture
+
+- **`api/bot/flow.py`** — 31-state machine covering the full quote flow, Domii Fijo, purchases/bancarios, and multi-stop. Each state is an async handler registered via `@_handler(name)` decorator. The main entrypoint is `advance(conversation, session, user_text) -> FlowResult` which returns messages to send, escalation flags, and the next state.
+- **`api/bot/llm_fallback.py`** — Minimal Gemini classifier. Called only when the user sends free text instead of tapping a button. Receives current state + valid options, returns the matching button ID (or `"none"`). Tiny prompt (1-16 output tokens), temperature 0.0. Degrades gracefully (returns `None` if Gemini is down).
+- **`dispatcher.py`** — `_USE_STATE_MACHINE` flag at top; routes to `_handle_with_state_machine()` or `_handle_with_llm_legacy()`.
+
+#### Session structure (state machine)
+
+```python
+{
+    "state": "WELCOME",       # current state name
+    "fallback_count": 0,      # resets on successful parse, escalate at 2
+    "history": [...],         # [{role, content}, ...] for LLM context
+    "data": {
+        "collected": {
+            "profile": None, "service_type": None,
+            "segments": [{
+                "origin": {"address": "...", "lat": ..., "lng": ..., "confirmed": bool},
+                "destination": {...},
+                "description": None, "instructions": None,
+            }],
+            "current_segment": 0,
+            "tool_keys": [],
+            "payment_method": None, "acompanante": None,
+            "recipient_name": None, "recipient_phone": None,
+            "geocoded_addresses": [],
+        },
+    },
+    "domii_fijo_data": {...},  # only during Domii Fijo flow
+    "pending_coords": [],      # kept for compatibility
+}
+```
+
+#### Key states
+
+| State | Input type | Description |
+|---|---|---|
+| `WELCOME` | list | Menu: cotizar, Domii Fijo, FAQ, asesor |
+| `AWAITING_PROFILE` | buttons | final / negocio |
+| `AWAITING_SERVICE_TYPE` | list | domicilios / mensajeria / purchases / tramites / bancarios |
+| `AWAITING_ORIGIN` | free text | Geocode address → show location → confirm |
+| `CONFIRMING_ORIGIN` | buttons | Confirm with map |
+| `AWAITING_DESTINATION` | free text | Same as origin |
+| `CONFIRMING_DEST` | buttons | Confirm with map |
+| `AWAITING_MORE_STOPS` | buttons | Multi-stop loop |
+| `AWAITING_TOOLS` | list | Dynamic from calculator API |
+| `AWAITING_PAYMENT` | buttons | efectivo / nequi |
+| `AWAITING_ACOMPANANTE` | buttons | sí / no |
+| `SHOW_PRICE` | (internal) | Calls `calculate_price`, shows breakdown |
+| `CONFIRMING_QUOTE` | buttons | confirm / change / cancel |
+| `AWAITING_RECIPIENT_NAME/PHONE` | free text | Contact info |
+| `SUBMIT_ORDER` | (terminal) | Logs order, returns to WELCOME |
+
+#### Escalation (state machine — 6 escape paths)
+
+| Path | Trigger | When |
+|---|---|---|
+| **Keyword escalation** | `_FAQ_PATTERNS_ESCALATE` regex: agente, asesor, ayuda, no funciona, pásame con, quiero hablar con, etc. | Before state machine runs — any state |
+| **Cancel** | `_FAQ_PATTERNS_CANCEL`: salir, cancelar, menú, déjame, ya no quiero, no más | Returns to WELCOME |
+| **Confusion** | `_CONFUSION_PATTERNS` regex: no entiendo, repite, explícame, cómo así | 1st → re-explain + escalation hint. **2nd** → escalation offer button |
+| **Fallback** | LLM can't classify free text into a button ID | After **2** consecutive → escalate |
+| **Menu button** | User taps "Hablar con un asesor" in WELCOME | Direct escalate |
+| **Confusion button** | User taps "✅ Sí, por favor" on escalation offer | Direct escalate (button_id="escalate" handled in dispatcher) |
+
+**Escalation notes** include what was already collected (e.g., `"[Bot] Cotizando usuario_final · domicilios. Quedó en: método de pago (2 fallbacks)"`).
+
 ## Conversation visibility & take permissions
 
 - **Visibility**: Non-staff users only see conversations that are free, taken by themselves, or taken by the bot. Conversations taken by another human are filtered out via `Exists` subquery in `get_queryset()` (annotates `_has_other_human_take`). Staff sees all.

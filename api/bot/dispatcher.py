@@ -25,7 +25,7 @@ from .utils import get_bot_user, get_bot_user_async
 from .lock import conversation_lock
 from .guard import sanitize_user_input
 from .limits import check_inbound_rate
-from . import metrics
+from . import metrics, flow as state_flow
 from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session, extract_state_from_turn
 from .llm import handle_with_llm
@@ -43,6 +43,9 @@ _pending_tasks: set[asyncio.Task] = set()
 
 _ESCALATED_KEY = "bot:escalated:{conv_id}"
 _ESCALATED_TTL = 600  # 10 minutes
+
+# Feature flag — enable/disable state machine via env var
+_USE_STATE_MACHINE = os.environ.get("BOT_STATE_MACHINE", "") in ("1", "true", "yes")
 
 
 async def _handle_with_semaphore(event: dict):
@@ -288,6 +291,17 @@ async def handle_inbound(event: dict):
             logger.debug("Skipping empty/filtered message for conv=%s", conversation_id)
             return
 
+        # --- Detect interactive button/list reply ---
+        button_id = None
+        meta = msg_data.get("metadata")
+        if isinstance(meta, dict):
+            itype = meta.get("interactive_type")
+            if itype in ("button_reply", "list_reply"):
+                ireply = meta.get("interactive_reply", {})
+                button_id = ireply.get("id") or user_text
+            elif itype == "button":
+                button_id = user_text
+
         # --- Inbound rate limit ---
         if not await check_inbound_rate(conversation_id):
             incr_metric("messages.rate_limited")
@@ -297,69 +311,272 @@ async def handle_inbound(event: dict):
         incr_metric("messages.processed")
 
         session = await sync_to_async(get_session)(conversation_id)
-        if session is None:
-            session = {
-                "history": [],
-                "fallback_count": 0,
-            }
 
-        # --- Pre-emptive escalation on too many failures ---
-        if session.get("fallback_count", 0) >= 3:
-            logger.info(
-                "Escalating conv=%s after %d fallbacks",
-                conversation_id, session["fallback_count"],
-            )
-            await sync_to_async(delete_session)(conversation_id)
-            await _release_bot_take(conversation, escalated=True)
-            bot = await get_bot_user_async()
-            if bot:
-                await sync_to_async(ConversationNote.create_note)(
-                    conversation=conversation,
-                    content="[Bot] Escalado autom\u00e1ticamente \u2014 el bot no pudo procesar la solicitud tras varios intentos",
-                    expiry_type='custom',
-                    custom_expiry_minutes=10,
-                    created_by=bot,
-                )
-            await sync_to_async(send_reply)(
-                conversation,
-                "He tenido dificultades para ayudarte. Un asesor humano te atender\xe1 pronto.",
-            )
-            return
-
-        # --- Cancel detection (must be the ONLY content in the message) ---
-        cancel_pattern = re.compile(r'^(salir|cancelar|men[úu])[.!?]*\s*$', re.I)
-        if cancel_pattern.search(user_text):
-            incr_metric("cancellations")
-            await sync_to_async(delete_session)(conversation_id)
-            await _release_bot_take(conversation)
-            await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
-            return
-
-        # --- Pre-LLM routing: handle greetings, thanks, FAQ without LLM ---
-        routed_reply = try_route_message(session, user_text)
-        if routed_reply is not None:
-            session.setdefault("history", []).append({"role": "user", "content": user_text})
-            session["history"].append({"role": "model", "content": routed_reply})
-            await sync_to_async(save_session)(conversation_id, session)
-            await sync_to_async(send_reply)(conversation, routed_reply)
-            incr_metric("messages.routed")
-            return
-
-        session.setdefault("history", []).append({"role": "user", "content": user_text})
-
-        reply, escalated, sent_interactive, function_calls = await handle_with_llm(session, conversation)
-
-        session["history"].append({"role": "model", "content": reply})
-
-        if escalated:
-            incr_metric("escalations")
-            await sync_to_async(delete_session)(conversation_id)
+        if _USE_STATE_MACHINE:
+            await _handle_with_state_machine(session, conversation, conversation_id, user_text, button_id)
         else:
-            extract_state_from_turn(session, user_text)
-            await sync_to_async(save_session)(conversation_id, session)
+            await _handle_with_llm_legacy(session, conversation, conversation_id, user_text)
 
-        if not sent_interactive and reply.strip():
-            await sync_to_async(send_reply)(conversation, reply)
+
+# ── State machine handler ─────────────────────────────────────────────────
+
+_FAQ_PATTERNS_CANCEL = re.compile(
+    r"^(salir|cancelar|men[úu]|d[eé]jame|ya\s+no\s+(quiero|necesito)|no\s+m[áa]s)[.!]*\s*$",
+    re.I,
+)
+_FAQ_PATTERNS_ESCALATE = re.compile(
+    r"\b(agente|asesor|humano|persona|operador|"
+    r"hablar\s+con|atenci[oó]n|atender|atenderme|"
+    r"p[aá]same\s+con|quiero\s+(que\s+)?(me\s+)?(atienda|hable|ayuden|una\s+persona)|"
+    r"necesito\s+(ayuda|hablar|una\s+persona|un\s+asesor)|"
+    r"ay[uú]dame|ay[uú]da\s+por\s+favor|"
+    r"no\s+(funciona|sirve|entiende|entiendo|sirves)|"
+    r"esto\s+no|mejor\s+(hablo|llamo|quiero)\s+con|"
+    r"comun[ií]came|transfi[eé]reme|"
+    r"qu[eé]\s+pereza|qu[eé]\s+fastidio)\b",
+    re.I | re.MULTILINE,
+)
+
+
+async def _handle_with_state_machine(session, conversation, conversation_id, user_text,
+                                      button_id: str | None = None):
+    """Process one turn using the state machine (flow.py)."""
+    result: state_flow.FlowResult
+
+    # --- Load or create session ---
+    if session is None:
+        session = state_flow.build_initial_session()
+
+    # --- Fallback threshold: 2 failures → escalate ---
+    if session.get("fallback_count", 0) >= 2:
+        logger.info("Escalating conv=%s after %d fallbacks (state machine)",
+                     conversation_id, session["fallback_count"])
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation, escalated=True)
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content="[Bot] Escalado autom\u00e1ticamente \u2014 el bot no pudo procesar la solicitud tras varios intentos",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
+        await sync_to_async(send_reply)(
+            conversation,
+            "He tenido dificultades para ayudarte. Un asesor humano te atender\u00e1 pronto.",
+        )
+        return
+
+    # --- Global keywords (checked before state machine) ---
+    if _FAQ_PATTERNS_CANCEL.search(user_text):
+        incr_metric("cancellations")
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation)
+        welcome = state_flow.get_welcome_interactive()
+        await sync_to_async(send_reply)(
+            conversation,
+            "\u00a1Bienvenido a Domii Tulu\u00e1! \u00bfQu\u00e9 deseas hacer?",
+        )
+        await sync_to_async(_send_interactive_payload)(conversation, welcome)
+        return
+
+    if _FAQ_PATTERNS_ESCALATE.search(user_text):
+        incr_metric("escalations")
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation, escalated=True)
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content="[Bot] Cliente solicit\u00f3 hablar con un asesor durante la conversaci\u00f3n",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
+        await sync_to_async(send_reply)(
+            conversation,
+            "Un asesor te atender\u00e1 pronto.",
+        )
+        return
+
+    # --- Button-based escalation (from confusion handler) ---
+    if button_id == "escalate":
+        incr_metric("escalations")
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation, escalated=True)
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content="[Bot] Cliente solicit\u00f3 asesor tras dificultades",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
+        await sync_to_async(send_reply)(
+            conversation,
+            "Un asesor te atender\u00e1 pronto.",
+        )
+        return
+
+    # --- FAQ mid-flow ---
+    from .router import THANKS_PATTERNS
+    clean = user_text.strip().lower()
+    if clean in THANKS_PATTERNS:
+        await sync_to_async(send_reply)(
+            conversation,
+            "\u00a1De nada! \u00bfHay algo m\u00e1s en lo que pueda ayudarte?",
+        )
+        return
+
+    # --- Run state machine ---
+    result = await state_flow.advance(conversation, session, user_text, button_id)
+
+    # --- Process result ---
+    if result.escalate:
+        incr_metric("escalations")
+        await sync_to_async(delete_session)(conversation_id)
+        reason = result.escalate_reason or "Cliente solicit\u00f3 asesor"
+        await _release_bot_take(conversation, escalated=True)
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content=f"[Bot] {reason}",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
+        await sync_to_async(send_reply)(
+            conversation,
+            "Un asesor te atender\u00e1 pronto.",
+        )
+        return
+
+    if result.fallback:
+        session["fallback_count"] = session.get("fallback_count", 0) + 1
+    else:
+        session["fallback_count"] = 0
+
+    # --- Send messages ---
+    for msg in result.messages:
+        if msg.get("type") == "text" and msg.get("content"):
+            await sync_to_async(send_reply)(conversation, msg["content"])
+
+    if result.send_interactive:
+        await sync_to_async(_send_interactive_payload)(conversation, result.send_interactive)
+
+    # --- Save or delete session ---
+    new_state = result.state
+    if new_state == state_flow.WELCOME and session.get("state") != state_flow.WELCOME:
+        await sync_to_async(delete_session)(conversation_id)
+    else:
+        session.setdefault("history", [])
+        session["history"].append({"role": "user", "content": user_text})
+        await sync_to_async(save_session)(conversation_id, session)
+
+
+def _send_interactive_payload(conversation, interactive_payload: dict):
+    """Send an interactive message (button/list) to the user."""
+    bot = get_bot_user()
+    if not bot:
+        return
+    body_text = interactive_payload.get("body", {}).get("text", "Mensaje interactivo")
+    _send_pool.submit(
+        send_whatsapp_outbound,
+        'interactive',
+        interactive_payload,
+        conversation.contact_phone,
+        None,
+        conversation.id,
+    )
+    msg = Message.objects.create(
+        conversation=conversation,
+        direction="outbound",
+        message_type="interactive",
+        content=body_text[:255],
+        sender_name="Bot",
+        sender=bot,
+        metadata={"interactive": interactive_payload},
+    )
+    conversation.last_message = body_text[:255]
+    conversation.last_message_at = timezone.now()
+    conversation.save(update_fields=["last_message", "last_message_at"])
+
+    msg_data = MessageSerializer(msg).data
+    publish_conversation_update(conversation, msg_data)
+
+
+# ── Legacy LLM handler (unchanged) ────────────────────────────────────────
+
+async def _handle_with_llm_legacy(session, conversation, conversation_id, user_text):
+    """Original LLM-driven handler — preserved for backward compat."""
+    if session is None:
+        session = {
+            "history": [],
+            "fallback_count": 0,
+        }
+
+    # --- Pre-emptive escalation on too many failures ---
+    if session.get("fallback_count", 0) >= 3:
+        logger.info(
+            "Escalating conv=%s after %d fallbacks",
+            conversation_id, session["fallback_count"],
+        )
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation, escalated=True)
+        bot = await get_bot_user_async()
+        if bot:
+            await sync_to_async(ConversationNote.create_note)(
+                conversation=conversation,
+                content="[Bot] Escalado autom\u00e1ticamente \u2014 el bot no pudo procesar la solicitud tras varios intentos",
+                expiry_type='custom',
+                custom_expiry_minutes=10,
+                created_by=bot,
+            )
+        await sync_to_async(send_reply)(
+            conversation,
+            "He tenido dificultades para ayudarte. Un asesor humano te atender\u00e1 pronto.",
+        )
+        return
+
+    # --- Cancel detection ---
+    cancel_pattern = re.compile(r'^(salir|cancelar|men[úu])[.!?]*\s*$', re.I)
+    if cancel_pattern.search(user_text):
+        incr_metric("cancellations")
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation)
+        await sync_to_async(send_reply)(conversation, WELCOME_REPLY)
+        return
+
+    # --- Pre-LLM routing: handle greetings, thanks, FAQ without LLM ---
+    routed_reply = try_route_message(session, user_text)
+    if routed_reply is not None:
+        session.setdefault("history", []).append({"role": "user", "content": user_text})
+        session["history"].append({"role": "model", "content": routed_reply})
+        await sync_to_async(save_session)(conversation_id, session)
+        await sync_to_async(send_reply)(conversation, routed_reply)
+        incr_metric("messages.routed")
+        return
+
+    session.setdefault("history", []).append({"role": "user", "content": user_text})
+
+    reply, escalated, sent_interactive, function_calls = await handle_with_llm(
+        session, conversation,
+    )
+
+    session["history"].append({"role": "model", "content": reply})
+
+    if escalated:
+        incr_metric("escalations")
+        await sync_to_async(delete_session)(conversation_id)
+    else:
+        extract_state_from_turn(session, user_text)
+        await sync_to_async(save_session)(conversation_id, session)
+
+    if not sent_interactive and reply.strip():
+        await sync_to_async(send_reply)(conversation, reply)
 
 
 async def _subscribe_with_retry():

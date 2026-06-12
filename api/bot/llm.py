@@ -131,7 +131,7 @@ HERRAMIENTAS:
 FLUJO COTIZAR SERVICIO:
 1. Perfil: usuario_final o negocio
 2. Tipo servicio: domicilios, mensajer\u00eda, compras por encargo, tr\u00e1mites, bancarios
-3-4. Origen y destino: usa geocode_search si no hay coordenadas. Si m\u00faltiples resultados \u2192 send_interactive(type="list"), title m\u00e1x 24 chars (barrio/zona), description m\u00e1x 72 chars (direcci\u00f3n). Si un solo resultado \u2192 geocode_details directo. Despu\u00e9s de geocode_details el sistema env\u00eda ubicaci\u00f3n en mapa. SIEMPRE confirma la direcci\u00f3n con el usuario.
+3-4. Origen y destino: usa geocode_search si no hay coordenadas. Si m\u00faltiples resultados \u2192 send_interactive(type="list"), title m\u00e1x 24 chars vague name like the neighborhood, description m\u00e1x 72 chars (direcci\u00f3n). Si un solo resultado \u2192 geocode_details directo. Despu\u00e9s de geocode_details el sistema env\u00eda ubicaci\u00f3n en mapa. SIEMPRE confirma la direcci\u00f3n con el usuario.
 5. \u00bfM\u00e1s paradas? (repetir desde 3 si s\u00ed)
 6. Herramientas: el usuario escribe cu\u00e1les necesita (ej: "canasta y malet\u00edn", "ninguna"). Extrae los tool keys.
 7. Pago: efectivo o Nequi
