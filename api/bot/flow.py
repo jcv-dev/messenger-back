@@ -95,6 +95,36 @@ ESCALATE = "ESCALATE"
 _GEO_SERVICES = frozenset({"domicilios", "mensajeria", "tramites"})
 _COORD_OPTIONAL = frozenset({"purchases", "bancarios"})
 _SKIP_WORDS = frozenset({"no", "ninguna", "ninguno", "omitir", "skip", "ningun"})
+_GEOCODE_FAIL_LIMIT = 2
+
+
+def _inc_geocode_fail(session: dict) -> None:
+    _d(session)["geocode_fail_count"] = _d(session).get("geocode_fail_count", 0) + 1
+
+
+def _reset_geocode_fail(session: dict) -> None:
+    _d(session)["geocode_fail_count"] = 0
+
+
+def _check_geocode_fail(session: dict) -> FlowResult | None:
+    """Auto-escalate if geocode failures exceed limit."""
+    if _d(session).get("geocode_fail_count", 0) >= _GEOCODE_FAIL_LIMIT:
+        _reset_geocode_fail(session)
+        return FlowResult(
+            escalate=True,
+            escalate_reason="No se pudo encontrar la dirección tras varios intentos",
+            messages=[_text_msg(
+                "He tenido dificultades para encontrar tu dirección. "
+                "Un asesor te atenderá pronto y completará el pedido contigo."
+            )],
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  Result type
+# ---------------------------------------------------------------------------
+
 
 # ---------------------------------------------------------------------------
 #  Result type
@@ -253,6 +283,10 @@ async def _geocode_and_store(session: dict, conversation, text: str, field: str)
         return FlowResult(messages=[_text_msg("Error inesperado. Intenta de nuevo.")])
 
     if len(result) == 0:
+        _inc_geocode_fail(session)
+        chk = _check_geocode_fail(session)
+        if chk:
+            return chk
         return FlowResult(messages=[
             _text_msg("No encontré esa dirección. Intenta con un formato como 'Cra 1 #2-3, Tuluá'."),
         ])
@@ -326,6 +360,10 @@ async def _store_single_geocode(session: dict, conversation, entry: dict, field:
 async def _handle_geocode_select(session: dict, conversation, button_id: str, field: str) -> FlowResult:
     """Handle user selection from geocode results list."""
     if button_id == "none_match":
+        _inc_geocode_fail(session)
+        chk = _check_geocode_fail(session)
+        if chk:
+            return chk
         return_to = AWAITING_ORIGIN if field == "origin" else AWAITING_DESTINATION
         return FlowResult(
             state=return_to,
@@ -602,6 +640,7 @@ async def handle_confirm_origin(session: dict, text: str, button_id: str | None,
                                 conversation) -> FlowResult:
     value = button_id if button_id else await _llm_classify_intent(text, CONFIRMING_ORIGIN)
     if value == "yes":
+        _reset_geocode_fail(session)
         _cur_seg(session)["origin"]["confirmed"] = True
         dest_prompt = (
             "¿Dirección de destino? (Opcional — escribe 'no' para omitir)"
@@ -612,6 +651,10 @@ async def handle_confirm_origin(session: dict, text: str, button_id: str | None,
             _text_msg(dest_prompt),
         ])
     if value == "no":
+        _inc_geocode_fail(session)
+        chk = _check_geocode_fail(session)
+        if chk:
+            return chk
         _cur_seg(session)["origin"] = {"address": None, "lat": None, "lng": None, "confirmed": False}
         origin_prompt = (
             "¿Dirección de origen? (Opcional — escribe 'no' para omitir)"
@@ -667,6 +710,7 @@ async def handle_confirm_dest(session: dict, text: str, button_id: str | None,
                               conversation) -> FlowResult:
     value = button_id if button_id else await _llm_classify_intent(text, CONFIRMING_DEST)
     if value == "yes":
+        _reset_geocode_fail(session)
         _cur_seg(session)["destination"]["confirmed"] = True
         st = _d(session).get("service_type", "")
         if st == "purchases":
@@ -679,6 +723,10 @@ async def handle_confirm_dest(session: dict, text: str, button_id: str | None,
             _text_msg(desc_prompt),
         ])
     if value == "no":
+        _inc_geocode_fail(session)
+        chk = _check_geocode_fail(session)
+        if chk:
+            return chk
         _cur_seg(session)["destination"] = {"address": None, "lat": None, "lng": None, "confirmed": False}
         dest_prompt = (
             "¿Dirección de destino? (Opcional — escribe 'no' para omitir)"
@@ -1551,6 +1599,7 @@ def build_initial_session() -> dict:
                 "tool_keys": [],
                 "payment_method": None,
                 "acompanante": None,
+                "geocode_fail_count": 0,
             },
         },
     }
