@@ -28,7 +28,7 @@ from django.utils import timezone
 
 from . import calculator
 from .utils import get_bot_user_async
-from api.models import Message
+from api.models import Conversation, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
