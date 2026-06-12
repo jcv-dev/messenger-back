@@ -93,6 +93,8 @@ ESCALATE = "ESCALATE"
 
 # --- Service types that need geocoding ---
 _GEO_SERVICES = frozenset({"domicilios", "mensajeria", "tramites"})
+_COORD_OPTIONAL = frozenset({"purchases", "bancarios"})
+_SKIP_WORDS = frozenset({"no", "ninguna", "ninguno", "omitir", "skip", "ningun"})
 
 # ---------------------------------------------------------------------------
 #  Result type
@@ -523,18 +525,16 @@ async def handle_service_type(session: dict, text: str, button_id: str | None,
             ],
         ))
 
-    if value in _GEO_SERVICES:
-        return FlowResult(state=AWAITING_ORIGIN, messages=[
-            _text_msg("¿Cuál es la dirección de origen? (Escríbela o comparte tu ubicación)"),
-        ])
+    coords_optional = value in _COORD_OPTIONAL
+    _d(session)["coords_optional"] = coords_optional
 
-    # purchases / bancarios — no geocoding
-    if value == "bancarios":
-        return FlowResult(state=AWAITING_DESCRIPTION, messages=[
-            _text_msg("¿Qué trámite bancario necesitas?"),
-        ])
-    return FlowResult(state=AWAITING_DESCRIPTION, messages=[
-        _text_msg("¿Qué necesitas que compren?"),
+    origin_prompt = (
+        "¿Dirección de origen? (Opcional — escribe 'no' para omitir)"
+        if coords_optional
+        else "¿Cuál es la dirección de origen? (Escríbela o comparte tu ubicación)"
+    )
+    return FlowResult(state=AWAITING_ORIGIN, messages=[
+        _text_msg(origin_prompt),
     ])
 
 
@@ -575,6 +575,12 @@ async def handle_origin(session: dict, text: str, button_id: str | None,
         return FlowResult(messages=[_text_msg("Escribe la dirección o comparte tu ubicación.")])
     if not text.strip():
         return FlowResult(messages=[_text_msg("Escribe una dirección.")])
+    if _d(session).get("coords_optional") and text.strip().lower() in _SKIP_WORDS:
+        _cur_seg(session)["origin"] = {"address": None, "lat": None, "lng": None, "confirmed": True}
+        dest_prompt = "¿Dirección de destino? (Opcional — escribe 'no' para omitir)"
+        return FlowResult(state=AWAITING_DESTINATION, messages=[
+            _text_msg(dest_prompt),
+        ])
     return await _geocode_and_store(session, conversation, text.strip(), "origin")
 
 
@@ -596,13 +602,23 @@ async def handle_confirm_origin(session: dict, text: str, button_id: str | None,
     value = button_id if button_id else await _llm_classify_intent(text, CONFIRMING_ORIGIN)
     if value == "yes":
         _cur_seg(session)["origin"]["confirmed"] = True
+        dest_prompt = (
+            "¿Dirección de destino? (Opcional — escribe 'no' para omitir)"
+            if _d(session).get("coords_optional")
+            else "¿Cuál es la dirección de destino?"
+        )
         return FlowResult(state=AWAITING_DESTINATION, messages=[
-            _text_msg("¿Cuál es la dirección de destino?"),
+            _text_msg(dest_prompt),
         ])
     if value == "no":
         _cur_seg(session)["origin"] = {"address": None, "lat": None, "lng": None, "confirmed": False}
+        origin_prompt = (
+            "¿Dirección de origen? (Opcional — escribe 'no' para omitir)"
+            if _d(session).get("coords_optional")
+            else "Claro. ¿Cuál es la dirección correcta?"
+        )
         return FlowResult(state=AWAITING_ORIGIN, messages=[
-            _text_msg("Claro. ¿Cuál es la dirección correcta?"),
+            _text_msg(origin_prompt),
         ])
     return FlowResult(fallback=True, messages=[
         _text_msg("Responde si la dirección es correcta o no."),
@@ -618,6 +634,18 @@ async def handle_destination(session: dict, text: str, button_id: str | None,
         return FlowResult(messages=[_text_msg("Escribe la dirección o comparte tu ubicación.")])
     if not text.strip():
         return FlowResult(messages=[_text_msg("Escribe una dirección.")])
+    if _d(session).get("coords_optional") and text.strip().lower() in _SKIP_WORDS:
+        _cur_seg(session)["destination"] = {"address": None, "lat": None, "lng": None, "confirmed": True}
+        st = _d(session).get("service_type", "")
+        if st == "purchases":
+            desc_prompt = "¿Qué necesitas que compren?"
+        elif st == "bancarios":
+            desc_prompt = "¿Qué trámite bancario necesitas?"
+        else:
+            desc_prompt = "¿Qué estás enviando? (Describe el paquete o producto)"
+        return FlowResult(state=AWAITING_SEGMENT_DESCRIPTION, messages=[
+            _text_msg(desc_prompt),
+        ])
     return await _geocode_and_store(session, conversation, text.strip(), "destination")
 
 
@@ -639,13 +667,25 @@ async def handle_confirm_dest(session: dict, text: str, button_id: str | None,
     value = button_id if button_id else await _llm_classify_intent(text, CONFIRMING_DEST)
     if value == "yes":
         _cur_seg(session)["destination"]["confirmed"] = True
+        st = _d(session).get("service_type", "")
+        if st == "purchases":
+            desc_prompt = "¿Qué necesitas que compren?"
+        elif st == "bancarios":
+            desc_prompt = "¿Qué trámite bancario necesitas?"
+        else:
+            desc_prompt = "¿Qué estás enviando? (Describe el paquete o producto)"
         return FlowResult(state=AWAITING_SEGMENT_DESCRIPTION, messages=[
-            _text_msg("¿Qué estás enviando? (Describe el paquete o producto)"),
+            _text_msg(desc_prompt),
         ])
     if value == "no":
         _cur_seg(session)["destination"] = {"address": None, "lat": None, "lng": None, "confirmed": False}
+        dest_prompt = (
+            "¿Dirección de destino? (Opcional — escribe 'no' para omitir)"
+            if _d(session).get("coords_optional")
+            else "Claro. ¿Cuál es la dirección correcta?"
+        )
         return FlowResult(state=AWAITING_DESTINATION, messages=[
-            _text_msg("Claro. ¿Cuál es la dirección correcta?"),
+            _text_msg(dest_prompt),
         ])
     return FlowResult(fallback=True, messages=[
         _text_msg("Responde si la dirección es correcta o no."),
@@ -658,7 +698,14 @@ async def handle_confirm_dest(session: dict, text: str, button_id: str | None,
 async def handle_seg_description(session: dict, text: str, button_id: str | None,
                                  conversation) -> FlowResult:
     if not text.strip():
-        return FlowResult(messages=[_text_msg("Describe lo que envías.")])
+        st = _d(session).get("service_type", "")
+        if st == "purchases":
+            err = "Describe lo que necesitas que compren."
+        elif st == "bancarios":
+            err = "Describe qué trámite bancario necesitas."
+        else:
+            err = "Describe lo que envías."
+        return FlowResult(messages=[_text_msg(err)])
     _cur_seg(session)["description"] = text.strip()[:500]
     return FlowResult(state=AWAITING_SEGMENT_INSTRUCTIONS, messages=[
         _text_msg("¿Alguna instrucción especial? (Ej: 'Tocar timbre', 'Llamar al llegar')\n\nEscribe 'no' si no hay instrucciones."),
@@ -706,6 +753,11 @@ async def handle_more_stops(session: dict, text: str, button_id: str | None,
         ])
 
     if value == "no":
+        st = _d(session).get("service_type", "")
+        if st == "bancarios":
+            return FlowResult(state=ASK_BANCARIOS_ENTITY, messages=[
+                _text_msg("¿Para qué entidad bancaria es el trámite?"),
+            ])
         return FlowResult(state=AWAITING_TOOLS, messages=[
             _text_msg("¿Necesitas herramientas adicionales? (Canasta, maletín térmico, etc.)"),
         ], send_interactive=await _build_tools_interactive(session))
@@ -1075,7 +1127,6 @@ async def _submit_order(conversation, session: dict) -> FlowResult:
         messages=[
             _text_msg("✅ *Pedido enviado exitosamente!*\n\nUn domiciliario será asignado pronto.\n\n¿Necesitas algo más?"),
         ],
-        send_interactive=_welcome_interactive(),
     )
 
 
@@ -1202,11 +1253,11 @@ async def handle_fijo_confirm(session: dict, text: str, button_id: str | None,
         logger.info("DOMII FIJO REQUEST conv=%s\n%s", conversation.id, "\n".join(lines))
         return FlowResult(state=WELCOME, messages=[
             _text_msg("✅ *Solicitud enviada!* Un asesor confirmará la disponibilidad.\n\n¿Necesitas algo más?"),
-        ], send_interactive=_welcome_interactive())
+        ])
     if value == "cancel":
         return FlowResult(state=WELCOME, messages=[
             _text_msg("Solicitud cancelada. ¿Necesitas algo más?"),
-        ], send_interactive=_welcome_interactive())
+        ])
     return FlowResult(fallback=True, messages=[
         _text_msg("Elige 'Confirmar' o 'Cancelar'."),
     ], send_interactive=_interactive("button", "¿Confirmas?", buttons=[
