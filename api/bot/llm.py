@@ -496,6 +496,8 @@ async def _execute_tool(function_call, conversation, session):
                     {"lat": float(lat), "lng": float(lng)},
                 )
                 display_name = (result.get("display_name") or result.get("name") or "")[:300]
+                session.setdefault("data", {}).setdefault("collected", {})
+                session["data"]["collected"].setdefault("geocoded_addresses", []).append(display_name)
                 location_payload = {
                     "longitude": float(lng),
                     "latitude": float(lat),

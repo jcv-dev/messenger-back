@@ -132,6 +132,14 @@ def build_state_summary(session):
                 val = "S\u00ed" if val else "No"
             lines.append(f"- {label}: {val} \u2713")
 
+    geocoded = collected.get("geocoded_addresses", [])
+    if geocoded:
+        lines.append("")
+        lines.append("Direcciones ya consultadas (NO preguntes de nuevo):")
+        for i, addr in enumerate(geocoded, 1):
+            label = "Origen" if i == 1 else f"Destino {i-1}" if i == 2 else f"Parada {i}"
+            lines.append(f"- {label}: {addr} \u2713")
+
     lines.append("")
     lines.append("Contin\u00faa con el siguiente paso que falte. "
                  "NO preguntes por datos que ya tienen \u2713.")
