@@ -112,22 +112,33 @@ def upload_media_to_whatsapp(file_path, phone_number_id, token):
         return res_data.get('id')
 
 
-def _convert_audio_to_ogg_opus(audio_path):
-    """Convert any audio (WebM, MP4, AAC) to OGG Opus for WhatsApp compatibility."""
+def _convert_audio_to_ogg_opus(audio_path, actual_duration=None):
+    """Convert any audio (WebM, MP4, AAC) to OGG Opus for WhatsApp compatibility.
+
+    Args:
+        audio_path: Path to the source audio file.
+        actual_duration: Known-good duration in seconds. If provided, forces
+            ffmpeg to write correct duration metadata into the output OGG,
+            preventing WhatsApp from showing wrong playback length.
+    """
     try:
         fd, ogg_path = tempfile.mkstemp(suffix='.ogg', prefix='wa_audio_')
         os.close(fd)
     except OSError:
         return None
     try:
+        cmd = [
+            'ffmpeg', '-y', '-i', audio_path,
+            '-c:a', 'libopus', '-b:a', '32k',
+            '-application', 'voip',
+            '-frame_duration', '60',
+            '-vn',
+        ]
+        if actual_duration is not None and actual_duration > 0:
+            cmd.extend(['-t', f'{actual_duration:.1f}'])
+        cmd.append(ogg_path)
         result = subprocess.run(
-            ['ffmpeg', '-y', '-i', audio_path,
-             '-c:a', 'libopus', '-b:a', '32k',
-             '-application', 'voip',
-             '-frame_duration', '60',
-             '-vn',
-             ogg_path],
-            capture_output=True, text=True, timeout=30,
+            cmd, capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
             logger.warning("ffmpeg audio to OGG conversion failed: %s", result.stderr[:200])
@@ -257,15 +268,18 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                 if message_type == 'audio':
                     _, ext = os.path.splitext(file_path)
                     should_convert = ext.lower() in ('.webm', '.mp4', '.m4a', '.aac')
-                    if not should_convert and message_id:
+                    actual_duration = None
+                    if message_id:
                         try:
                             msg = Message.objects.get(id=message_id)
-                            mime = (msg.metadata or {}).get('mime_type', '')
-                            should_convert = 'mp4' in mime or 'aac' in mime
+                            meta = msg.metadata or {}
+                            mime = meta.get('mime_type', '')
+                            should_convert = should_convert or ('mp4' in mime or 'aac' in mime)
+                            actual_duration = meta.get('duration_seconds')
                         except Message.DoesNotExist:
                             pass
                     if should_convert:
-                        converted_path = _convert_audio_to_ogg_opus(file_path)
+                        converted_path = _convert_audio_to_ogg_opus(file_path, actual_duration=actual_duration)
                         if converted_path:
                             upload_path = converted_path
                 acquire_rate_capacity(phone_number_id)
