@@ -477,7 +477,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 other_human_takes = ConversationTake.objects.filter(
                     conversation=OuterRef('pk'),
                     expires_at__gt=now,
-                ).exclude(created_by=user).exclude(created_by__username='bot')
+                ).exclude(created_by__isnull=True).exclude(created_by=user).exclude(created_by__username='bot')
                 qs = qs.annotate(
                     _has_other_human_take=Exists(other_human_takes)
                 ).filter(_has_other_human_take=False)
@@ -586,6 +586,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
             )
             take_serializer = ConversationTakeSerializer(take)
             conversation.save()
+            # Clear prefetch cache so SSE serializes fresh takes, not stale prefetch
+            if hasattr(conversation, '_prefetched_objects_cache'):
+                conversation._prefetched_objects_cache.pop('takes', None)
             publish_conversation_update(conversation)
             return Response(take_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -607,6 +610,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 )
             active_take.delete()
         conversation.save()
+        # Clear prefetch cache so SSE serializes fresh takes, not stale prefetch
+        if hasattr(conversation, '_prefetched_objects_cache'):
+            conversation._prefetched_objects_cache.pop('takes', None)
         publish_conversation_update(conversation)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
