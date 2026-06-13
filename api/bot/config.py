@@ -124,6 +124,83 @@ def is_within_operating_hours() -> bool:
     return True
 
 
+def _bogota_now():
+    from zoneinfo import ZoneInfo
+    return timezone.now().astimezone(ZoneInfo('America/Bogota'))
+
+
+def get_grouped_hours_text() -> str:
+    """Return operating hours as a grouped human-readable string.
+
+    Days sharing the same open/close time are grouped together.
+    Consecutive ranges use "a" ("Lunes a Viernes"); non-consecutive
+    lists use commas and "y" ("Lunes, Miércoles y Viernes").
+    Future date overrides are listed at the end.
+    """
+    from api.models import BotSchedule
+
+    now_bog = _bogota_now()
+    today = now_bog.date()
+
+    DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+
+    reg_rows = list(BotSchedule.objects.filter(
+        is_active=True, day_of_week__isnull=False,
+    ).order_by('day_of_week'))
+
+    if not reg_rows:
+        return ""
+
+    def _fmt(t):
+        return t.strftime('%-I:%M %p')
+
+    # Group by schedule (open/close pair)
+    schedule_map: dict[tuple, list[int]] = {}
+    for r in reg_rows:
+        sk = (r.open_time, r.close_time)
+        schedule_map.setdefault(sk, []).append(r.day_of_week)
+
+    for days in schedule_map.values():
+        days.sort()
+
+    def _day_label(days: list[int]) -> str:
+        if days == [0, 1, 2, 3, 4, 5, 6]:
+            return "Todos los días"
+        is_range = len(days) > 1 and all(days[i] == days[0] + i for i in range(len(days)))
+        if is_range:
+            return f"{DAYS[days[0]]} a {DAYS[days[-1]]}"
+        labels = [DAYS[d] for d in days]
+        if len(labels) == 1:
+            return labels[0]
+        if len(labels) == 2:
+            return f"{labels[0]} y {labels[1]}"
+        return ", ".join(labels[:-1]) + f" y {labels[-1]}"
+
+    lines = []
+    for (open_time, close_time), days in sorted(
+        schedule_map.items(), key=lambda kv: kv[1][0],
+    ):
+        label = _day_label(days)
+        if close_time is None:
+            lines.append(f"{label}: Cerrado")
+        else:
+            lines.append(f"{label}: {_fmt(open_time)} a {_fmt(close_time)}")
+
+    overrides = BotSchedule.objects.filter(
+        is_active=True, date__isnull=False, date__gte=today,
+    ).order_by('date')
+
+    for o in overrides:
+        date_label = o.date.strftime('%-d/%-m/%Y')
+        tag = f" ({o.label})" if o.label else ""
+        if o.close_time:
+            lines.append(f"{date_label}{tag}: {_fmt(o.open_time)} a {_fmt(o.close_time)}")
+        else:
+            lines.append(f"{date_label}{tag}: Cerrado")
+
+    return "\n".join(lines)
+
+
 def _clear_cache():
     global _CONFIG_CACHE
     _CONFIG_CACHE = {}

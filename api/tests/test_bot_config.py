@@ -75,7 +75,6 @@ class OperatingHoursTests(SimpleTestCase):
         return row
 
     def _mock_filter(self, rows):
-        """Return schedule rows that match the filter call."""
         def side_effect(**kwargs):
             mock_qs = MagicMock()
             if "date" in kwargs:
@@ -153,7 +152,6 @@ class OperatingHoursTests(SimpleTestCase):
     @patch("api.models.BotConfig")
     @patch("api.bot.config.timezone.now")
     def test_inactive_day_excluded(self, mock_now, mock_cfg):
-        """Inactive schedule rows are excluded → no active schedule → assumes open."""
         mock_cfg.objects.all().values_list.return_value = []
         mock_now.return_value = datetime.datetime(2026, 6, 15, 15, 0, tzinfo=datetime.timezone.utc)
         t = datetime.time
@@ -334,3 +332,156 @@ class ConfigCacheTests(SimpleTestCase):
         mock_time.return_value = 1030.0
         mock_model.objects.all().values_list.return_value = [("key1", "v2")]
         self.assertEqual(get_config("key1"), "v2")
+
+
+class GroupedHoursTextTests(SimpleTestCase):
+    """get_grouped_hours_text() — smart day grouping, future overrides."""
+
+    def _row(self, day_of_week=None, date=None, open_time=None,
+             close_time=None, is_active=True, label=""):
+        r = MagicMock()
+        r.day_of_week = day_of_week
+        r.date = date
+        r.open_time = open_time
+        r.close_time = close_time
+        r.is_active = is_active
+        r.label = label
+        return r
+
+    def _mock_qs(self, rows):
+        qs = MagicMock()
+        qs.__iter__.return_value = iter(rows)
+        qs.order_by.return_value = qs
+        return qs
+
+    def _make_side_effect(self, rows):
+        """Return side_effect list for two filter() calls: recurring, then overrides."""
+        recurring_qs = self._mock_qs(rows)
+        override_qs = self._mock_qs([])
+        return [recurring_qs, override_qs]
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_groups_consecutive_same_schedule(self, mock_now, mock_bs):
+        """Mon-Fri same schedule → 'Lunes a Viernes' group."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        t = datetime.time
+        rows = [
+            self._row(day_of_week=0, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=1, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=2, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=3, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=4, open_time=t(8, 0), close_time=t(20, 0)),
+        ]
+        mock_bs.objects.filter.side_effect = self._make_side_effect(rows)
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertIn("Lunes a Viernes", result)
+        self.assertNotIn("Martes:", result)
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_split_at_different_hours(self, mock_now, mock_bs):
+        """Sat/Sun different hours → separate lines."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        t = datetime.time
+        rows = [
+            self._row(day_of_week=0, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=1, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=2, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=3, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=4, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=5, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=6, open_time=t(9, 0), close_time=t(18, 0)),
+        ]
+        mock_bs.objects.filter.side_effect = self._make_side_effect(rows)
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertIn("Lunes a Sábado", result)
+        self.assertIn("Domingo: 9:00 AM", result)
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_all_different(self, mock_now, mock_bs):
+        """All different → no grouping."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        t = datetime.time
+        rows = [
+            self._row(day_of_week=0, open_time=t(8, 0), close_time=t(18, 0)),
+            self._row(day_of_week=1, open_time=t(9, 0), close_time=t(18, 0)),
+            self._row(day_of_week=2, open_time=t(8, 0), close_time=t(17, 0)),
+        ]
+        mock_bs.objects.filter.side_effect = self._make_side_effect(rows)
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertIn("Lunes:", result)
+        self.assertIn("Martes:", result)
+        self.assertIn("Miércoles:", result)
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_non_consecutive_days_interleaved(self, mock_now, mock_bs):
+        """Mon/Wed/Fri same hours, Tue/Thu same hours → grouped by schedule."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        t = datetime.time
+        rows = [
+            self._row(day_of_week=0, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=1, open_time=t(9, 0), close_time=t(18, 0)),
+            self._row(day_of_week=2, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=3, open_time=t(9, 0), close_time=t(18, 0)),
+            self._row(day_of_week=4, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=5, open_time=t(9, 0), close_time=t(18, 0)),
+            self._row(day_of_week=6, open_time=t(9, 0), close_time=t(18, 0)),
+        ]
+        mock_bs.objects.filter.side_effect = self._make_side_effect(rows)
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertIn("Lunes, Miércoles y Viernes", result)
+        self.assertIn("Martes, Jueves, Sábado y Domingo", result)
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_closed_day_grouped(self, mock_now, mock_bs):
+        """Closed days grouped; open days with gaps → comma+y list."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        t = datetime.time
+        rows = [
+            self._row(day_of_week=0, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=1, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=2, open_time=None, close_time=None),
+            self._row(day_of_week=3, open_time=None, close_time=None),
+            self._row(day_of_week=4, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=5, open_time=t(8, 0), close_time=t(20, 0)),
+            self._row(day_of_week=6, open_time=t(9, 0), close_time=t(18, 0)),
+        ]
+        mock_bs.objects.filter.side_effect = self._make_side_effect(rows)
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertIn("Lunes, Martes, Viernes y Sábado", result)
+        self.assertIn("Miércoles a Jueves: Cerrado", result)
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_everyday_single_group(self, mock_now, mock_bs):
+        """All 7 days same schedule → 'Todos los días'."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        t = datetime.time
+        rows = [
+            self._row(day_of_week=i, open_time=t(8, 0), close_time=t(20, 0))
+            for i in range(7)
+        ]
+        mock_bs.objects.filter.side_effect = self._make_side_effect(rows)
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertIn("Todos los días", result)
+        self.assertNotIn("Lunes", result)
+
+    @patch("api.models.BotSchedule")
+    @patch("api.bot.config.timezone.now")
+    def test_empty_returns_empty_string(self, mock_now, mock_bs):
+        """No schedule at all → empty string."""
+        mock_now.return_value = datetime.datetime(2026, 6, 13, 15, 0, tzinfo=datetime.timezone.utc)
+        mock_bs.objects.filter.side_effect = self._make_side_effect([])
+        from api.bot.config import get_grouped_hours_text
+        result = get_grouped_hours_text()
+        self.assertEqual(result, "")
