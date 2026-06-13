@@ -618,6 +618,39 @@ class ConversationViewSet(viewsets.ModelViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'])
+    def hand_over_to_bot(self, request, pk=None):
+        """Release the conversation back to the bot — clears all bot-blocking conditions.
+
+        Does NOT remove Domii tags (exemptions stay intact).
+        """
+        conversation = self.get_object()
+
+        # 1. Release any human take
+        ConversationTake.objects.filter(conversation=conversation).delete()
+
+        try:
+            import redis as sync_redis
+            r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+            pipe = r.pipeline()
+            # 2. Delete escalation cooldown
+            pipe.delete(f"bot:escalated:{conversation.id}")
+            # 3. Delete bot session (forces fresh start)
+            pipe.delete(f"bot:session:{conversation.id}")
+            # 4. Delete outside-hours replied flags
+            for key in r.scan_iter(f"bot:outside_hours_replied:{conversation.id}:*"):
+                pipe.delete(key)
+            pipe.execute()
+            r.close()
+        except Exception:
+            pass
+
+        conversation.save()
+        if hasattr(conversation, '_prefetched_objects_cache'):
+            conversation._prefetched_objects_cache.pop('takes', None)
+        publish_conversation_update(conversation)
+        return Response(status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
     def mark_read(self, request, pk=None):
         """Mark all unread inbound messages in a conversation as read"""
         conversation = self.get_object()
