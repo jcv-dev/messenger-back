@@ -398,7 +398,7 @@ class GroupedHoursTextTests(SimpleTestCase):
         from api.bot.config import get_grouped_hours_text
         result = get_grouped_hours_text()
         self.assertIn("Lunes a Sábado", result)
-        self.assertIn("Domingo: 9:00 AM", result)
+        self.assertIn("Domingo y Festivos: 9:00 AM", result)
 
     @patch("api.models.BotSchedule")
     @patch("api.bot.config.timezone.now")
@@ -437,7 +437,7 @@ class GroupedHoursTextTests(SimpleTestCase):
         from api.bot.config import get_grouped_hours_text
         result = get_grouped_hours_text()
         self.assertIn("Lunes, Miércoles y Viernes", result)
-        self.assertIn("Martes, Jueves, Sábado y Domingo", result)
+        self.assertIn("Martes, Jueves, Sábado y Domingo y Festivos", result)
 
     @patch("api.models.BotSchedule")
     @patch("api.bot.config.timezone.now")

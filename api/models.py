@@ -302,7 +302,7 @@ class BotSchedule(models.Model):
         null=True, blank=True,
         choices=[
             (0, 'Lunes'), (1, 'Martes'), (2, 'Miércoles'),
-            (3, 'Jueves'), (4, 'Viernes'), (5, 'Sábado'), (6, 'Domingo'),
+            (3, 'Jueves'), (4, 'Viernes'), (5, 'Sábado'), (6, 'Domingo y Festivos'),
         ],
     )
     date = models.DateField(null=True, blank=True)
@@ -325,7 +325,7 @@ class BotSchedule(models.Model):
 
     def __str__(self):
         if self.day_of_week is not None:
-            days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+            days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo y Festivos']
             day = days[self.day_of_week]
             hours = f'{self.open_time.strftime("%H:%M")}–{self.close_time.strftime("%H:%M")}' if self.close_time else 'Cerrado'
             return f'{day}: {hours}'

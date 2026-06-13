@@ -18,7 +18,7 @@ def _build_hours_response() -> str:
     if not rows.exists():
         return "Nuestro horario de atención:\n- No configurado."
     lines = ["Nuestro horario de atención:"]
-    days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+    days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo y Festivos']
     for r in rows:
         if r.day_of_week is not None:
             if r.close_time:

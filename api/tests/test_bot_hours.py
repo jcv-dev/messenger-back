@@ -45,7 +45,7 @@ class HoursResponseTests(SimpleTestCase):
         result = _build_hours_response()
         self.assertIn("Nuestro horario de atención:", result)
         self.assertIn("Lunes: 8:00 AM a 8:00 PM", result)
-        self.assertIn("Domingo: 9:00 AM a 6:00 PM", result)
+        self.assertIn("Domingo y Festivos: 9:00 AM a 6:00 PM", result)
 
     @patch("api.models.BotSchedule")
     def test_empty_schedule(self, mock_model):

@@ -43,7 +43,7 @@ def seed_bot_config(apps, schema_editor):
         (3, None, t(8, 0), t(20, 0), True, 'Jueves'),
         (4, None, t(8, 0), t(20, 0), True, 'Viernes'),
         (5, None, t(8, 0), t(20, 0), True, 'Sábado'),
-        (6, None, t(9, 0), t(18, 0), True, 'Domingo'),
+        (6, None, t(9, 0), t(18, 0), True, 'Domingo y Festivos'),
     ]
     for day_of_week, date, open_time, close_time, active, label in default_schedule:
         BotSchedule.objects.get_or_create(

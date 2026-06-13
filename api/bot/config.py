@@ -142,7 +142,7 @@ def get_grouped_hours_text() -> str:
     now_bog = _bogota_now()
     today = now_bog.date()
 
-    DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+    DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo y Festivos']
 
     reg_rows = list(BotSchedule.objects.filter(
         is_active=True, day_of_week__isnull=False,
