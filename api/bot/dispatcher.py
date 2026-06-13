@@ -321,7 +321,15 @@ async def handle_inbound(event: dict):
 # ── State machine handler ─────────────────────────────────────────────────
 
 _FAQ_PATTERNS_CANCEL = re.compile(
-    r"\b(?:salir|cancelar|cancel|men[úu]|d[eé]jame|ya\s+no\s+(?:quiero|necesito)|no\s+m[áa]s)\b",
+    r"\b(?:salir|cancelar|cancel|d[eé]jame|"
+    r"ya\s+no\s+(?:quiero|necesito)|no\s+m[áa]s)\b",
+    re.I,
+)
+_FAQ_MENU_RETURN = re.compile(
+    r"\b(?:men[úu](?:\s+principal)?|"
+    r"volver\s+(?:al?\s+)?(?:men[úu]|inicio|empezar|principio)|"
+    r"regresar|vuelve\s+a\s+(?:men[úu]|inicio)|"
+    r"ir\s+(?:al\s+)?men[úu])\b",
     re.I,
 )
 _FAQ_PATTERNS_ESCALATE = re.compile(
@@ -347,6 +355,10 @@ def _is_actual_cancel(user_text: str) -> bool:
         return False
     # "cancelar" in Colombia often means "pagar" — skip if payment context
     if "cancelar" in user_text.lower() and _PAYMENT_WORDS.search(user_text):
+        return False
+    # Long messages (>150 chars) are unlikely to be a pure cancel intent —
+    # the keyword is likely embedded in a broader request
+    if len(user_text) > 150:
         return False
     return True
 
@@ -383,6 +395,16 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
         return
 
     # --- Global keywords (checked before state machine) ---
+    if not button_id and _FAQ_MENU_RETURN.search(user_text) and not _is_actual_cancel(user_text):
+        incr_metric("cancellations")
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation)
+        await sync_to_async(send_reply)(
+            conversation,
+            "De acuerdo, volvamos al men\u00fa principal.",
+        )
+        return
+
     if not button_id and _is_actual_cancel(user_text):
         incr_metric("cancellations")
         await sync_to_async(delete_session)(conversation_id)
@@ -553,7 +575,16 @@ async def _handle_with_llm_legacy(session, conversation, conversation_id, user_t
         )
         return
 
-    # --- Cancel detection ---
+    # --- Menu-return / Cancel detection ---
+    if _FAQ_MENU_RETURN.search(user_text) and not _is_actual_cancel(user_text):
+        await sync_to_async(delete_session)(conversation_id)
+        await _release_bot_take(conversation)
+        await sync_to_async(send_reply)(
+            conversation,
+            "De acuerdo, volvamos al men\u00fa principal.",
+        )
+        return
+
     if _is_actual_cancel(user_text):
         incr_metric("cancellations")
         await sync_to_async(delete_session)(conversation_id)

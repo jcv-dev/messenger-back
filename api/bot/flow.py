@@ -473,7 +473,8 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
         return await handle_welcome(session, text, "faq", conversation)
 
     return FlowResult(fallback=True, messages=[
-        _text_msg("No entendí. Elige una opción del menú."),
+        _text_msg("Gracias por tu mensaje. Para ayudarte mejor, dime exactamente qu\u00e9 "
+                  "necesitas o elige una opci\u00f3n del men\u00fa."),
     ], send_interactive=_welcome_interactive())
 
 
@@ -1430,7 +1431,17 @@ _CONFUSION_PATTERNS = re.compile(
 
 # ── Global cancel/escalate patterns (same as dispatcher) ───────────────────
 _GLOBAL_CANCEL = re.compile(
-    r"\b(?:salir|cancelar|cancel|men[úu]|d[eé]jame|ya\s+no\s+(?:quiero|necesito)|no\s+m[áa]s)\b",
+    r"\b(?:salir|cancelar|cancel|d[eé]jame|"
+    r"ya\s+no\s+(?:quiero|necesito)|no\s+m[áa]s)\b",
+    re.I,
+)
+_GLOBAL_MENU_RETURN = re.compile(
+    r"\b(?:"
+    r"men[úu]\s+principal|"
+    r"volver\s+(?:al?\s+)?(?:men[úu]|inicio|empezar|principio)|"
+    r"regresar\s+(?:al?\s+)?(?:men[úu]|inicio|principio)|"
+    r"vuelve\s+a\s+(?:men[úu]|inicio)|"
+    r"ir\s+(?:al\s+)?men[úu])\b",
     re.I,
 )
 _GLOBAL_ESCALATE = re.compile(
@@ -1449,11 +1460,33 @@ _GLOBAL_ESCALATE = re.compile(
 # Prevent false cancel when "cancelar" means "pagar" in Colombian Spanish
 _PAYMENT_WORDS = re.compile(r"\b(cuenta|factura|pago|recibo|total|tarjeta|transferencia|nequi|bancolombia|daviplata|billetera|efectivo|pedido|servicio|pesos|valor)\b", re.I)
 
+# Domii Fijo info-request patterns — when user is in fijo flow but asking for
+# FAQ, pricing, or saying "no soy negocio / no quiero contratar"
+_DOMII_FIJO_INFO = re.compile(
+    r"\b(?:"
+    r"c[óo]mo\s+(?:funciona|es|hago|se\s+hace)|"
+    r"informaci[óo]n(?!\s+general\b)|"
+    r"(?:solo|s[óo]lo)\s+(?:quer[íi]a|necesito|busco)\s+(?:info|saber|conocer|informaci[óo]n)|"
+    r"no\s+(?:soy|tengo)\s+(?:negocio|empresa|comercio)|"
+    r"no\s+quiero\s+(?:contratar|el\s+servicio|pedir)|"
+    r"me\s+equivoqu[ée]|"
+    r"cu[áa]nto\s+(?:cuesta|vale|sale|es\s+el\s+precio|se\s+cobra)|"
+    r"precio|tarifa)\b",
+    re.I,
+)
+_FIJO_STATES = {"AWAITING_FIJO_NAME", "AWAITING_FIJO_ADDR", "AWAITING_FIJO_PHONE",
+                 "AWAITING_FIJO_DATE", "AWAITING_FIJO_START", "AWAITING_FIJO_END",
+                 "AWAITING_FIJO_VOLUME", "CONFIRMING_FIJO"}
+
 
 def _is_actual_cancel(text: str) -> bool:
     if not _GLOBAL_CANCEL.search(text):
         return False
     if "cancelar" in text.lower() and _PAYMENT_WORDS.search(text):
+        return False
+    # Long messages (>150 chars) are unlikely to be a pure cancel intent —
+    # the keyword is likely embedded in a broader request
+    if len(text) > 150:
         return False
     return True
 
@@ -1590,14 +1623,60 @@ async def advance(conversation, session: dict, user_text: str,
     """
     state_name = session.get("state") or WELCOME
 
-    # ── Global cancel/escalate keywords (checked before confusion) ──
+    # ── Global menu-return, cancel, escalate keywords (before confusion) ──
+    if not button_id and len(user_text) <= 150 and \
+       _GLOBAL_MENU_RETURN.search(user_text) and not _is_actual_cancel(user_text):
+        session.clear()
+        return FlowResult(state=WELCOME, messages=[
+            _text_msg("De acuerdo, volvamos al men\u00fa principal."),
+        ], send_interactive=_welcome_interactive())
+
+    # ── FAQ request from fijo flow — user wants FAQ, not Domii Fijo info ──
+    if not button_id and state_name in _FIJO_STATES and \
+       re.search(r"preguntas?\s+(?:frecuentes?|generales)?", user_text, re.I):
+        session.clear()
+        return FlowResult(state=WELCOME, messages=[
+            _text_msg("De acuerdo, volvamos al men\u00fa principal."),
+        ], send_interactive=_welcome_interactive())
+
+    # ── Domii Fijo info-request — user is in fijo flow but asking for
+    #    FAQ, pricing, or clarifying they aren't a business ──
+    if not button_id and state_name in _FIJO_STATES and _DOMII_FIJO_INFO.search(user_text):
+        session.clear()
+        return FlowResult(state=WELCOME, messages=[
+            _text_msg(
+                "Entendido. Domii Fijo es nuestro servicio de domiciliario dedicado "
+                "por horas o d\u00edas.\n\n"
+                "\u2022 *\u00bfC\u00f3mo funciona?* Asignamos un mensajero exclusivo "
+                "para tu negocio durante el horario que elijas.\n"
+                "\u2022 *Precio:* Depende del volumen estimado y horario.\n"
+                "\u2022 *Pago:* Efectivo o Nequi (+$500).\n\n"
+                "Elige una opci\u00f3n del men\u00fa cuando quieras continuar."
+            ),
+        ], send_interactive=_welcome_interactive())
+
+    # ── Domii Fijo mention from a non-fijo flow — user wants to switch ──
+    if not button_id and state_name not in _FIJO_STATES and state_name != WELCOME and \
+       re.search(r"\bDomii\s+Fijo\b", user_text, re.I):
+        session.clear()
+        return FlowResult(state=WELCOME, messages=[
+            _text_msg(
+                "Entendido, hablemos de Domii Fijo.\n\n"
+                "\u2022 *\u00bfC\u00f3mo funciona?* Asignamos un mensajero exclusivo "
+                "para tu negocio durante el horario que elijas.\n"
+                "\u2022 *Precio:* Depende del volumen estimado y horario.\n"
+                "\u2022 *Pago:* Efectivo o Nequi (+$500).\n\n"
+                "Elige una opci\u00f3n del men\u00fa para continuar."
+            ),
+        ], send_interactive=_welcome_interactive())
+
     if not button_id and _is_actual_cancel(user_text):
         session.clear()
         return FlowResult(state=WELCOME, messages=[
             _text_msg("\u00a1Hasta luego! Cuando necesites algo, solo escr\u00edbeme."),
         ])
 
-    if not button_id and _GLOBAL_ESCALATE.search(user_text):
+    if not button_id and len(user_text) <= 150 and _GLOBAL_ESCALATE.search(user_text):
         session.clear()
         return FlowResult(
             escalate=True,
@@ -1663,7 +1742,7 @@ async def advance(conversation, session: dict, user_text: str,
     else:
         session["error_count"] = 0
 
-    result.state = session["state"]
+    result.state = session.get("state") or WELCOME
     return result
 
 
