@@ -96,10 +96,10 @@ def get_allowed_url_domains():
 
 def is_within_operating_hours() -> bool:
     """Check if current time (UTC-05) falls within BotSchedule."""
-    import pytz
+    from zoneinfo import ZoneInfo
     from api.models import BotSchedule
 
-    bogota = pytz.timezone('America/Bogota')
+    bogota = ZoneInfo('America/Bogota')
     now_bog = timezone.now().astimezone(bogota)
     today = now_bog.date()
     current_time = now_bog.time()
