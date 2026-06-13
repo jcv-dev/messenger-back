@@ -2100,3 +2100,193 @@ class BotDispatcherTests(SimpleTestCase):
         mock_filter.return_value.exists.return_value = False
         from api.bot.dispatcher import has_domii_tag
         self.assertFalse(has_domii_tag(1))
+
+
+# ── Bot Schedule API Tests ─────────────────────────────────────────────────
+
+class BotScheduleAPITests(APITestCase):
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser('admin', 'admin@test.com', 'pass')
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user('staff', 'staff@test.com', 'pass')
+        self.user_token = Token.objects.create(user=self.user)
+        from api.models import BotSchedule
+        self.schedule_model = BotSchedule
+
+    def _url(self, pk=None):
+        if pk:
+            return f'/api/bot-schedule/{pk}/'
+        return '/api/bot-schedule/'
+
+    def test_list_unauthenticated(self):
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, 401)
+
+    def test_list_authenticated(self):
+        self.schedule_model.objects.create(
+            day_of_week=0, open_time='08:00', close_time='20:00',
+        )
+        response = self.client.get(self._url(), HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        items = data if isinstance(data, list) else data.get('results', data)
+        self.assertGreaterEqual(len(items), 1)
+
+    def test_create_requires_admin(self):
+        response = self.client.post(
+            self._url(),
+            {'day_of_week': 0, 'open_time': '08:00', 'close_time': '20:00'},
+            HTTP_AUTHORIZATION=f'Token {self.user_token.key}',
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_create_as_admin(self):
+        response = self.client.post(
+            self._url(),
+            {'day_of_week': 1, 'open_time': '09:00', 'close_time': '18:00'},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertEqual(data['day_of_week'], 1)
+        self.assertEqual(data['open_time'], '09:00:00')
+        self.assertEqual(data['close_time'], '18:00:00')
+
+    def test_update_requires_admin(self):
+        entry = self.schedule_model.objects.create(
+            day_of_week=0, open_time='08:00', close_time='20:00',
+        )
+        response = self.client.patch(
+            self._url(entry.id),
+            {'close_time': '21:00'},
+            HTTP_AUTHORIZATION=f'Token {self.user_token.key}',
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_update_as_admin(self):
+        entry = self.schedule_model.objects.create(
+            day_of_week=0, open_time='08:00', close_time='20:00',
+        )
+        response = self.client.patch(
+            self._url(entry.id),
+            {'close_time': '21:00'},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['close_time'], '21:00:00')
+
+    def test_delete_requires_admin(self):
+        entry = self.schedule_model.objects.create(
+            day_of_week=0, open_time='08:00', close_time='20:00',
+        )
+        response = self.client.delete(
+            self._url(entry.id),
+            HTTP_AUTHORIZATION=f'Token {self.user_token.key}',
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_delete_as_admin(self):
+        entry = self.schedule_model.objects.create(
+            day_of_week=0, open_time='08:00', close_time='20:00',
+        )
+        response = self.client.delete(
+            self._url(entry.id),
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 204)
+
+    def test_create_date_override(self):
+        """Date override (date set, day_of_week null) succeeds."""
+        response = self.client.post(
+            self._url(),
+            {'date': '2026-12-25', 'open_time': '09:00', 'close_time': '14:00', 'label': 'Navidad'},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['date'], '2026-12-25')
+
+
+# ── Bot Config API Tests ───────────────────────────────────────────────────
+
+class BotConfigAPITests(APITestCase):
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser('admin', 'admin@test.com', 'pass')
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user('staff', 'staff@test.com', 'pass')
+        self.user_token = Token.objects.create(user=self.user)
+        from api.models import BotConfig
+        self.config_model = BotConfig
+
+    def _url(self, pk=None):
+        if pk:
+            return f'/api/bot-config/{pk}/'
+        return '/api/bot-config/'
+
+    def test_list_requires_auth(self):
+        response = self.client.get(self._url())
+        self.assertEqual(response.status_code, 401)
+
+    def test_list_as_admin(self):
+        self.config_model.objects.create(
+            key='test_key', value='test_value', description='A test config',
+        )
+        response = self.client.get(self._url(), HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        items = data if isinstance(data, list) else data.get('results', data)
+        keys = [c['key'] for c in items]
+        self.assertIn('test_key', keys)
+
+    def test_update_value_requires_admin(self):
+        cfg = self.config_model.objects.create(
+            key='test_key', value='old_value', description='Test',
+        )
+        response = self.client.patch(
+            f'/api/bot-config/{cfg.id}/update_value/',
+            {'value': 'new_value'},
+            HTTP_AUTHORIZATION=f'Token {self.user_token.key}',
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_update_value_success(self):
+        cfg = self.config_model.objects.create(
+            key='test_key', value='old_value', description='Test',
+        )
+        response = self.client.patch(
+            f'/api/bot-config/{cfg.id}/update_value/',
+            {'value': 'new_value'},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['value'], 'new_value')
+
+    def test_update_value_missing_value(self):
+        cfg = self.config_model.objects.create(
+            key='test_key', value='old_value', description='Test',
+        )
+        response = self.client.patch(
+            f'/api/bot-config/{cfg.id}/update_value/',
+            {},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_post_not_allowed(self):
+        response = self.client.post(
+            self._url(),
+            {'key': 'new_key', 'value': 'new_value'},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 405)
+
+    def test_delete_not_allowed(self):
+        cfg = self.config_model.objects.create(
+            key='test_key', value='value', description='Test',
+        )
+        response = self.client.delete(
+            self._url(cfg.id),
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 405)

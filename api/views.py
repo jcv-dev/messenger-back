@@ -24,12 +24,13 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
     ConversationNoteSerializer, ConversationTakeSerializer,
     CreateConversationTagSerializer, CreateConversationNoteSerializer,
+    BotScheduleSerializer, BotConfigSerializer,
     TakeConversationSerializer, InitiateConversationSerializer,
     UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
     media_signer, sign_media_url,
@@ -1079,6 +1080,36 @@ class StickerAssetViewSet(viewsets.ModelViewSet):
             except Exception:
                 pass
         instance.delete()
+
+
+class BotScheduleViewSet(viewsets.ModelViewSet):
+    """Manage bot operating hours. Admin-only for write operations."""
+    queryset = BotSchedule.objects.all()
+    serializer_class = BotScheduleSerializer
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsAdminUser()]
+        return [IsAuthenticated()]
+
+
+class BotConfigViewSet(viewsets.ReadOnlyModelViewSet):
+    """View bot configuration settings."""
+    queryset = BotConfig.objects.all()
+    serializer_class = BotConfigSerializer
+
+    def get_permissions(self):
+        return [IsAuthenticated(), IsAdminUser()]
+
+    @action(detail=True, methods=['patch'])
+    def update_value(self, request, pk=None):
+        config = self.get_object()
+        value = request.data.get('value')
+        if value is None:
+            return Response({'detail': 'value is required'}, status=status.HTTP_400_BAD_REQUEST)
+        config.value = value
+        config.save(update_fields=['value'])
+        return Response(BotConfigSerializer(config).data)
 
 
 # Webhook endpoint for WhatsApp (verification + incoming messages)

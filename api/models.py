@@ -293,3 +293,55 @@ class BotExemptContact(models.Model):
         ordering = ['-created_at']
         verbose_name = "Bot Exempt Contact"
         verbose_name_plural = "Bot Exempt Contacts"
+
+
+class BotSchedule(models.Model):
+    """Operating hours for the bot. Each row is either a recurring day-of-week
+    slot or a specific date override. Times are in UTC-05 (America/Bogota)."""
+    day_of_week = models.IntegerField(
+        null=True, blank=True,
+        choices=[
+            (0, 'Lunes'), (1, 'Martes'), (2, 'Miércoles'),
+            (3, 'Jueves'), (4, 'Viernes'), (5, 'Sábado'), (6, 'Domingo'),
+        ],
+    )
+    date = models.DateField(null=True, blank=True)
+    open_time = models.TimeField()
+    close_time = models.TimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    label = models.CharField(max_length=100, blank=True)
+
+    class Meta:
+        ordering = ['day_of_week', 'date']
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    Q(day_of_week__isnull=False, date__isnull=True) |
+                    Q(day_of_week__isnull=True, date__isnull=False)
+                ),
+                name='bot_schedule_exactly_one_of_day_or_date',
+            ),
+        ]
+
+    def __str__(self):
+        if self.day_of_week is not None:
+            days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+            day = days[self.day_of_week]
+            hours = f'{self.open_time.strftime("%H:%M")}–{self.close_time.strftime("%H:%M")}' if self.close_time else 'Cerrado'
+            return f'{day}: {hours}'
+        hours = f'{self.open_time.strftime("%H:%M")}–{self.close_time.strftime("%H:%M")}' if self.close_time else 'Cerrado'
+        return f'{self.date} ({self.label or "Excepción"}): {hours}'
+
+
+class BotConfig(models.Model):
+    """Key-value configuration store for bot settings. Managed via admin panel."""
+    key = models.CharField(max_length=100, unique=True)
+    value = models.JSONField()
+    description = models.TextField(blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['key']
+
+    def __str__(self):
+        return self.key

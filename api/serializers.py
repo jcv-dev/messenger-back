@@ -8,7 +8,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -387,3 +387,15 @@ class StickerAssetSerializer(serializers.ModelSerializer):
         if data.get('image'):
             data['image'] = sign_media_url(data['image'])
         return data
+
+
+class BotScheduleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotSchedule
+        fields = ['id', 'day_of_week', 'date', 'open_time', 'close_time', 'is_active', 'label']
+
+
+class BotConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BotConfig
+        fields = ['id', 'key', 'value', 'description', 'updated_at']

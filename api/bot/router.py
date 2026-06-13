@@ -8,15 +8,29 @@ avoiding an LLM call entirely.
 from __future__ import annotations
 
 import re
+from typing import Callable
 
-from django.conf import settings
 
-# ── FAQ responses ───────────────────────────────────────────────────────────
-
-HOURS_RESPONSE = (
-    f"Nuestro horario de atenci\u00f3n:\n"
-    f"- {settings.BOT_OPERATING_HOURS}"
-)
+def _build_hours_response() -> str:
+    """Build the hours FAQ response from BotSchedule."""
+    from api.models import BotSchedule
+    rows = BotSchedule.objects.filter(is_active=True).order_by('day_of_week')
+    if not rows.exists():
+        return "Nuestro horario de atención:\n- No configurado."
+    lines = ["Nuestro horario de atención:"]
+    days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+    for r in rows:
+        if r.day_of_week is not None:
+            if r.close_time:
+                lines.append(f"- {days[r.day_of_week]}: {r.open_time.strftime('%-I:%M %p')} a {r.close_time.strftime('%-I:%M %p')}")
+            else:
+                lines.append(f"- {days[r.day_of_week]}: Cerrado")
+        elif r.date:
+            if r.close_time:
+                lines.append(f"- {r.date.strftime('%-d/%-m/%Y')} ({r.label}): {r.open_time.strftime('%-I:%M %p')} a {r.close_time.strftime('%-I:%M %p')}")
+            else:
+                lines.append(f"- {r.date.strftime('%-d/%-m/%Y')} ({r.label}): Cerrado")
+    return "\n".join(lines)
 
 PAYMENT_RESPONSE = (
     "Aceptamos:\n"
@@ -49,14 +63,14 @@ DOMII_FIJO_RESPONSE = (
 # FAQ patterns — ordered list, first match wins.  Each pattern is narrow /
 # question-phrased to avoid false matches on flow messages like "nequi" or
 # "domicilios".
-FAQ_PATTERNS: list[tuple[re.Pattern, str]] = [
+FAQ_PATTERNS: list = [
     (
         re.compile(
             r"\b(horario|cual\s+es\s+(el\s+)?horario|a\s+que\s+hora\s+(abren|cierran|atienden)|"
             r"horas?\s+de\s+atenci[o\u00f3]n)\b",
             re.IGNORECASE,
         ),
-        HOURS_RESPONSE,
+        _build_hours_response,
     ),
     (
         re.compile(
@@ -146,6 +160,6 @@ def try_route_message(session: dict, text: str) -> str | None:
     if len(clean) <= 100:
         for pattern, response in FAQ_PATTERNS:
             if pattern.search(clean):
-                return response
+                return response() if callable(response) else response
 
     return None

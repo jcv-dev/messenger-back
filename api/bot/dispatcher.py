@@ -7,7 +7,7 @@ import os
 import re
 import signal
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from asgiref.sync import sync_to_async
 
@@ -30,6 +30,7 @@ from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session, extract_state_from_turn
 from .llm import handle_with_llm
 from .router import try_route_message
+from .config import is_within_operating_hours, get_outside_hours_reply, get_state_machine_enabled, get_max_user_message_length
 
 logger = logging.getLogger("api.bot")
 
@@ -43,9 +44,6 @@ _pending_tasks: set[asyncio.Task] = set()
 
 _ESCALATED_KEY = "bot:escalated:{conv_id}"
 _ESCALATED_TTL = 600  # 10 minutes
-
-# Feature flag — enable/disable state machine via env var
-_USE_STATE_MACHINE = os.environ.get("BOT_STATE_MACHINE", "") in ("1", "true", "yes")
 
 
 async def _handle_with_semaphore(event: dict):
@@ -282,6 +280,25 @@ async def handle_inbound(event: dict):
         except Exception:
             pass  # fails open — if Redis is down, don't block
 
+        # --- Operating hours gate ---
+        if not await sync_to_async(is_within_operating_hours)():
+            try:
+                import redis.asyncio as aioredis
+                r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
+                today = datetime.now().strftime('%Y%m%d')
+                replied_key = f"bot:outside_hours_replied:{conversation_id}:{today}"
+                already_replied = await r.get(replied_key)
+                if already_replied:
+                    await r.aclose()
+                    return
+                await r.setex(replied_key, 90000, "1")
+                await r.aclose()
+            except Exception:
+                pass
+            reply = await sync_to_async(get_outside_hours_reply)()
+            await sync_to_async(send_reply)(conversation, reply)
+            return
+
         await sync_to_async(_renew_bot_take)(conversation)
 
         # --- Sanitize input ---
@@ -312,7 +329,7 @@ async def handle_inbound(event: dict):
 
         session = await sync_to_async(get_session)(conversation_id)
 
-        if _USE_STATE_MACHINE:
+        if get_state_machine_enabled():
             await _handle_with_state_machine(session, conversation, conversation_id, user_text, button_id)
         else:
             await _handle_with_llm_legacy(session, conversation, conversation_id, user_text)

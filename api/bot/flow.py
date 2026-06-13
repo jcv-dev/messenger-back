@@ -28,6 +28,7 @@ from django.utils import timezone
 
 from . import calculator
 from .utils import get_bot_user_async
+from .router import _build_hours_response
 from api.models import Conversation, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
@@ -448,14 +449,15 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
             return FlowResult(escalate=True, escalate_reason="Cliente solicitó asesor desde el menú principal",
                               messages=[_text_msg("Un asesor te atenderá pronto.")])
         if button_id == "faq":
+            hours_text = _build_hours_response()
             return FlowResult(messages=[
                 _text_msg(
-                    "Preguntas frecuentes:\n\n"
-                    "• *Horario:* Lunes a sábado 8am-8pm, domingos 9am-6pm.\n"
-                    "• *Cobertura:* Tuluá urbano y veredas. Fuera (Cali, Buga) = tarifas fijas.\n"
-                    "• *Pago:* Efectivo (sin recargo) o Nequi (+$500).\n"
-                    "• *Servicios:* Domicilios, mensajería, compras, trámites, bancarios.\n\n"
-                    "¿Necesitas algo más? elige una opción del menú."
+                    f"Preguntas frecuentes:\n\n"
+                    f"{hours_text}\n"
+                    f"• *Cobertura:* Tuluá urbano y veredas. Fuera (Cali, Buga) = tarifas fijas.\n"
+                    f"• *Pago:* Efectivo (sin recargo) o Nequi (+$500).\n"
+                    f"• *Servicios:* Domicilios, mensajería, compras, trámites, bancarios.\n\n"
+                    f"¿Necesitas algo más? elige una opción del menú."
                 ),
             ], send_interactive=_welcome_interactive())
 

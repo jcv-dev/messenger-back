@@ -17,6 +17,10 @@ from .utils import get_bot_user_async
 from .guard import sanitize_llm_output
 from .metrics import incr as incr_metric
 from .session import build_state_summary
+from .config import (
+    get_faq_info_section, get_llm_temperature, get_llm_max_tokens,
+    get_llm_retry_count, get_tools_cache_ttl,
+)
 from api.models import Conversation, ConversationNote, ConversationTake, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
@@ -27,7 +31,6 @@ logger = logging.getLogger("api.bot.llm")
 #  Retry configuration
 # ---------------------------------------------------------------------------
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
-_MAX_RETRIES = getattr(settings, "BOT_LLM_RETRY_COUNT", 3)
 _BASE_DELAY = 1.0
 
 # ---------------------------------------------------------------------------
@@ -81,8 +84,9 @@ async def _build_system_prompt():
     global _tools_cache
     now = time.time()
 
+    cache_ttl = get_tools_cache_ttl()
     async with _tools_cache_lock:
-        if _tools_cache is None or (now - _tools_cache["fetched_at"]) > TOOLS_CACHE_TTL:
+        if _tools_cache is None or (now - _tools_cache["fetched_at"]) > cache_ttl:
             try:
                 raw_tools = await calculator.get_tools()
                 sanitized = [
@@ -120,10 +124,7 @@ FORMATO WHATSAPP:
 - USA send_interactive para: men\u00fa inicial, perfil, servicio, pago, confirmaciones s\u00ed/no, resultados de geocoding
 - USA TEXTO NORMAL para: explicaciones, resultados de precios, preguntas frecuentes, conversaci\u00f3n natural
 
-SERVICIOS: Domicilios, Mensajer\u00eda, Compras por encargo, Tr\u00e1mites, Bancarios, Domii Fijo (domiciliario dedicado por horas/d\u00edas).
-HORARIOS: {settings.BOT_OPERATING_HOURS}.
-COBERTURA: Tulu\u00e1 urbano y veredas. Fuera del \u00e1rea (Cali, Buga) = tarifas fijas.
-PAGO: Efectivo (sin recargo) o Nequi (+$500). Pago al recibir.
+{faq_section}
 
 HERRAMIENTAS:
 {tools_text}
@@ -399,27 +400,28 @@ def _validate_interactive_payload(itype: str, args: dict) -> str | None:
 
 async def _generate_with_retry(client, model, contents, config):
     last_error = None
-    for attempt in range(_MAX_RETRIES + 1):
+    max_retries = get_llm_retry_count()
+    for attempt in range(max_retries + 1):
         try:
             return await client.aio.models.generate_content(
                 model=model, contents=contents, config=config,
             )
         except genai_errors.APIError as e:
             status = getattr(e, "code", None) or getattr(e, "status_code", None)
-            if status in RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+            if status in RETRYABLE_STATUSES and attempt < max_retries:
                 delay = _BASE_DELAY * (2 ** attempt)
                 logger.warning("Gemini API %s, retry %d/%d in %.1fs",
-                               status, attempt + 1, _MAX_RETRIES, delay)
+                               status, attempt + 1, max_retries, delay)
                 incr_metric("llm.retries")
                 await asyncio.sleep(delay)
                 last_error = e
                 continue
             raise
         except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-            if attempt < _MAX_RETRIES:
+            if attempt < max_retries:
                 delay = _BASE_DELAY * (2 ** attempt)
                 logger.warning("Gemini connection error, retry %d/%d in %.1fs",
-                               attempt + 1, _MAX_RETRIES, delay)
+                               attempt + 1, max_retries, delay)
                 incr_metric("llm.retries")
                 await asyncio.sleep(delay)
                 last_error = e
@@ -687,8 +689,8 @@ async def handle_with_llm(session, conversation):
     if state_summary:
         system_prompt = state_summary + "\n\n" + system_prompt
 
-    temperature = getattr(settings, "BOT_LLM_TEMPERATURE", 0.25)
-    max_tokens = getattr(settings, "BOT_LLM_MAX_OUTPUT_TOKENS", 1024)
+    temperature = get_llm_temperature()
+    max_tokens = get_llm_max_tokens()
 
     config = genai_types.GenerateContentConfig(
         system_instruction=system_prompt,

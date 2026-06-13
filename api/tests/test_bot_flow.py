@@ -26,6 +26,7 @@ from api.bot.flow import (
     AWAITING_RECIPIENT_PHONE,
     ASK_BANCARIOS_ENTITY,
     ASK_BANCARIOS_REFERENCE,
+    ASK_KNOWS_RECIPIENT,
     advance,
     build_initial_session,
 )
@@ -147,16 +148,20 @@ class BotFlowTests(SimpleTestCase):
         self.assertIn("Total", r.messages[0]["content"])
         mock_calc_price.assert_called_once()
 
-        # 14. CONFIRMING_QUOTE -> confirm -> AWAITING_RECIPIENT_NAME
+        # 14. CONFIRMING_QUOTE -> confirm -> ASK_KNOWS_RECIPIENT
         r = await advance(conv, session, "Confirmar", button_id="confirm")
+        self.assertEqual(r.state, ASK_KNOWS_RECIPIENT)
+
+        # 15. ASK_KNOWS_RECIPIENT -> yes -> AWAITING_RECIPIENT_NAME
+        r = await advance(conv, session, "Sí", button_id="yes")
         self.assertEqual(r.state, AWAITING_RECIPIENT_NAME)
 
-        # 15. AWAITING_RECIPIENT_NAME -> type name -> AWAITING_RECIPIENT_PHONE
+        # 17. AWAITING_RECIPIENT_NAME -> type name -> AWAITING_RECIPIENT_PHONE
         r = await advance(conv, session, "Juan Pérez")
         self.assertEqual(r.state, AWAITING_RECIPIENT_PHONE)
         self.assertEqual(session["data"]["collected"]["recipient_name"], "Juan Pérez")
 
-        # 16. AWAITING_RECIPIENT_PHONE -> type phone -> WELCOME (order submitted)
+        # 18. AWAITING_RECIPIENT_PHONE -> type phone -> WELCOME (order submitted)
         r = await advance(conv, session, "3151234567")
         self.assertEqual(r.state, WELCOME)
         self.assertIn("enviado exitosamente", r.messages[0]["content"])
@@ -246,6 +251,10 @@ class BotFlowTests(SimpleTestCase):
 
         # CONFIRMING_QUOTE -> confirm
         r = await advance(conv, session, "Confirmar", button_id="confirm")
+        self.assertEqual(r.state, ASK_KNOWS_RECIPIENT)
+
+        # ASK_KNOWS_RECIPIENT -> yes -> AWAITING_RECIPIENT_NAME
+        r = await advance(conv, session, "Sí", button_id="yes")
         self.assertEqual(r.state, AWAITING_RECIPIENT_NAME)
 
         # AWAITING_RECIPIENT_NAME -> name
@@ -340,6 +349,9 @@ class BotFlowTests(SimpleTestCase):
         self.assertEqual(r.state, CONFIRMING_QUOTE)
 
         r = await advance(conv, session, "Confirmar", button_id="confirm")
+        self.assertEqual(r.state, ASK_KNOWS_RECIPIENT)
+
+        r = await advance(conv, session, "Sí", button_id="yes")
         self.assertEqual(r.state, AWAITING_RECIPIENT_NAME)
 
         r = await advance(conv, session, "Carlos López")

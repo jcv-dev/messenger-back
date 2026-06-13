@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 
-from django.conf import settings
+from .config import get_max_user_message_length, get_allowed_url_domains
 
 logger = logging.getLogger("api.bot.guard")
 
@@ -72,7 +72,7 @@ def sanitize_user_input(text: str | None) -> str | None:
     if not text or not text.strip():
         return None
 
-    max_len = getattr(settings, "BOT_MAX_USER_MESSAGE_LENGTH", 1000)
+    max_len = get_max_user_message_length()
     text = text[:max_len]
 
     # Strip control characters (keep \n \r \t)
@@ -142,7 +142,7 @@ _DEFAULT_ALLOWED_DOMAINS = frozenset({"wa.me", "facebook.com", "whatsapp.com"})
 
 
 def _get_allowed_domains() -> frozenset[str]:
-    custom = getattr(settings, "BOT_ALLOWED_OUTPUT_URL_DOMAINS", None)
+    custom = get_allowed_url_domains()
     if custom:
         return _DEFAULT_ALLOWED_DOMAINS | frozenset(
             d.lower().strip() for d in custom if d.strip()
