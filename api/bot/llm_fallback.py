@@ -185,3 +185,62 @@ async def classify_free_text(text: str, state: str,
     except Exception:
         logger.exception("Unexpected error in LLM fallback")
         return None
+
+
+async def generate_escalation_summary(
+    state: str,
+    profile: str | None = None,
+    service: str | None = None,
+    reason_type: str = "error",
+) -> str | None:
+    """Ask Gemini to write a one-line escalation summary.
+
+    Args:
+        state: The bot state where escalation happened.
+        profile: User profile (usuario_final / negocio) if known.
+        service: Service type label (Domicilios / Mensajería / etc) if known.
+        reason_type: Short description of why escalation triggered.
+
+    Returns:
+        A one-line summary, or ``None`` if the LLM call fails.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+
+    parts = [p for p in [profile, service] if p]
+    context = f" ({' · '.join(parts)})" if parts else ""
+
+    prompt = (
+        "Escribe UNA línea que resuma por qué se escala este chat a un asesor humano.\n"
+        f"Contexto: estado {state}{context}\n"
+        f"Motivo: {reason_type}\n\n"
+        "Ejemplo: 'El cliente estaba confundido al inicio de la conversación tras varios intentos.'\n"
+        "Responde solo la línea, sin saludos ni introducciones."
+    )
+
+    config = genai_types.GenerateContentConfig(
+        system_instruction=prompt,
+        temperature=0.0,
+        max_output_tokens=64,
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(text=prompt)],
+            )],
+            config=config,
+        )
+
+        if not response.candidates or not response.candidates[0].content.parts:
+            return None
+
+        raw = response.candidates[0].content.parts[0].text or ""
+        return raw.strip().strip("\"'").strip()[:200]
+
+    except Exception:
+        logger.warning("Gemini escalation summary failed for state=%s", state)
+        return None

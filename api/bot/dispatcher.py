@@ -362,15 +362,16 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
 
     # --- Fallback threshold: 2 failures → escalate ---
     if session.get("fallback_count", 0) >= 2:
-        logger.info("Escalating conv=%s after %d fallbacks (state machine)",
-                     conversation_id, session["fallback_count"])
+        state_name = session.get("state", "desconocido")
+        logger.info("Escalating conv=%s after %d fallbacks in state %s (state machine)",
+                     conversation_id, session["fallback_count"], state_name)
         await sync_to_async(delete_session)(conversation_id)
         await _release_bot_take(conversation, escalated=True)
         bot = await get_bot_user_async()
         if bot:
             await sync_to_async(ConversationNote.create_note)(
                 conversation=conversation,
-                content="[Bot] Escalado autom\u00e1ticamente \u2014 el bot no pudo procesar la solicitud tras varios intentos",
+                content=f"[Bot] Escalado autom\u00e1ticamente en estado {state_name} \u2014 no se pudo procesar la solicitud tras varios intentos",
                 expiry_type='custom',
                 custom_expiry_minutes=10,
                 created_by=bot,

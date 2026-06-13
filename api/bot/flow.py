@@ -73,8 +73,10 @@ SHOW_PRICE = "SHOW_PRICE"
 CONFIRMING_QUOTE = "CONFIRMING_QUOTE"
 
 # Recipient + submit
+ASK_KNOWS_RECIPIENT = "ASK_KNOWS_RECIPIENT"
 AWAITING_RECIPIENT_NAME = "AWAITING_RECIPIENT_NAME"
 AWAITING_RECIPIENT_PHONE = "AWAITING_RECIPIENT_PHONE"
+AWAITING_SENDER_NAME = "AWAITING_SENDER_NAME"
 SUBMIT_ORDER = "SUBMIT_ORDER"
 
 # Domii Fijo sub-flow
@@ -106,16 +108,17 @@ def _reset_geocode_fail(session: dict) -> None:
     _d(session)["geocode_fail_count"] = 0
 
 
-def _check_geocode_fail(session: dict) -> FlowResult | None:
+async def _check_geocode_fail(session: dict) -> FlowResult | None:
     """Auto-escalate if geocode failures exceed limit."""
     if _d(session).get("geocode_fail_count", 0) >= _GEOCODE_FAIL_LIMIT:
         _reset_geocode_fail(session)
+        reason = await _escalation_note(session, "El cliente no pudo indicar su direcci\u00f3n tras varios intentos")
         return FlowResult(
             escalate=True,
-            escalate_reason="No se pudo encontrar la dirección tras varios intentos",
+            escalate_reason=reason,
             messages=[_text_msg(
-                "He tenido dificultades para encontrar tu dirección. "
-                "Un asesor te atenderá pronto y completará el pedido contigo."
+                "He tenido dificultades para encontrar tu direcci\u00f3n. "
+                "Un asesor te atender\u00e1 pronto y completar\u00e1 el pedido contigo."
             )],
         )
     return None
@@ -284,7 +287,7 @@ async def _geocode_and_store(session: dict, conversation, text: str, field: str)
 
     if len(result) == 0:
         _inc_geocode_fail(session)
-        chk = _check_geocode_fail(session)
+        chk = await _check_geocode_fail(session)
         if chk:
             return chk
         return FlowResult(messages=[
@@ -361,7 +364,7 @@ async def _handle_geocode_select(session: dict, conversation, button_id: str, fi
     """Handle user selection from geocode results list."""
     if button_id == "none_match":
         _inc_geocode_fail(session)
-        chk = _check_geocode_fail(session)
+        chk = await _check_geocode_fail(session)
         if chk:
             return chk
         return_to = AWAITING_ORIGIN if field == "origin" else AWAITING_DESTINATION
@@ -523,6 +526,39 @@ _SERVICE_LABELS: dict[str, str] = {
 
 _ORDERED_SERVICES = ["domicilios", "mensajeria", "purchases", "tramites", "bancarios"]
 
+def _build_escalation_context(session: dict, reason: str) -> str:
+    """Build a contextual escalation reason from session data."""
+    data = _d(session)
+    parts = []
+    profile = data.get("profile")
+    if profile:
+        parts.append(profile)
+    service = data.get("service_type")
+    if service:
+        label = _SERVICE_LABELS.get(service, service)
+        parts.append(label)
+    ctx = " · ".join(parts) if parts else "sin datos"
+    state = session.get("state", "?")
+    return f"{reason} — {ctx} (estado {state})"
+
+
+async def _escalation_note(session: dict, reason_type: str) -> str:
+    """LLM-generated escalation note, falling back to context."""
+    data = _d(session)
+    profile = data.get("profile")
+    service = data.get("service_type")
+    if service:
+        service = _SERVICE_LABELS.get(service, service)
+    note = await _llm_fallback.generate_escalation_summary(
+        state=session.get("state", "?"),
+        profile=profile,
+        service=service,
+        reason_type=reason_type,
+    )
+    if note:
+        return note
+    return _build_escalation_context(session, reason_type)
+
 
 def _service_type_list() -> dict:
     return _interactive("list",
@@ -652,7 +688,7 @@ async def handle_confirm_origin(session: dict, text: str, button_id: str | None,
         ])
     if value == "no":
         _inc_geocode_fail(session)
-        chk = _check_geocode_fail(session)
+        chk = await _check_geocode_fail(session)
         if chk:
             return chk
         _cur_seg(session)["origin"] = {"address": None, "lat": None, "lng": None, "confirmed": False}
@@ -724,7 +760,7 @@ async def handle_confirm_dest(session: dict, text: str, button_id: str | None,
         ])
     if value == "no":
         _inc_geocode_fail(session)
-        chk = _check_geocode_fail(session)
+        chk = await _check_geocode_fail(session)
         if chk:
             return chk
         _cur_seg(session)["destination"] = {"address": None, "lat": None, "lng": None, "confirmed": False}
@@ -1083,9 +1119,9 @@ async def handle_confirm_quote(session: dict, text: str, button_id: str | None,
                                conversation) -> FlowResult:
     value = button_id if button_id else await _llm_classify_intent(text, CONFIRMING_QUOTE)
     if value == "confirm":
-        return FlowResult(state=AWAITING_RECIPIENT_NAME, messages=[
-            _text_msg("¿Nombre de la persona que recibe?"),
-        ])
+        return FlowResult(state=ASK_KNOWS_RECIPIENT, messages=[
+            _text_msg("¿Sabes quién recibe el pedido?"),
+        ], send_interactive=_interactive("button", "¿Sabes quién recibe?", buttons=_yes_no_buttons()))
     if value == "change":
         # Back to service type, but keep collected data
         return FlowResult(state=AWAITING_SERVICE_TYPE, messages=[
@@ -1104,13 +1140,36 @@ async def handle_confirm_quote(session: dict, text: str, button_id: str | None,
     ]))
 
 
+# ── ASK_KNOWS_RECIPIENT ────────────────────────────────────────────────────
+
+@_handler(ASK_KNOWS_RECIPIENT)
+async def handle_knows_recipient(session: dict, text: str, button_id: str | None,
+                                 conversation) -> FlowResult:
+    if len(_d(session).get("segments", [])) > 1:
+        return FlowResult(state=AWAITING_SENDER_NAME, messages=[
+            _text_msg("¿Cuál es tu nombre?"),
+        ])
+    value = button_id if button_id else await _llm_classify_intent(text, ASK_KNOWS_RECIPIENT)
+    if value == "yes":
+        return FlowResult(state=AWAITING_RECIPIENT_NAME, messages=[
+            _text_msg("¿Nombre de la persona que recibe?"),
+        ])
+    if value == "no":
+        return FlowResult(state=AWAITING_SENDER_NAME, messages=[
+            _text_msg("¿Cuál es tu nombre?"),
+        ])
+    return FlowResult(fallback=True, messages=[
+        _text_msg("Responde si sabes o no quién recibe el pedido."),
+    ], send_interactive=_interactive("button", "¿Sabes quién recibe?", buttons=_yes_no_buttons()))
+
+
 # ── AWAITING_RECIPIENT_NAME ───────────────────────────────────────────────
 
 @_handler(AWAITING_RECIPIENT_NAME)
 async def handle_recipient_name(session: dict, text: str, button_id: str | None,
                                 conversation) -> FlowResult:
     if not text.strip():
-        return FlowResult(messages=[_text_msg("Escribe el nombre del receptor.")])
+        return FlowResult(fallback=True, messages=[_text_msg("Escribe el nombre del receptor.")])
     _d(session)["recipient_name"] = text.strip()[:100]
     return FlowResult(state=AWAITING_RECIPIENT_PHONE, messages=[
         _text_msg("¿Teléfono del receptor?"),
@@ -1124,7 +1183,7 @@ async def handle_recipient_phone(session: dict, text: str, button_id: str | None
                                  conversation) -> FlowResult:
     phone = re.sub(r"\D", "", text.strip()) if text else ""
     if len(phone) < 10:
-        return FlowResult(messages=[_text_msg("Ingresa un número válido (ej: 3151234567).")])
+        return FlowResult(fallback=True, messages=[_text_msg("Ingresa un número válido (ej: 3151234567).")])
     _d(session)["recipient_phone"] = phone
     return await _submit_order(conversation, session)
 
@@ -1138,11 +1197,14 @@ async def _submit_order(conversation, session: dict) -> FlowResult:
     profile = data.get("profile", "usuario_final")
     payment_method = data.get("payment_method", "efectivo")
     total = data.get("last_price_result", {}).get("breakdown", {}).get("total", 0)
-    contact_name = data.get("recipient_name", "")
+    contact_name = data.get("recipient_name") or data.get("sender_name", "")
     contact_phone = data.get("recipient_phone", "")
 
     lines = ["*Domii Tuluá - Nuevo Pedido*\n"]
-    lines.append(f"*Contacto:* {contact_name} ({contact_phone})\n")
+    if contact_name and contact_phone:
+        lines.append(f"*Contacto:* {contact_name} ({contact_phone})\n")
+    elif contact_name:
+        lines.append(f"*Contacto:* {contact_name}\n")
     for i, seg in enumerate(segments):
         svc = seg.get("service_type", service_type)
         label = _SERVICE_LABELS.get(svc, svc)
@@ -1176,6 +1238,17 @@ async def _submit_order(conversation, session: dict) -> FlowResult:
             _text_msg("✅ *Pedido enviado exitosamente!*\n\nUn domiciliario será asignado pronto.\n\n¿Necesitas algo más?"),
         ],
     )
+
+
+# ── AWAITING_SENDER_NAME ──────────────────────────────────────────────────
+
+@_handler(AWAITING_SENDER_NAME)
+async def handle_sender_name(session: dict, text: str, button_id: str | None,
+                             conversation) -> FlowResult:
+    if not text.strip():
+        return FlowResult(fallback=True, messages=[_text_msg("Escribe tu nombre.")])
+    _d(session)["sender_name"] = text.strip()[:100]
+    return await _submit_order(conversation, session)
 
 
 # ── DOMII FIJO states ─────────────────────────────────────────────────────
@@ -1470,11 +1543,17 @@ _STATE_EXPLANATIONS: dict[str, str] = {
     CONFIRMING_QUOTE: (
         "Confirma tu pedido:\n- *Confirmar* para enviar\n- *Cambiar* para modificar datos\n- *Cancelar* para descartar"
     ),
+    ASK_KNOWS_RECIPIENT: (
+        "Responde si sabes o no quién recibirá el pedido."
+    ),
     AWAITING_RECIPIENT_NAME: (
         "Escribe el nombre completo de la persona que recibe el pedido."
     ),
     AWAITING_RECIPIENT_PHONE: (
         "Escribe el número de teléfono de la persona que recibe.\nEjemplo: 3151234567."
+    ),
+    AWAITING_SENDER_NAME: (
+        "Escribe tu nombre para que el domiciliario sepa a quién contactar."
     ),
     AWAITING_FIJO_NAME: "Escribe el nombre de tu negocio.",
     AWAITING_FIJO_ADDR: "Escribe la dirección del negocio donde se prestará el servicio.",
@@ -1528,25 +1607,19 @@ async def advance(conversation, session: dict, user_text: str,
 
     # ── Confusion detection (only for free text, not button taps) ──
     if not button_id and _CONFUSION_PATTERNS.search(user_text):
-        count = session.get("confusion_count", 0) + 1
-        session["confusion_count"] = count
-        logger.info("Confusion detected in state=%s count=%d", state_name, count)
+        session["error_count"] = session.get("error_count", 0) + 1
+        logger.info("Confusion detected in state=%s error_count=%d", state_name, session["error_count"])
 
-        explanation = _get_state_explanation(state_name)
-
-        if count >= 2:
+        if session["error_count"] >= 2:
             return FlowResult(
-                state=state_name,
+                escalate=True,
+                escalate_reason=await _escalation_note(session, "Cliente confundido tras varios intentos"),
                 messages=[
-                    _text_msg("Veo que tienes dificultades. ¿Prefieres que un asesor te ayude?"),
-                    _text_msg(f"{explanation}\n\nO escribe *asesor* para hablar con una persona."),
+                    _text_msg("Veo que tienes dificultades. Un asesor te atender\u00e1 pronto."),
                 ],
-                send_interactive=_interactive("button",
-                    "¿Hablar con un asesor?",
-                    buttons=[{"id": "escalate", "title": "✅ Sí, por favor"}],
-                ),
             )
 
+        explanation = _get_state_explanation(state_name)
         return FlowResult(
             state=state_name,
             messages=[_text_msg(
@@ -1571,9 +1644,24 @@ async def advance(conversation, session: dict, user_text: str,
 
     if result.state is not None:
         session["state"] = result.state
-    elif not result.escalate:
-        # Terminal state with no next state — keep WELCOME
-        session["state"] = WELCOME
+
+    if result.escalate:
+        pass
+    elif result.fallback:
+        session["error_count"] = session.get("error_count", 0) + 1
+        if session.get("error_count", 0) >= 2:
+            return FlowResult(
+                escalate=True,
+                escalate_reason=await _escalation_note(
+                    session, "Cliente no pudo completar el paso"
+                ),
+                messages=[_text_msg(
+                    "He tenido dificultades para procesar tu solicitud. "
+                    "Un asesor te atender\u00e1 pronto."
+                )],
+            )
+    else:
+        session["error_count"] = 0
 
     result.state = session["state"]
     return result
@@ -1589,6 +1677,7 @@ def build_initial_session() -> dict:
     return {
         "state": WELCOME,
         "fallback_count": 0,
+        "error_count": 0,
         "history": [],
         "data": {
             "collected": {
