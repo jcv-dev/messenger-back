@@ -67,6 +67,12 @@ def get_state_machine_enabled():
     return bool(get_config('state_machine_enabled', False))
 
 
+def get_testing_warning_enabled():
+    if getattr(settings, 'BOT_TESTING_WARNING', False):
+        return True
+    return bool(get_config('testing_warning_enabled', False))
+
+
 def get_llm_temperature():
     return float(get_config('llm_temperature', settings.BOT_LLM_TEMPERATURE))
 

@@ -30,7 +30,7 @@ from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session, extract_state_from_turn
 from .llm import handle_with_llm
 from .router import try_route_message
-from .config import is_within_operating_hours, get_outside_hours_reply, get_state_machine_enabled, get_max_user_message_length, get_grouped_hours_text
+from .config import is_within_operating_hours, get_outside_hours_reply, get_state_machine_enabled, get_max_user_message_length, get_grouped_hours_text, get_testing_warning_enabled
 
 logger = logging.getLogger("api.bot")
 
@@ -390,6 +390,11 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
 
     # --- Load or create session ---
     if session is None:
+        if get_testing_warning_enabled():
+            await sync_to_async(send_reply)(
+                conversation,
+                "🤖 *Aviso:* Estamos probando una nueva tecnología (bot automático). Si en cualquier momento necesitas ayuda, solo escribe la palabra *asesor* para comunicarte con un humano."
+            )
         session = state_flow.build_initial_session()
 
     # --- Fallback threshold: 2 failures → escalate ---
@@ -567,6 +572,11 @@ def _send_interactive_payload(conversation, interactive_payload: dict):
 async def _handle_with_llm_legacy(session, conversation, conversation_id, user_text):
     """Original LLM-driven handler — preserved for backward compat."""
     if session is None:
+        if get_testing_warning_enabled():
+            await sync_to_async(send_reply)(
+                conversation,
+                "🤖 *Aviso:* Estamos probando una nueva tecnología (bot automático). Si en cualquier momento necesitas ayuda, solo escribe la palabra *asesor* para comunicarte con un humano."
+            )
         session = {
             "history": [],
             "fallback_count": 0,
