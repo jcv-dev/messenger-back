@@ -306,8 +306,8 @@ async def handle_inbound(event: dict):
 
         # --- Sanitize input ---
         user_text = msg_data.get("content", "").strip()
-        user_text = sanitize_user_input(user_text)
-        if not user_text:
+        user_text = await sync_to_async(sanitize_user_input)(user_text)
+        if user_text is None:
             logger.debug("Skipping empty/filtered message for conv=%s", conversation_id)
             return
 

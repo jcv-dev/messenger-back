@@ -4,6 +4,7 @@ import datetime
 import logging
 import os
 import time
+from asgiref.sync import sync_to_async
 
 from django.conf import settings
 from django.utils import timezone
@@ -34,7 +35,7 @@ def _get_config():
 
 def get_config(key, default=None):
     """Read a config value, falling back to provided default."""
-    cfg = _get_config()
+    cfg = sync_to_async(_get_config())
     return cfg.get(key, default)
 
 
