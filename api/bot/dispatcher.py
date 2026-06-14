@@ -332,7 +332,7 @@ async def handle_inbound(event: dict):
 
         session = await sync_to_async(get_session)(conversation_id)
 
-        if get_state_machine_enabled():
+        if await sync_to_async(get_state_machine_enabled)():
             await _handle_with_state_machine(session, conversation, conversation_id, user_text, button_id)
         else:
             await _handle_with_llm_legacy(session, conversation, conversation_id, user_text)
@@ -390,7 +390,7 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
 
     # --- Load or create session ---
     if session is None:
-        if get_testing_warning_enabled():
+        if await sync_to_async(get_testing_warning_enabled)():
             await sync_to_async(send_reply)(
                 conversation,
                 "🤖 *Aviso:* Estamos probando una nueva tecnología (bot automático). Si en cualquier momento necesitas ayuda, solo escribe la palabra *asesor* para comunicarte con un humano."
@@ -572,7 +572,7 @@ def _send_interactive_payload(conversation, interactive_payload: dict):
 async def _handle_with_llm_legacy(session, conversation, conversation_id, user_text):
     """Original LLM-driven handler — preserved for backward compat."""
     if session is None:
-        if get_testing_warning_enabled():
+        if await sync_to_async(get_testing_warning_enabled)():
             await sync_to_async(send_reply)(
                 conversation,
                 "🤖 *Aviso:* Estamos probando una nueva tecnología (bot automático). Si en cualquier momento necesitas ayuda, solo escribe la palabra *asesor* para comunicarte con un humano."

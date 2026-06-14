@@ -450,7 +450,7 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
             return FlowResult(escalate=True, escalate_reason="Cliente solicitó asesor desde el menú principal",
                               messages=[_text_msg("Un asesor te atenderá pronto.")])
         if button_id == "faq":
-            hours_text = _build_hours_response()
+            hours_text = await sync_to_async(_build_hours_response)()
             return FlowResult(messages=[
                 _text_msg(
                     f"Preguntas frecuentes:\n\n"
@@ -1254,7 +1254,7 @@ async def _submit_order(conversation, session: dict) -> FlowResult:
     # TODO: send to operations WhatsApp group
     logger.info("ORDER SUBMITTED for conv=%s\n%s", conversation.id, "\n".join(lines))
 
-    if get_escalate_orders_enabled():
+    if await sync_to_async(get_escalate_orders_enabled)():
         return FlowResult(
             state=WELCOME,
             escalate=True,
@@ -1405,7 +1405,7 @@ async def handle_fijo_confirm(session: dict, text: str, button_id: str | None,
         ]
         logger.info("DOMII FIJO REQUEST conv=%s\n%s", conversation.id, "\n".join(lines))
 
-        if get_escalate_orders_enabled():
+        if await sync_to_async(get_escalate_orders_enabled)():
             return FlowResult(
                 state=WELCOME,
                 escalate=True,
