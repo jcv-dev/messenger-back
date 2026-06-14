@@ -73,6 +73,12 @@ def get_testing_warning_enabled():
     return bool(get_config('testing_warning_enabled', False))
 
 
+def get_escalate_orders_enabled():
+    if getattr(settings, 'BOT_ESCALATE_ORDERS', False):
+        return True
+    return bool(get_config('escalate_orders_enabled', False))
+
+
 def get_llm_temperature():
     return float(get_config('llm_temperature', settings.BOT_LLM_TEMPERATURE))
 

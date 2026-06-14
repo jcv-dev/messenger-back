@@ -69,6 +69,7 @@ _STATE_OPTIONS: dict[str, list[dict]] = {
     ],
     "AWAITING_TOOLS": [
         {"id": "none", "label": "Ninguna / no / sin herramientas / nada / no necesito / no gracias / sin nada"},
+        {"id": "done", "label": "Listo / continuar / ya terminé / eso es todo / seguir / finalizar / listo con herramientas / continuar con el pedido"},
         # Dynamic tool IDs are added per-call
     ],
     "AWAITING_PAYMENT": [

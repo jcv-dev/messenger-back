@@ -219,6 +219,7 @@ BOT_INBOUND_RATE_LIMIT = config('BOT_INBOUND_RATE_LIMIT', default=10, cast=int)
 _raw_url_domains = config('BOT_ALLOWED_OUTPUT_URL_DOMAINS', default='')
 BOT_ALLOWED_OUTPUT_URL_DOMAINS = [h.strip() for h in _raw_url_domains.split(',') if h.strip()]
 BOT_TESTING_WARNING = config('BOT_TESTING_WARNING', default=False, cast=bool)
+BOT_ESCALATE_ORDERS = config('BOT_ESCALATE_ORDERS', default=False, cast=bool)
 
 LOGGING = {
     'version': 1,

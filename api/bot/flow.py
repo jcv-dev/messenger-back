@@ -29,6 +29,7 @@ from django.utils import timezone
 from . import calculator
 from .utils import get_bot_user_async
 from .router import _build_hours_response
+from .config import get_escalate_orders_enabled
 from api.models import Conversation, Message
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
@@ -919,16 +920,24 @@ _TOOLS_CACHE: list[dict] = []
 
 async def _build_tools_interactive(session: dict) -> dict:
     global _TOOLS_CACHE
-    rows = [{"id": "none", "title": "Ninguna", "description": "Sin herramientas adicionales"}]
+    tool_keys = _d(session).get("tool_keys", [])
+    
+    rows = []
+    if tool_keys:
+        rows.append({"id": "done", "title": "✅ Listo / Continuar", "description": "Continuar con el pedido"})
+    else:
+        rows.append({"id": "none", "title": "Ninguna", "description": "Sin herramientas adicionales"})
+        
     try:
         _TOOLS_CACHE = await calculator.get_tools()
         for t in _TOOLS_CACHE:
             if isinstance(t, dict) and "key" in t:
-                rows.append({
-                    "id": t["key"],
-                    "title": (t.get("label") or t["key"])[:24],
-                    "description": (t.get("description") or "")[:72],
-                })
+                if t["key"] not in tool_keys:
+                    rows.append({
+                        "id": t["key"],
+                        "title": (t.get("label") or t["key"])[:24],
+                        "description": (t.get("description") or "")[:72],
+                    })
     except Exception:
         pass  # empty tools list if API fails
     return _interactive("list",
@@ -943,24 +952,34 @@ async def handle_tools(session: dict, text: str, button_id: str | None,
                        conversation) -> FlowResult:
     data = _d(session)
     if button_id:
+        if button_id == "done":
+            return await _advance_to_payment(session)
         if button_id == "none":
             data["tool_keys"] = []
             return await _advance_to_payment(session)
-        data.setdefault("tool_keys", []).append(button_id)
+            
+        data.setdefault("tool_keys", [])
+        if button_id not in data["tool_keys"]:
+            data["tool_keys"].append(button_id)
         return FlowResult(messages=[_text_msg(f"✅ Herramienta agregada. ¿Alguna más?")],
                           send_interactive=await _build_tools_interactive(session))
 
     # Free text — LLM extracts tools, or "ninguna"
     intent = await _llm_classify_intent(text, AWAITING_TOOLS)
+    if intent == "done":
+        return await _advance_to_payment(session)
     if intent == "none" or intent == "ninguna":
-        data["tool_keys"] = []
+        if not data.get("tool_keys"):
+            data["tool_keys"] = []
         return await _advance_to_payment(session)
     if intent and intent in _TOOL_KEYS_CACHED():
-        data.setdefault("tool_keys", []).append(intent)
+        data.setdefault("tool_keys", [])
+        if intent not in data["tool_keys"]:
+            data["tool_keys"].append(intent)
         return FlowResult(messages=[_text_msg(f"✅ Agregada. ¿Alguna herramienta más?")],
                           send_interactive=await _build_tools_interactive(session))
     return FlowResult(fallback=True, messages=[
-        _text_msg("Elige herramientas de la lista o 'Ninguna'."),
+        _text_msg("Elige herramientas de la lista o presiona 'Listo' si ya terminaste."),
     ], send_interactive=await _build_tools_interactive(session))
 
 
@@ -1235,6 +1254,16 @@ async def _submit_order(conversation, session: dict) -> FlowResult:
     # TODO: send to operations WhatsApp group
     logger.info("ORDER SUBMITTED for conv=%s\n%s", conversation.id, "\n".join(lines))
 
+    if get_escalate_orders_enabled():
+        return FlowResult(
+            state=WELCOME,
+            escalate=True,
+            escalate_reason="\n".join(lines),
+            messages=[
+                _text_msg("✅ *Pedido enviado exitosamente!*\n\nUn domiciliario será asignado pronto.\n\n¿Necesitas algo más?"),
+            ],
+        )
+
     return FlowResult(
         state=WELCOME,
         messages=[
@@ -1375,6 +1404,17 @@ async def handle_fijo_confirm(session: dict, text: str, button_id: str | None,
             "*Nota:* Sujeto a disponibilidad de flota.",
         ]
         logger.info("DOMII FIJO REQUEST conv=%s\n%s", conversation.id, "\n".join(lines))
+
+        if get_escalate_orders_enabled():
+            return FlowResult(
+                state=WELCOME,
+                escalate=True,
+                escalate_reason="\n".join(lines),
+                messages=[
+                    _text_msg("✅ *Solicitud enviada!* Un asesor confirmará la disponibilidad.\n\n¿Necesitas algo más?"),
+                ],
+            )
+
         return FlowResult(state=WELCOME, messages=[
             _text_msg("✅ *Solicitud enviada!* Un asesor confirmará la disponibilidad.\n\n¿Necesitas algo más?"),
         ])
@@ -1402,7 +1442,11 @@ async def _llm_classify_intent(text: str, state_name: str) -> str | None:
     if not text.strip():
         return None
     try:
-        return await _llm_fallback.classify_free_text(text, state_name)
+        dynamic_options = None
+        if state_name == AWAITING_TOOLS:
+            dynamic_options = [{"id": t["key"], "label": t.get("label", t["key"])} for t in _TOOLS_CACHE if isinstance(t, dict)]
+            
+        return await _llm_fallback.classify_free_text(text, state_name, dynamic_options=dynamic_options)
     except Exception:
         logger.exception("LLM fallback failed")
         return None
