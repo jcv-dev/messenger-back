@@ -1295,6 +1295,36 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                 pass
         return Response({'synced': len(remote), 'updated': updated})
 
+    @action(detail=False, methods=['post'], parser_classes=[FormParser, MultiPartParser])
+    def upload_media(self, request):
+        """Upload an image to Meta for use as a template header."""
+        uploaded_file = request.FILES.get('file')
+        if not uploaded_file:
+            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        import os, tempfile
+        ext = os.path.splitext(uploaded_file.name)[1] or '.png'
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            for chunk in uploaded_file.chunks():
+                tmp.write(chunk)
+            tmp_path = tmp.name
+
+        phone_number_id = getattr(settings, 'WHATSAPP_PHONE_NUMBER_ID', None) or settings.WHATSAPP_PHONE_NUMBER
+        token = settings.WHATSAPP_API_TOKEN
+
+        try:
+            media_id = upload_media_to_whatsapp(tmp_path, phone_number_id, token)
+            if media_id:
+                return Response({'media_id': media_id, 'handle': media_id})
+            return Response({'error': 'Media upload failed'}, status=500)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
     @action(detail=False, methods=['post'])
     def bulk_send(self, request):
         """Send a template to the last N conversations (admin only)."""
