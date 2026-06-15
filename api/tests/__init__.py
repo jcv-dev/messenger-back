@@ -14,12 +14,13 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact
+from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate
 from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
+    WhatsAppTemplateSerializer, SendTemplateSerializer, BulkSendTemplateSerializer,
 )
-from api.views import ConversationViewSet, MessageViewSet
+from api.views import ConversationViewSet, MessageViewSet, WhatsAppTemplateViewSet
 
 # Load bot package so @patch('api.bot.dispatcher.xxx') resolves
 from api import bot as _  # noqa
@@ -2290,3 +2291,316 @@ class BotConfigAPITests(APITestCase):
             HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
         )
         self.assertEqual(response.status_code, 405)
+
+
+# ── WhatsApp Template Tests ─────────────────────────────────────────────
+
+
+class WhatsAppTemplateModelTests(APITestCase):
+    """Test the WhatsAppTemplate model."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='admin', password='pass', is_staff=True)
+        self.token = Token.objects.create(user=self.user)
+        self.template = WhatsAppTemplate.objects.create(
+            name='test_template',
+            language='es',
+            category='MARKETING',
+            components=[{'type': 'body', 'text': 'Hola {{nombre}}'}],
+        )
+
+    def test_create_template(self):
+        self.assertEqual(self.template.name, 'test_template')
+        self.assertEqual(self.template.status, 'PENDING')
+        self.assertEqual(str(self.template), 'test_template (es) — PENDING')
+
+    def test_unique_together(self):
+        with self.assertRaises(Exception):
+            WhatsAppTemplate.objects.create(
+                name='test_template',
+                language='es',
+                category='MARKETING',
+            )
+
+
+class WhatsAppTemplateViewSetTests(APITestCase):
+    """Test API endpoints for template management."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username='admin', password='pass', is_staff=True)
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user(username='user', password='pass', is_staff=False)
+        self.user_token = Token.objects.create(user=self.user)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.admin, self.group)
+
+        self.template = WhatsAppTemplate.objects.create(
+            name='test_template',
+            language='es',
+            category='MARKETING',
+            status='APPROVED',
+            template_id='12345',
+            components=[{'type': 'body', 'text': 'Hola {{nombre}}'}],
+        )
+
+    def test_list_requires_auth(self):
+        self.client.credentials()
+        response = self.client.get('/api/templates/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_list_non_staff_forbidden(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.get('/api/templates/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_list_staff_allowed(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/templates/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+
+    def test_create_template(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        data = {
+            'name': 'new_template',
+            'language': 'es',
+            'category': 'MARKETING',
+            'components': [{'type': 'body', 'text': 'Bienvenido'}],
+        }
+        response = self.client.post('/api/templates/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['name'], 'new_template')
+        self.assertEqual(response.data['status'], 'PENDING')
+
+    def test_create_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        data = {
+            'name': 'new_template',
+            'language': 'es',
+            'category': 'MARKETING',
+            'components': [{'type': 'body', 'text': 'Bienvenido'}],
+        }
+        response = self.client.post('/api/templates/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_approved_endpoint(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/templates/approved/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['name'], 'test_template')
+
+    def test_approved_filters(self):
+        WhatsAppTemplate.objects.create(
+            name='pending_template',
+            language='es',
+            category='MARKETING',
+            status='PENDING',
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/templates/approved/')
+        self.assertEqual(len(response.data), 1)
+
+    def test_destroy_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.delete(f'/api/templates/{self.template.id}/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_destroy_staff(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.delete(f'/api/templates/{self.template.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_bulk_send_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {'template_id': self.template.id, 'count': 5}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class SendTemplateActionTests(APITestCase):
+    """Test the send_template action on ConversationViewSet."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username='admin', password='pass', is_staff=True)
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user(username='user', password='pass', is_staff=False)
+        self.user_token = Token.objects.create(user=self.user)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.admin, self.group)
+
+        self.conversation = Conversation.objects.create(
+            whatsapp_id='573001234567',
+            contact_name='Test',
+            contact_phone='573001234567',
+            group=self.group,
+        )
+
+        self.template = WhatsAppTemplate.objects.create(
+            name='test_template',
+            language='es',
+            category='MARKETING',
+            status='APPROVED',
+            template_id='12345',
+            components=[{'type': 'body', 'text': 'Hola {{nombre}}'}],
+        )
+
+    def test_send_template_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/send_template/',
+            {'template_id': self.template.id},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_send_template_success(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/send_template/',
+            {'template_id': self.template.id, 'parameters': {'nombre': 'Juan'}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['message_type'], 'template')
+
+    def test_send_template_not_approved(self):
+        pending = WhatsAppTemplate.objects.create(
+            name='pending_t',
+            language='es',
+            category='MARKETING',
+            status='PENDING',
+            components=[{'type': 'body', 'text': 'test'}],
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/send_template/',
+            {'template_id': pending.id},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_send_template_invalid_id(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/send_template/',
+            {'template_id': 999},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class TemplateWebhookHandlerTests(APITestCase):
+    """Test webhook handler functions for template events."""
+
+    def setUp(self):
+        self.template = WhatsAppTemplate.objects.create(
+            name='test_template',
+            language='es',
+            category='MARKETING',
+            status='PENDING',
+            template_id='12345',
+            components=[{'type': 'body', 'text': 'Hola'}],
+        )
+
+    def test_status_approved_webhook(self):
+        from api.views import _handle_template_status_webhook
+        _handle_template_status_webhook({
+            'event': 'APPROVED',
+            'message_template_id': '12345',
+            'message_template_name': 'test_template',
+            'message_template_language': 'es',
+            'message_template_category': 'MARKETING',
+            'reason': 'NONE',
+        })
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.status, 'APPROVED')
+
+    def test_status_rejected_webhook(self):
+        from api.views import _handle_template_status_webhook
+        _handle_template_status_webhook({
+            'event': 'REJECTED',
+            'message_template_id': '12345',
+            'message_template_name': 'test_template',
+            'message_template_language': 'es',
+            'reason': 'INVALID_FORMAT',
+            'rejection_info': {
+                'reason': 'Parameters next to each other',
+                'recommendation': 'Separate with text',
+            },
+        })
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.status, 'REJECTED')
+        self.assertIn('Parameters next to each other', self.template.rejection_reason)
+
+    def test_quality_webhook(self):
+        from api.views import _handle_template_quality_webhook
+        _handle_template_quality_webhook({
+            'new_quality_score': 'GREEN',
+            'message_template_name': 'test_template',
+            'message_template_language': 'es',
+        })
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.quality_score, 'GREEN')
+
+    def test_category_webhook(self):
+        from api.views import _handle_template_category_webhook
+        _handle_template_category_webhook({
+            'new_category': 'UTILITY',
+            'previous_category': 'MARKETING',
+            'message_template_name': 'test_template',
+            'message_template_language': 'es',
+        })
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.category, 'UTILITY')
+
+
+class SerializerTests(APITestCase):
+    """Test template serializers."""
+
+    def setUp(self):
+        self.template = WhatsAppTemplate.objects.create(
+            name='test_t',
+            language='es',
+            category='MARKETING',
+            status='APPROVED',
+            template_id='12345',
+            components=[{'type': 'body', 'text': 'Hola {{nombre}}'}],
+        )
+
+    def test_whatsapp_template_serializer_read_only_fields(self):
+        serializer = WhatsAppTemplateSerializer(self.template)
+        data = serializer.data
+        self.assertEqual(data['id'], self.template.id)
+        self.assertEqual(data['name'], 'test_t')
+        self.assertEqual(data['status'], 'APPROVED')
+        self.assertIn('created_at', data)
+
+    def test_send_template_serializer_valid(self):
+        serializer = SendTemplateSerializer(data={
+            'template_id': self.template.id,
+            'parameters': {'nombre': 'Juan'},
+        })
+        self.assertTrue(serializer.is_valid())
+
+    def test_send_template_serializer_not_approved(self):
+        pending = WhatsAppTemplate.objects.create(
+            name='pending_t', language='es', category='MARKETING',
+            status='PENDING',
+        )
+        serializer = SendTemplateSerializer(data={'template_id': pending.id})
+        self.assertFalse(serializer.is_valid())
+
+    def test_bulk_send_serializer_valid(self):
+        serializer = BulkSendTemplateSerializer(data={
+            'template_id': self.template.id,
+            'count': 25,
+        })
+        self.assertTrue(serializer.is_valid())
+        self.assertEqual(serializer.validated_data['count'], 25)
+
+    def test_bulk_send_serializer_max_count(self):
+        serializer = BulkSendTemplateSerializer(data={
+            'template_id': self.template.id,
+            'count': 999,
+        })
+        self.assertFalse(serializer.is_valid())

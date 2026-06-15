@@ -24,7 +24,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
@@ -33,6 +33,7 @@ from .serializers import (
     BotScheduleSerializer, BotConfigSerializer,
     TakeConversationSerializer, InitiateConversationSerializer,
     UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
+    WhatsAppTemplateSerializer,
     media_signer, sign_media_url,
 )
 from .redis_client import get_sync_redis
@@ -379,6 +380,10 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                     except Message.DoesNotExist:
                         pass
                 payload[message_type] = media_payload
+        elif message_type == 'template':
+            # content is a dict: {name, language, components}
+            payload['type'] = 'template'
+            payload['template'] = content
         else:
             payload['type'] = 'text'
             payload['text'] = {"body": content}
@@ -994,6 +999,86 @@ class ConversationViewSet(viewsets.ModelViewSet):
         serializer = ConversationListSerializer(queryset, many=True)
         return Response({'results': serializer.data})
 
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def send_template(self, request, pk=None):
+        """Send a WhatsApp template to this conversation (admin only)."""
+        if not request.user.is_staff:
+            return Response({'error': 'Admin only'}, status=status.HTTP_403_FORBIDDEN)
+
+        from .serializers import SendTemplateSerializer
+        serializer = SendTemplateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        template = WhatsAppTemplate.objects.get(id=serializer.validated_data['template_id'])
+        parameters = serializer.validated_data.get('parameters', {})
+        conversation = self.get_object()
+
+        if not conversation.contact_phone:
+            return Response({'error': 'No contact phone'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Build components with parameter substitution
+        components = []
+        for comp in template.components:
+            comp_type = comp.get('type')
+            if comp_type == 'body':
+                params = []
+                if parameters:
+                    for p in parameters:
+                        params.append({
+                            'type': 'text',
+                            'parameter_name': p,
+                            'text': parameters[p],
+                        })
+                components.append({'type': 'body', 'parameters': params})
+            elif comp_type == 'header' and comp.get('format') in ('image', 'video', 'document'):
+                header_param = parameters.get('header_media_id')
+                if header_param:
+                    components.append({
+                        'type': 'header',
+                        'parameters': [{'type': comp['format'], comp['format']: {'id': header_param}}],
+                    })
+            elif comp_type == 'buttons':
+                button_params = parameters.get('buttons', [])
+                btn_components = []
+                for i, btn in enumerate(comp.get('buttons', [])):
+                    if btn['type'] == 'url' and i < len(button_params):
+                        btn_components.append({
+                            'type': 'url',
+                            'text': btn['text'],
+                            'url': button_params[i],
+                        })
+                if btn_components:
+                    components.append({'type': 'button', 'sub_type': 'url', 'index': '0', 'parameters': btn_components})
+
+        payload = {
+            'name': template.name,
+            'language': {'code': template.language},
+            'components': components,
+        }
+
+        message = Message.objects.create(
+            conversation=conversation,
+            direction='outbound',
+            message_type='template',
+            content=json.dumps(payload),
+            sender_name=request.user.get_full_name() or request.user.username,
+            sender=request.user,
+        )
+
+        conversation.last_message = f'[{template.name}]'
+        conversation.last_message_at = timezone.now()
+        conversation.save()
+
+        transaction.on_commit(lambda: _send_pool.submit(
+            send_whatsapp_outbound,
+            'template', payload, conversation.contact_phone,
+            message.id, conversation.id,
+        ))
+
+        publish_conversation_update(conversation)
+        return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
+
 
 class MessageViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for reading messages"""
@@ -1145,6 +1230,294 @@ class BotConfigViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(BotConfigSerializer(config).data)
 
 
+class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
+    """Manage WhatsApp message templates. Admins can create, list, sync, delete."""
+    queryset = WhatsAppTemplate.objects.all()
+    serializer_class = WhatsAppTemplateSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def perform_create(self, serializer):
+        from . import whatsapp_templates
+        template = serializer.save()
+        try:
+            result = whatsapp_templates.create_template(
+                name=template.name,
+                language=template.language,
+                category=template.category,
+                components=template.components,
+            )
+            if result:
+                template.template_id = str(result.get('id', ''))
+                template.status = result.get('status', 'PENDING')
+            else:
+                template.status = 'REJECTED'
+                template.rejection_reason = 'Failed to submit to Meta API'
+        except Exception:
+            template.status = 'REJECTED'
+            template.rejection_reason = 'Error submitting to Meta API'
+        template.save()
+
+    def perform_destroy(self, instance):
+        from . import whatsapp_templates
+        if instance.name:
+            whatsapp_templates.delete_template(name=instance.name)
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def sync_status(self, request, pk=None):
+        """Re-fetch template status from Meta."""
+        from . import whatsapp_templates
+        template = self.get_object()
+        if template.template_id:
+            result = whatsapp_templates.get_template(template.template_id)
+            if result:
+                template.status = result.get('status', template.status)
+                template.save(update_fields=['status'])
+                return Response(WhatsAppTemplateSerializer(template).data)
+            return Response({'error': 'Failed to sync with Meta'}, status=400)
+        return Response({'error': 'No template_id to sync'}, status=400)
+
+    @action(detail=False, methods=['post'])
+    def sync_all(self, request):
+        """Sync status of all templates from Meta."""
+        from . import whatsapp_templates
+        remote = whatsapp_templates.list_templates()
+        updated = 0
+        for rt in remote:
+            try:
+                template = WhatsAppTemplate.objects.get(name=rt.get('name', ''), language=rt.get('language', 'es'))
+                old = template.status
+                template.status = rt.get('status', template.status)
+                if old != template.status:
+                    template.save(update_fields=['status'])
+                    updated += 1
+            except WhatsAppTemplate.DoesNotExist:
+                pass
+        return Response({'synced': len(remote), 'updated': updated})
+
+    @action(detail=False, methods=['post'])
+    def bulk_send(self, request):
+        """Send a template to the last N conversations (admin only)."""
+        from .serializers import BulkSendTemplateSerializer
+        serializer = BulkSendTemplateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        template = WhatsAppTemplate.objects.get(id=serializer.validated_data['template_id'])
+        count = serializer.validated_data['count']
+        parameters = serializer.validated_data.get('parameters', {})
+
+        conversations = Conversation.objects.exclude(
+            contact_phone__isnull=True,
+        ).exclude(contact_phone='').order_by('-last_message_at')[:count]
+
+        queued = 0
+        for conv in conversations:
+            # Build components the same way as send_template
+            components = []
+            for comp in template.components:
+                comp_type = comp.get('type')
+                if comp_type == 'body':
+                    params = []
+                    if parameters:
+                        for p in parameters:
+                            params.append({
+                                'type': 'text',
+                                'parameter_name': p,
+                                'text': parameters[p],
+                            })
+                    components.append({'type': 'body', 'parameters': params})
+                elif comp_type == 'header' and comp.get('format') in ('image', 'video', 'document'):
+                    header_param = parameters.get('header_media_id')
+                    if header_param:
+                        components.append({
+                            'type': 'header',
+                            'parameters': [{'type': comp['format'], comp['format']: {'id': header_param}}],
+                        })
+                elif comp_type == 'buttons':
+                    button_params = parameters.get('buttons', [])
+                    btn_components = []
+                    for i, btn in enumerate(comp.get('buttons', [])):
+                        if btn['type'] == 'url' and i < len(button_params):
+                            btn_components.append({
+                                'type': 'url',
+                                'text': btn['text'],
+                                'url': button_params[i],
+                            })
+                    if btn_components:
+                        components.append({
+                            'type': 'button', 'sub_type': 'url',
+                            'index': '0', 'parameters': btn_components,
+                        })
+
+            payload = {
+                'name': template.name,
+                'language': {'code': template.language},
+                'components': components,
+            }
+
+            message = Message.objects.create(
+                conversation=conv,
+                direction='outbound',
+                message_type='template',
+                content=json.dumps(payload),
+                sender_name='Bot',
+                sender=None,
+            )
+
+            conv.last_message = f'[{template.name}]'
+            conv.last_message_at = timezone.now()
+            conv.save(update_fields=['last_message', 'last_message_at'])
+
+            transaction.on_commit(lambda c=conv, p=payload, m=message: _send_pool.submit(
+                send_whatsapp_outbound,
+                'template', p, c.contact_phone, m.id, c.id,
+            ))
+
+            publish_conversation_update(conv)
+            queued += 1
+
+        return Response({
+            'queued': queued,
+            'template_name': template.name,
+            'total': len(conversations),
+        })
+
+    @action(detail=False, methods=['get'])
+    def approved(self, request):
+        """Return only APPROVED templates (for sending UI)."""
+        queryset = self.queryset.filter(status='APPROVED')
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+
+# ── Template webhook handlers ─────────────────────────────────────────────
+
+
+def _handle_template_status_webhook(value: dict):
+    """Handle message_template_status_update webhook from Meta."""
+    event = value.get('event', '')
+    template_id = str(value.get('message_template_id', ''))
+    reason = value.get('reason', '')
+    template_name = value.get('message_template_name', '')
+    template_lang = value.get('message_template_language', 'es')
+
+    try:
+        template = WhatsAppTemplate.objects.get(name=template_name, language=template_lang)
+    except WhatsAppTemplate.DoesNotExist:
+        logger.info("Template status webhook for unknown template %s (%s)", template_name, template_lang)
+        return
+
+    old_status = template.status
+    template.status = event
+
+    if event == 'REJECTED' and reason:
+        template.rejection_reason = reason
+        rejection_info = value.get('rejection_info', {})
+        if rejection_info:
+            parts = []
+            if rejection_info.get('reason'):
+                parts.append(rejection_info['reason'])
+            if rejection_info.get('recommendation'):
+                parts.append(rejection_info['recommendation'])
+            if parts:
+                template.rejection_reason = ' | '.join(parts)
+
+    if event == 'APPROVED' and value.get('message_template_category'):
+        template.category = value['message_template_category']
+
+    template.template_id = template_id or template.template_id
+    template.save()
+
+    if old_status != event:
+        try:
+            from api.realtime import publish
+            publish({'type': 'template.updated', 'template_id': template.id, 'status': event})
+        except Exception:
+            pass
+
+    logger.info("Template %s status updated: %s -> %s", template.name, old_status, event)
+
+
+def _handle_template_quality_webhook(value: dict):
+    """Handle message_template_quality_update webhook from Meta."""
+    template_id = str(value.get('message_template_id', ''))
+    new_score = value.get('new_quality_score', '')
+    template_name = value.get('message_template_name', '')
+    template_lang = value.get('message_template_language', 'es')
+
+    try:
+        template = WhatsAppTemplate.objects.get(name=template_name, language=template_lang)
+    except WhatsAppTemplate.DoesNotExist:
+        logger.info("Template quality webhook for unknown template %s (%s)", template_name, template_lang)
+        return
+
+    template.quality_score = new_score
+    template.save(update_fields=['quality_score'])
+    logger.info("Template %s quality score: %s", template.name, new_score)
+
+
+def _handle_template_category_webhook(value: dict):
+    """Handle template_category_update webhook from Meta."""
+    new_category = value.get('new_category', '')
+    previous_category = value.get('previous_category', '')
+    template_name = value.get('message_template_name', '')
+    template_lang = value.get('message_template_language', 'es')
+
+    try:
+        template = WhatsAppTemplate.objects.get(name=template_name, language=template_lang)
+    except WhatsAppTemplate.DoesNotExist:
+        logger.info("Template category webhook for unknown template %s (%s)", template_name, template_lang)
+        return
+
+    if new_category:
+        template.category = new_category
+        template.save(update_fields=['category'])
+    logger.info("Template %s category: %s -> %s", template.name, previous_category, new_category)
+
+
+def _handle_template_components_webhook(value: dict):
+    """Handle message_template_components_update webhook from Meta."""
+    template_name = value.get('message_template_name', '')
+    template_lang = value.get('message_template_language', 'es')
+    template_id = str(value.get('message_template_id', ''))
+
+    try:
+        template = WhatsAppTemplate.objects.get(name=template_name, language=template_lang)
+    except WhatsAppTemplate.DoesNotExist:
+        logger.info("Template components webhook for unknown template %s (%s)", template_name, template_lang)
+        return
+
+    body_text = value.get('message_template_element', '')
+    header_text = value.get('message_template_title', '')
+    footer_text = value.get('message_template_footer', '')
+    buttons_data = value.get('message_template_buttons', [])
+
+    new_components = []
+    if header_text:
+        new_components.append({'type': 'header', 'format': 'text', 'text': header_text})
+    if body_text:
+        new_components.append({'type': 'body', 'text': body_text})
+    if footer_text:
+        new_components.append({'type': 'footer', 'text': footer_text})
+    if buttons_data:
+        buttons = []
+        for b in buttons_data:
+            btn = {'type': b.get('message_template_button_type', '').lower(), 'text': b.get('message_template_button_text', '')}
+            if b.get('message_template_button_url'):
+                btn['url'] = b['message_template_button_url']
+            if b.get('message_template_button_phone_number'):
+                btn['phone_number'] = b['message_template_button_phone_number']
+            buttons.append(btn)
+        if buttons:
+            new_components.append({'type': 'buttons', 'buttons': buttons})
+
+    if new_components and new_components != template.components:
+        template.components = new_components
+        template.template_id = template_id or template.template_id
+        template.save(update_fields=['components', 'template_id'])
+        logger.info("Template %s components updated from webhook", template.name)
+
+
 # Webhook endpoint for WhatsApp (verification + incoming messages)
 @csrf_exempt
 def whatsapp_webhook(request):
@@ -1194,6 +1567,22 @@ def whatsapp_webhook(request):
             entries = payload.get('entry', [])
             changes = entries[0].get('changes', []) if entries else []
             value = changes[0].get('value', {}) if changes else payload.get('value', {})
+            field = changes[0].get('field', '') if changes else ''
+
+            # --- Template webhooks ---
+            if field == 'message_template_status_update':
+                _handle_template_status_webhook(value)
+                return JsonResponse({'status': 'template_status_handled'}, status=200)
+            if field == 'message_template_quality_update':
+                _handle_template_quality_webhook(value)
+                return JsonResponse({'status': 'template_quality_handled'}, status=200)
+            if field == 'template_category_update':
+                _handle_template_category_webhook(value)
+                return JsonResponse({'status': 'template_category_handled'}, status=200)
+            if field == 'message_template_components_update':
+                _handle_template_components_webhook(value)
+                return JsonResponse({'status': 'template_components_handled'}, status=200)
+
             messages = value.get('messages', [])
             if not messages:
                 return JsonResponse({'status': 'no_message'}, status=200)

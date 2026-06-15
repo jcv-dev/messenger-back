@@ -345,3 +345,57 @@ class BotConfig(models.Model):
 
     def __str__(self):
         return self.key
+
+
+TEMPLATE_STATUS_CHOICES = [
+    ('PENDING', 'Pending'),
+    ('APPROVED', 'Approved'),
+    ('REJECTED', 'Rejected'),
+    ('PAUSED', 'Paused'),
+    ('DISABLED', 'Disabled'),
+    ('FLAGGED', 'Flagged'),
+    ('PENDING_DELETION', 'Pending Deletion'),
+    ('DELETED', 'Deleted'),
+    ('ARCHIVED', 'Archived'),
+    ('UNARCHIVED', 'Unarchived'),
+    ('IN_APPEAL', 'In Appeal'),
+    ('LIMIT_EXCEEDED', 'Limit Exceeded'),
+    ('LOCKED', 'Locked'),
+    ('REINSTATED', 'Reinstated'),
+]
+
+TEMPLATE_CATEGORY_CHOICES = [
+    ('MARKETING', 'Marketing'),
+    ('UTILITY', 'Utility'),
+    ('AUTHENTICATION', 'Authentication'),
+]
+
+TEMPLATE_QUALITY_CHOICES = [
+    ('GREEN', 'Green'),
+    ('YELLOW', 'Yellow'),
+    ('RED', 'Red'),
+    ('UNKNOWN', 'Unknown'),
+]
+
+
+class WhatsAppTemplate(models.Model):
+    """WhatsApp message template. Managed via admin UI and synced with Meta Graph API."""
+    name = models.CharField(max_length=512)
+    language = models.CharField(max_length=10, default='es')
+    category = models.CharField(max_length=20, choices=TEMPLATE_CATEGORY_CHOICES, default='MARKETING')
+    template_id = models.CharField(max_length=50, null=True, blank=True)
+    status = models.CharField(max_length=30, choices=TEMPLATE_STATUS_CHOICES, default='PENDING')
+    quality_score = models.CharField(max_length=10, choices=TEMPLATE_QUALITY_CHOICES, null=True, blank=True)
+    components = models.JSONField(default=list)
+    rejection_reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "WhatsApp Template"
+        verbose_name_plural = "WhatsApp Templates"
+        unique_together = [('name', 'language')]
+
+    def __str__(self):
+        return f"{self.name} ({self.language}) — {self.status}"

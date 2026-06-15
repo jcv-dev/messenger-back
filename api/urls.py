@@ -3,7 +3,7 @@ URL configuration for API
 """
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import ConversationViewSet, MessageViewSet, UserViewSet, CityGroupViewSet, StickerAssetViewSet, BotExemptContactViewSet, BotScheduleViewSet, BotConfigViewSet, media_proxy, serve_media, static_map, issue_sse_token
+from .views import ConversationViewSet, MessageViewSet, UserViewSet, CityGroupViewSet, StickerAssetViewSet, BotExemptContactViewSet, BotScheduleViewSet, BotConfigViewSet, WhatsAppTemplateViewSet, media_proxy, serve_media, static_map, issue_sse_token
 
 router = DefaultRouter()
 router.register(r'conversations', ConversationViewSet, basename='conversation')
@@ -14,6 +14,7 @@ router.register(r'stickers', StickerAssetViewSet, basename='sticker')
 router.register(r'bot-exempt', BotExemptContactViewSet, basename='bot-exempt')
 router.register(r'bot-schedule', BotScheduleViewSet, basename='bot-schedule')
 router.register(r'bot-config', BotConfigViewSet, basename='bot-config')
+router.register(r'templates', WhatsAppTemplateViewSet, basename='template')
 
 urlpatterns = [
     path('', include(router.urls)),

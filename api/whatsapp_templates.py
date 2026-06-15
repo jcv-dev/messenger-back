@@ -1,0 +1,148 @@
+"""WhatsApp Template API client — Meta Graph API integration.
+
+All functions communicate with the Meta Graph API v20.0 using the same
+urllib + Bearer auth pattern used by ``send_whatsapp_outbound`` in views.py.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+
+import urllib.request
+import urllib.error
+
+from django.conf import settings
+
+from .rate_limiter import acquire as acquire_rate_capacity
+
+logger = logging.getLogger("api.whatsapp_templates")
+
+_GRAPH_API_VERSION = "v20.0"
+_GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
+
+
+def _headers() -> dict:
+    token = settings.WHATSAPP_API_TOKEN
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _business_id() -> str:
+    return settings.WHATSAPP_BUSINESS_ACCOUNT_ID
+
+
+def _phone_number_id() -> str:
+    return getattr(settings, "WHATSAPP_PHONE_NUMBER_ID", None) or settings.WHATSAPP_PHONE_NUMBER
+
+
+def _request(method: str, url: str, data: dict | None = None) -> dict:
+    """Low-level HTTP request to the Meta Graph API."""
+    headers = _headers()
+    body = json.dumps(data).encode("utf-8") if data else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _request_ok(method: str, url: str, data: dict | None = None) -> bool:
+    """Send a request and return True on 2xx, False on anything else."""
+    headers = _headers()
+    body = json.dumps(data).encode("utf-8") if data else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req):
+            return True
+    except urllib.error.HTTPError:
+        return False
+
+
+def create_template(name: str, language: str, category: str,
+                    components: list[dict]) -> dict | None:
+    """Submit a new template to Meta for review.
+
+    Returns the API response dict (containing ``id`` and ``status``) on
+    success, or ``None`` on failure.
+    """
+    business_id = _business_id()
+    if not business_id:
+        logger.error("WHATSAPP_BUSINESS_ACCOUNT_ID not configured")
+        return None
+
+    url = f"{_GRAPH_BASE}/{business_id}/message_templates"
+    payload = {
+        "name": name,
+        "language": language,
+        "category": category.lower(),
+        "components": components,
+    }
+
+    acquire_rate_capacity(_phone_number_id())
+    try:
+        return _request("POST", url, payload)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if hasattr(e, "read") else ""
+        logger.error("Meta create_template HTTP %s: %s", e.code, body[:500])
+        return None
+    except Exception:
+        logger.exception("Meta create_template network error")
+        return None
+
+
+def list_templates() -> list[dict]:
+    """Fetch all templates from Meta.
+
+    Returns a list of dicts (each with ``id``, ``name``, ``status``,
+    ``category``, ``language``, ``components``, etc.).
+    """
+    business_id = _business_id()
+    if not business_id:
+        return []
+
+    url = f"{_GRAPH_BASE}/{business_id}/message_templates"
+    acquire_rate_capacity(_phone_number_id())
+    try:
+        resp = _request("GET", url)
+        return resp.get("data", [])
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if hasattr(e, "read") else ""
+        logger.error("Meta list_templates HTTP %s: %s", e.code, body[:500])
+        return []
+    except Exception:
+        logger.exception("Meta list_templates network error")
+        return []
+
+
+def delete_template(name: str) -> bool:
+    """Delete a template from Meta by name.
+
+    Returns True if successful, False otherwise.
+    """
+    business_id = _business_id()
+    if not business_id:
+        return False
+
+    url = f"{_GRAPH_BASE}/{business_id}/message_templates?name={name}"
+    acquire_rate_capacity(_phone_number_id())
+    return _request_ok("DELETE", url)
+
+
+def get_template(template_id: str) -> dict | None:
+    """Fetch a single template's current status from Meta.
+
+    Returns the template dict (with ``status``, ``quality_score``, etc.)
+    or ``None`` on failure.
+    """
+    url = f"{_GRAPH_BASE}/{template_id}"
+    acquire_rate_capacity(_phone_number_id())
+    try:
+        return _request("GET", url)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if hasattr(e, "read") else ""
+        logger.error("Meta get_template HTTP %s: %s", e.code, body[:500])
+        return None
+    except Exception:
+        logger.exception("Meta get_template network error")
+        return None

@@ -8,7 +8,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -399,3 +399,44 @@ class BotConfigSerializer(serializers.ModelSerializer):
     class Meta:
         model = BotConfig
         fields = ['id', 'key', 'value', 'description', 'updated_at']
+
+
+class WhatsAppTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WhatsAppTemplate
+        fields = [
+            'id', 'name', 'language', 'category', 'template_id', 'status',
+            'quality_score', 'components', 'rejection_reason',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'template_id', 'status', 'quality_score',
+                            'rejection_reason', 'created_at', 'updated_at']
+
+
+class SendTemplateSerializer(serializers.Serializer):
+    template_id = serializers.IntegerField()
+    parameters = serializers.JSONField(required=False, default=dict)
+
+    def validate_template_id(self, value):
+        try:
+            template = WhatsAppTemplate.objects.get(id=value)
+        except WhatsAppTemplate.DoesNotExist:
+            raise serializers.ValidationError("Template not found")
+        if template.status != 'APPROVED':
+            raise serializers.ValidationError("Template must be APPROVED")
+        return value
+
+
+class BulkSendTemplateSerializer(serializers.Serializer):
+    template_id = serializers.IntegerField()
+    count = serializers.IntegerField(min_value=1, max_value=100, default=10)
+    parameters = serializers.JSONField(required=False, default=dict)
+
+    def validate_template_id(self, value):
+        try:
+            template = WhatsAppTemplate.objects.get(id=value)
+        except WhatsAppTemplate.DoesNotExist:
+            raise serializers.ValidationError("Template not found")
+        if template.status != 'APPROVED':
+            raise serializers.ValidationError("Template must be APPROVED")
+        return value
