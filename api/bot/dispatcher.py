@@ -332,6 +332,28 @@ async def handle_inbound(event: dict):
 
         session = await sync_to_async(get_session)(conversation_id)
 
+        # --- Rich first message gate (applies to both bot modes) ---
+        if session is None and not button_id and _is_rich_first_message_heuristic(user_text):
+            from .llm_fallback import is_rich_first_message
+            if await is_rich_first_message(user_text):
+                incr_metric("escalations")
+                await sync_to_async(delete_session)(conversation_id)
+                await _release_bot_take(conversation, escalated=True)
+                bot = await get_bot_user_async()
+                if bot:
+                    await sync_to_async(ConversationNote.create_note)(
+                        conversation=conversation,
+                        content="[Bot] Cliente proporcionó información completa en su primer mensaje. Transferido a agente.",
+                        expiry_type='custom',
+                        custom_expiry_minutes=10,
+                        created_by=bot,
+                    )
+                await sync_to_async(send_reply)(
+                    conversation,
+                    "He revisado tu mensaje y veo que tienes toda la información lista. Un asesor te atenderá para procesar tu solicitud rápidamente.",
+                )
+                return
+
         if await sync_to_async(get_state_machine_enabled)():
             await _handle_with_state_machine(session, conversation, conversation_id, user_text, button_id)
         else:
@@ -367,6 +389,46 @@ _FAQ_PATTERNS_ESCALATE = re.compile(
 
 # Prevent false cancel when "cancelar" means "pagar" in Colombian Spanish
 _PAYMENT_WORDS = re.compile(r"\b(cuenta|factura|pago|recibo|total|tarjeta|transferencia|nequi|bancolombia|daviplata|billetera|efectivo|pedido|servicio|pesos|valor)\b", re.I)
+
+# ── Heuristic patterns for "rich first message" detection ────────────────
+# These are quick pre-filters before calling the LLM for confirmation.
+
+_RICH_FIRST_ADDRESS = re.compile(
+    r"\b(cra\b|calle\b|carrera\b|avenida|transversal|diagonal|autopista|"
+    r"barrio|torre\b|apto\b|apartamento|oficina|local\b|km\b|"
+    r"#\d+|nro|n\.?\s*\d|esquina|"
+    r"dirección|direccion|donde|ubicación)\b",
+    re.I,
+)
+
+_RICH_FIRST_SERVICE = re.compile(
+    r"\b(necesito|quiero|solicito|busco|"
+    r"enviar|envío|domicilio|paquete|mensajería|"
+    r"recoger|recogida|entregar|entrega|llevar|traer|"
+    r"pedido|encargo|cotizar|precio)\b",
+    re.I,
+)
+
+_RICH_FIRST_PERSONAL = re.compile(
+    r"\b(soy\b|llamo\b|me\s+llamo|nombre|"
+    r"teléfono|telefono|celular|"
+    r"efectivo|nequi|pago|tarjeta)\b",
+    re.I,
+)
+
+
+def _is_rich_first_message_heuristic(text: str) -> bool:
+    """Quick pre-filter: does the message look rich enough to warrant an LLM check?"""
+    if len(text) <= 100:
+        return False
+    score = 0
+    if _RICH_FIRST_ADDRESS.search(text):
+        score += 1
+    if _RICH_FIRST_SERVICE.search(text):
+        score += 1
+    if _RICH_FIRST_PERSONAL.search(text):
+        score += 1
+    return score >= 2
 
 
 def _is_actual_cancel(user_text: str) -> bool:

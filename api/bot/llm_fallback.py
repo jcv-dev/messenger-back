@@ -245,3 +245,75 @@ async def generate_escalation_summary(
     except Exception:
         logger.warning("Gemini escalation summary failed for state=%s", state)
         return None
+
+
+async def is_rich_first_message(text: str) -> bool:
+    """Check if a first message contains enough info to route to a human agent.
+
+    The LLM classifies the message as a complete request (with addresses,
+    service intent, name/contact, payment info, etc.) versus a simple
+    greeting or general question.  Used by the dispatcher to decide
+    whether to skip the bot flow and escalate to a human.
+
+    Args:
+        text: The user's first message.
+
+    Returns:
+        True if the message contains meaningful context (addresses, names,
+        details) that an agent could work with, ``False`` for simple
+        greetings or general questions (or on any error — fail-open).
+    """
+    client = _get_client()
+    if client is None:
+        return False
+
+    prompt = (
+        "Determina si el siguiente mensaje contiene información sustancial "
+        "que un agente humano pueda aprovechar, o si solo es un saludo "
+        "simple o pregunta general.\n\n"
+        "Indicadores de información sustancial (NO necesita tenerlos todos):\n"
+        "- Dirección de origen y/o destino (cra, calle, barrio, etc.)\n"
+        "- Nombre del cliente, negocio o datos de contacto\n"
+        "- Forma de pago (efectivo, nequi, etc.)\n"
+        "- Descripción de lo que necesita (paquete, pedido, compras, etc.)\n"
+        "- Detalles como instrucciones, acompañante, herramientas, etc.\n\n"
+        "Responde SOLO 'si' si el mensaje tiene al menos algún detalle "
+        "concreto (dirección, nombre, forma de pago, descripción, etc.) "
+        "que justifique pasarlo a un asesor humano.\n"
+        "Responde 'no' si es solo un saludo (hola, buenas), una pregunta "
+        "general sin contexto, o si no aporta datos útiles.\n"
+        "El tipo de servicio puede faltar — el asesor lo preguntará.\n"
+        "NO des explicaciones ni respondas otra cosa."
+    )
+
+    config = genai_types.GenerateContentConfig(
+        system_instruction=prompt,
+        temperature=0.0,
+        max_output_tokens=4,
+        response_mime_type="text/x.enum",
+        response_schema=genai_types.Schema(
+            type=genai_types.Type.STRING,
+            enum=["si", "no"],
+        ),
+    )
+
+    try:
+        response = await client.aio.models.generate_content(
+            model="gemini-3.1-flash-lite",
+            contents=[genai_types.Content(
+                role="user",
+                parts=[genai_types.Part.from_text(text=text)],
+            )],
+            config=config,
+        )
+
+        if not response.candidates or not response.candidates[0].content.parts:
+            return False
+
+        raw = response.candidates[0].content.parts[0].text or ""
+        result = raw.strip().lower()[:2]
+        return result == "si"
+
+    except Exception:
+        logger.warning("Gemini rich-first-message classification failed")
+        return False
