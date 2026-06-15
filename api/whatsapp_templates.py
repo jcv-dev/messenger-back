@@ -59,6 +59,25 @@ def _request_ok(method: str, url: str, data: dict | None = None) -> bool:
         return False
 
 
+_INTERNAL_KEYS = {'parameters', 'header_handle', 'image_name'}
+
+
+def _sanitize_components(components: list[dict]) -> list[dict]:
+    """Strip internal metadata keys that Meta doesn't accept."""
+    cleaned = []
+    for comp in components:
+        entry = {k: v for k, v in comp.items() if k not in _INTERNAL_KEYS}
+        if 'buttons' in entry:
+            entry['buttons'] = [
+                {k: v for k, v in btn.items() if k not in _INTERNAL_KEYS}
+                for btn in entry['buttons']
+            ]
+        if 'example' in entry:
+            entry['example'] = {k: v for k, v in entry['example'].items() if k not in _INTERNAL_KEYS}
+        cleaned.append(entry)
+    return cleaned
+
+
 def create_template(name: str, language: str, category: str,
                     components: list[dict]) -> dict | None:
     """Submit a new template to Meta for review.
@@ -76,7 +95,7 @@ def create_template(name: str, language: str, category: str,
         "name": name,
         "language": language,
         "category": category.lower(),
-        "components": components,
+        "components": _sanitize_components(components),
     }
 
     acquire_rate_capacity(_phone_number_id())
