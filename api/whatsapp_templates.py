@@ -63,7 +63,8 @@ _INTERNAL_KEYS = {'parameters', 'header_handle', 'image_name'}
 
 
 def _sanitize_components(components: list[dict]) -> list[dict]:
-    """Strip internal metadata keys that Meta doesn't accept."""
+    """Strip internal metadata keys that Meta doesn't accept, and
+    build the ``example`` block for named parameters."""
     cleaned = []
     for comp in components:
         entry = {k: v for k, v in comp.items() if k not in _INTERNAL_KEYS}
@@ -74,6 +75,22 @@ def _sanitize_components(components: list[dict]) -> list[dict]:
             ]
         if 'example' in entry:
             entry['example'] = {k: v for k, v in entry['example'].items() if k not in _INTERNAL_KEYS}
+
+        # Build body_text_named_params from internal parameter metadata for Meta review
+        if comp.get('type') == 'body':
+            params = comp.get('parameters', [])
+            if params:
+                named_params = []
+                for p in params:
+                    named_params.append({
+                        'param_name': p['name'],
+                        'example': p.get('example', p['name']),
+                    })
+                if named_params:
+                    if 'example' not in entry:
+                        entry['example'] = {}
+                    entry['example']['body_text_named_params'] = named_params
+
         cleaned.append(entry)
     return cleaned
 
@@ -95,6 +112,7 @@ def create_template(name: str, language: str, category: str,
         "name": name,
         "language": language,
         "category": category.lower(),
+        "parameter_format": "named",
         "components": _sanitize_components(components),
     }
 
