@@ -427,10 +427,14 @@ class SendTemplateSerializer(serializers.Serializer):
         return value
 
 
+PARAMETER_SOURCE_CHOICES = ['contact_name', 'custom_name', 'contact_phone', 'conversation_id', 'fixed']
+
+
 class BulkSendTemplateSerializer(serializers.Serializer):
     template_id = serializers.IntegerField()
     count = serializers.IntegerField(min_value=1, max_value=100, default=10)
-    parameters = serializers.JSONField(required=False, default=dict)
+    parameter_sources = serializers.JSONField(required=False, default=dict)
+    fixed_values = serializers.JSONField(required=False, default=dict)
 
     def validate_template_id(self, value):
         try:
@@ -439,4 +443,13 @@ class BulkSendTemplateSerializer(serializers.Serializer):
             raise serializers.ValidationError("Template not found")
         if template.status != 'APPROVED':
             raise serializers.ValidationError("Template must be APPROVED")
+        return value
+
+    def validate_parameter_sources(self, value):
+        for var_name, source in value.items():
+            if source not in PARAMETER_SOURCE_CHOICES:
+                raise serializers.ValidationError(
+                    f"Invalid source '{source}' for '{var_name}'. "
+                    f"Choices: {', '.join(PARAMETER_SOURCE_CHOICES)}"
+                )
         return value

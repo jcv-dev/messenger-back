@@ -1334,45 +1334,63 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
 
         template = WhatsAppTemplate.objects.get(id=serializer.validated_data['template_id'])
         count = serializer.validated_data['count']
-        parameters = serializer.validated_data.get('parameters', {})
+        parameter_sources = serializer.validated_data.get('parameter_sources', {})
+        fixed_values = serializer.validated_data.get('fixed_values', {})
 
         conversations = Conversation.objects.exclude(
             contact_phone__isnull=True,
         ).exclude(contact_phone='').order_by('-last_message_at')[:count]
 
+        def _resolve_params(conv):
+            """Resolve template parameters for a given conversation."""
+            resolved = {}
+            for var_name, source in parameter_sources.items():
+                if source == 'contact_name':
+                    resolved[var_name] = conv.contact_name or ''
+                elif source == 'custom_name':
+                    resolved[var_name] = conv.custom_name or conv.contact_name or ''
+                elif source == 'contact_phone':
+                    resolved[var_name] = conv.contact_phone or ''
+                elif source == 'conversation_id':
+                    resolved[var_name] = str(conv.id)
+                elif source == 'fixed':
+                    resolved[var_name] = fixed_values.get(var_name, '')
+            return resolved
+
         queued = 0
         for conv in conversations:
-            # Build components the same way as send_template
+            resolved_params = _resolve_params(conv)
             components = []
             for comp in template.components:
                 comp_type = comp.get('type')
                 if comp_type == 'body':
                     params = []
-                    if parameters:
-                        for p in parameters:
+                    if resolved_params:
+                        for var_name, value in resolved_params.items():
                             params.append({
                                 'type': 'text',
-                                'parameter_name': p,
-                                'text': parameters[p],
+                                'parameter_name': var_name,
+                                'text': value,
                             })
                     components.append({'type': 'body', 'parameters': params})
                 elif comp_type == 'header' and comp.get('format') in ('image', 'video', 'document'):
-                    header_param = parameters.get('header_media_id')
+                    header_param = fixed_values.get('header_media_id') or parameter_sources.get('header_media_id')
                     if header_param:
                         components.append({
                             'type': 'header',
                             'parameters': [{'type': comp['format'], comp['format']: {'id': header_param}}],
                         })
                 elif comp_type == 'buttons':
-                    button_params = parameters.get('buttons', [])
                     btn_components = []
                     for i, btn in enumerate(comp.get('buttons', [])):
-                        if btn['type'] == 'url' and i < len(button_params):
-                            btn_components.append({
-                                'type': 'url',
-                                'text': btn['text'],
-                                'url': button_params[i],
-                            })
+                        if btn['type'] == 'url':
+                            url_val = fixed_values.get(f'btn_{i}')
+                            if url_val:
+                                btn_components.append({
+                                    'type': 'url',
+                                    'text': btn['text'],
+                                    'url': url_val,
+                                })
                     if btn_components:
                         components.append({
                             'type': 'button', 'sub_type': 'url',
