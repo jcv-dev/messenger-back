@@ -1309,13 +1309,12 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                 tmp.write(chunk)
             tmp_path = tmp.name
 
-        phone_number_id = getattr(settings, 'WHATSAPP_PHONE_NUMBER_ID', None) or settings.WHATSAPP_PHONE_NUMBER
-        token = settings.WHATSAPP_API_TOKEN
+        from . import whatsapp_templates
 
         try:
-            media_id = upload_media_to_whatsapp(tmp_path, phone_number_id, token)
-            if media_id:
-                return Response({'media_id': media_id, 'handle': media_id})
+            handle = whatsapp_templates.upload_template_media(tmp_path)
+            if handle:
+                return Response({'media_id': handle, 'handle': handle})
             return Response({'error': 'Media upload failed'}, status=500)
         except Exception as e:
             return Response({'error': str(e)}, status=500)

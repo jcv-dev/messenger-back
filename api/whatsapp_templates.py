@@ -7,6 +7,9 @@ urllib + Bearer auth pattern used by ``send_whatsapp_outbound`` in views.py.
 from __future__ import annotations
 
 import json
+import os
+import mimetypes
+import uuid
 import logging
 
 import urllib.request
@@ -190,4 +193,66 @@ def get_template(template_id: str) -> dict | None:
         return None
     except Exception:
         logger.exception("Meta get_template network error")
+        return None
+
+
+def upload_template_media(file_path: str) -> str | None:
+    """Upload an image to Meta's business account for use as a template header.
+
+    Unlike ``upload_media_to_whatsapp`` (which uploads to the phone-number
+    media endpoint for sending messages), this uploads to the **business
+    account** media endpoint and returns a handle (``h``) that can be used
+    as ``header_handle`` in template creation.
+
+    Returns the handle string, or ``None`` on failure.
+    """
+    business_id = _business_id()
+    token = settings.WHATSAPP_API_TOKEN
+    if not business_id or not token:
+        logger.error("WHATSAPP_BUSINESS_ACCOUNT_ID or WHATSAPP_API_TOKEN not configured")
+        return None
+
+    url = f"{_GRAPH_BASE}/{business_id}/media"
+    boundary = uuid.uuid4().hex
+
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+
+    filename = os.path.basename(file_path)
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"messaging_product\"\r\n\r\n"
+        f"whatsapp\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+
+    acquire_rate_capacity(_phone_number_id())
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+            handle = data.get("h") or data.get("id")
+            if handle:
+                logger.info("Template media uploaded: handle=%s", handle)
+                return handle
+            logger.error("Meta upload_template_media: no handle in response: %s", data)
+            return None
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if hasattr(e, "read") else ""
+        logger.error("Meta upload_template_media HTTP %s: %s", e.code, err_body[:500])
+        return None
+    except Exception:
+        logger.exception("Meta upload_template_media network error")
         return None
