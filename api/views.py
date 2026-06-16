@@ -1336,6 +1336,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
         count = serializer.validated_data['count']
         parameter_sources = serializer.validated_data.get('parameter_sources', {})
         fixed_values = serializer.validated_data.get('fixed_values', {})
+        header_media_id = request.data.get('header_media_id')
 
         conversations = Conversation.objects.exclude(
             contact_phone__isnull=True,
@@ -1374,11 +1375,10 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                             })
                     components.append({'type': 'body', 'parameters': params})
                 elif comp_type == 'header' and comp.get('format') in ('image', 'video', 'document'):
-                    header_param = fixed_values.get('header_media_id') or parameter_sources.get('header_media_id')
-                    if header_param:
+                    if header_media_id:
                         components.append({
                             'type': 'header',
-                            'parameters': [{'type': comp['format'], comp['format']: {'id': header_param}}],
+                            'parameters': [{'type': comp['format'], comp['format']: {'id': header_media_id}}],
                         })
                 elif comp_type == 'buttons':
                     btn_components = []
