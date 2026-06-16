@@ -1302,20 +1302,27 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
         if not uploaded_file:
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
 
-        import os, tempfile
-        ext = os.path.splitext(uploaded_file.name)[1] or '.png'
+        ext = os.path.splitext(uploaded_file.name)[1].lower()
+        if ext not in ('.jpg', '.jpeg', '.png'):
+            return Response({'error': 'Solo se permiten imágenes JPG o PNG'}, status=400)
+
+        if uploaded_file.size > 5 * 1024 * 1024:
+            return Response({'error': 'La imagen no debe superar los 5 MB'}, status=400)
+
+        import tempfile
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             for chunk in uploaded_file.chunks():
                 tmp.write(chunk)
             tmp_path = tmp.name
 
-        from . import whatsapp_templates
+        phone_number_id = getattr(settings, 'WHATSAPP_PHONE_NUMBER_ID', None) or settings.WHATSAPP_PHONE_NUMBER
+        token = settings.WHATSAPP_API_TOKEN
 
         try:
-            handle = whatsapp_templates.upload_template_media(tmp_path)
-            if handle:
-                return Response({'media_id': handle, 'handle': handle})
-            return Response({'error': 'Media upload failed'}, status=500)
+            media_id = upload_media_to_whatsapp(tmp_path, phone_number_id, token)
+            if media_id:
+                return Response({'media_id': media_id, 'handle': media_id})
+            return Response({'error': 'Error al subir la imagen a Meta'}, status=500)
         except Exception as e:
             return Response({'error': str(e)}, status=500)
         finally:
