@@ -59,7 +59,7 @@ def _request_ok(method: str, url: str, data: dict | None = None) -> bool:
         return False
 
 
-_INTERNAL_KEYS = {'parameters', 'header_handle', 'image_name'}
+_INTERNAL_KEYS = {'parameters', 'image_name'}
 
 
 def _sanitize_components(components: list[dict]) -> list[dict]:
@@ -73,7 +73,15 @@ def _sanitize_components(components: list[dict]) -> list[dict]:
                 {k: v for k, v in btn.items() if k not in _INTERNAL_KEYS}
                 for btn in entry['buttons']
             ]
-        if 'example' in entry:
+
+        # Image headers: move header_handle into example block for Meta
+        if comp.get('type') == 'header' and comp.get('format') == 'image':
+            handle = entry.pop('header_handle', None) or comp.get('header_handle')
+            if handle:
+                entry['example'] = {'header_handle': [handle]}
+            elif 'example' not in entry:
+                entry['example'] = {'header_handle': []}
+        elif 'example' in entry:
             entry['example'] = {k: v for k, v in entry['example'].items() if k not in _INTERNAL_KEYS}
 
         # Build body_text_named_params from internal parameter metadata for Meta review
