@@ -412,6 +412,21 @@ class WhatsAppTemplateSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'template_id', 'status', 'quality_score',
                             'rejection_reason', 'created_at', 'updated_at']
 
+    def validate_components(self, value):
+        for comp in value:
+            if comp.get('type') == 'body':
+                text = comp.get('text', '')
+                variables = re.findall(r'\{\{(\w+)\}\}', text)
+                if variables:
+                    params = comp.get('parameters', [])
+                    for var in variables:
+                        p = next((p for p in params if p.get('name') == var), None)
+                        if not p or not p.get('example'):
+                            raise serializers.ValidationError(
+                                f"El parámetro '{{{{{var}}}}}' necesita un valor de ejemplo."
+                            )
+        return value
+
 
 class SendTemplateSerializer(serializers.Serializer):
     template_id = serializers.IntegerField()

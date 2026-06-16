@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import mimetypes
+import re
 import uuid
 import logging
 
@@ -89,13 +90,20 @@ def _sanitize_components(components: list[dict]) -> list[dict]:
 
         # Build body_text_named_params from internal parameter metadata for Meta review
         if comp.get('type') == 'body':
+            text = comp.get('text', '')
             params = comp.get('parameters', [])
+            if not params and re.findall(r'\{\{(\w+)\}\}', text):
+                logger.warning(
+                    "Body component has variables but no parameters — "
+                    "template will likely be rejected by Meta"
+                )
             if params:
                 named_params = []
                 for p in params:
+                    example_val = p.get('example') or p.get('name', '')
                     named_params.append({
                         'param_name': p['name'],
-                        'example': p.get('example', p['name']),
+                        'example': example_val,
                     })
                 if named_params:
                     if 'example' not in entry:
