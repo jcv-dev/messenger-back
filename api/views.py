@@ -2819,7 +2819,8 @@ def call_settings(request):
             calling_data[field] = request.data[field]
 
     if not calling_data:
-        return JsonResponse({'error': 'No valid fields provided'}, status=400)
+        logger.warning("call_settings POST no valid fields. request.data=%s", request.data)
+        return JsonResponse({'error': 'No valid fields provided', 'received': dict(request.data)}, status=400)
 
     payload = {"calling": calling_data}
     body = json.dumps(payload).encode('utf-8')
