@@ -3279,22 +3279,12 @@ class CsvExportTests(APITestCase):
         self.assertIn('Último mensaje', content)
         self.assertIn('Estado', content)
 
-    def test_export_filters_by_status(self):
+    def test_export_returns_all_visible_conversations(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
-        response = self.client.get('/api/conversations/export/?status=active')
+        response = self.client.get('/api/conversations/export/')
         content = b''.join(response.streaming_content).decode('utf-8-sig')
         self.assertIn('Test Contact', content)
-        self.assertNotIn('Resolved Contact', content)
-
-        response2 = self.client.get('/api/conversations/export/?status=resolved')
-        content2 = b''.join(response2.streaming_content).decode('utf-8-sig')
-        self.assertIn('Resolved Contact', content2)
-        self.assertNotIn('Test Contact', content2)
-
-    def test_export_invalid_status_returns_400(self):
-        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
-        response = self.client.get('/api/conversations/export/?status=invalid')
-        self.assertEqual(response.status_code, 400)
+        self.assertIn('Resolved Contact', content)
 
 
 # ── Message Group Filtering ───────────────────────────────────────────────

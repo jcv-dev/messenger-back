@@ -3415,10 +3415,6 @@ def call_settings(request):
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
 def export_conversations_csv(request):
-    status_filter = request.query_params.get('status', 'active')
-    if status_filter not in ('active', 'resolved', 'archived'):
-        return JsonResponse({'error': 'Invalid status filter'}, status=400)
-
     qs = Conversation.objects.select_related('group').prefetch_related(
         'takes', 'tags', 'notes',
     )
@@ -3442,7 +3438,7 @@ def export_conversations_csv(request):
             _has_other_human_take=Exists(other_human_takes)
         ).filter(_has_other_human_take=False)
 
-    qs = qs.filter(status=status_filter).order_by('-last_message_at')
+    qs = qs.order_by('-last_message_at')
 
     def stream():
         import io
@@ -3496,5 +3492,5 @@ def export_conversations_csv(request):
             buffer.seek(0)
 
     response = StreamingHttpResponse(stream(), content_type='text/csv; charset=utf-8')
-    response['Content-Disposition'] = f'attachment; filename="conversaciones_{status_filter}_{timezone.now().strftime("%Y%m%d")}.csv"'
+    response['Content-Disposition'] = f'attachment; filename="conversaciones_{timezone.now().strftime("%Y%m%d")}.csv"'
     return response
