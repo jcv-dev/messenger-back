@@ -17,19 +17,23 @@ from .redis_client import get_sync_redis, reset_sync_redis
 logger = logging.getLogger(__name__)
 
 REDIS_CHANNEL = "sse:events"
+GROUP_CHANNEL_PREFIX = "sse:group"
 
 _next_seq = count(1)
 
 # --- sync publish (called from sync DRF views) ---
 
 
-def publish(event: dict[str, Any]) -> None:
+def publish(event: dict[str, Any], group_id: int | None = None) -> None:
     seq = next(_next_seq)
     event["_seq"] = seq
     payload = json.dumps(event, default=str)
     try:
-        get_sync_redis().publish(REDIS_CHANNEL, payload)
-        logger.info("SSE published seq=%s type=%s", seq, event.get('type'))
+        r = get_sync_redis()
+        r.publish(REDIS_CHANNEL, payload)
+        if group_id:
+            r.publish(f"{GROUP_CHANNEL_PREFIX}:{group_id}", payload)
+        logger.info("SSE published seq=%s type=%s group=%s", seq, event.get('type'), group_id)
     except Exception:
         reset_sync_redis()
         logger.exception("Failed to publish SSE event seq=%s", seq)
@@ -41,7 +45,7 @@ _subscribers: dict[str, dict[str, Any]] = {}
 _lock = asyncio.Lock()
 
 
-async def subscribe() -> (
+async def subscribe(user: Any = None) -> (
     tuple[str, asyncio.Queue[str], Callable[[], bool], Callable[[], None]]
 ):
     subscriber_id = str(uuid.uuid4())
@@ -49,13 +53,16 @@ async def subscribe() -> (
 
     redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
     pubsub = redis.pubsub()
-    await pubsub.subscribe(REDIS_CHANNEL)
+
+    channels = _build_subscriber_channels(user)
+    await pubsub.subscribe(*channels)
 
     state: dict[str, Any] = {
         "queue": event_queue,
         "pubsub": pubsub,
         "redis": redis,
         "missed": False,
+        "channels": channels,
     }
 
     async with _lock:
@@ -95,11 +102,29 @@ async def unsubscribe(subscriber_id: str) -> None:
     if state:
         state["task"].cancel()
         try:
-            await state["pubsub"].unsubscribe(REDIS_CHANNEL)
+            await state["pubsub"].unsubscribe()
             await state["pubsub"].close()
             await state["redis"].aclose()
         except Exception:
             logger.exception("Error closing subscriber %s", subscriber_id)
+
+
+def _build_subscriber_channels(user: Any) -> list[str]:
+    """Determine Redis channels this user should subscribe to."""
+    channels = [REDIS_CHANNEL]
+    if (
+        user
+        and hasattr(user, 'is_authenticated')
+        and user.is_authenticated
+        and not user.is_staff
+    ):
+        try:
+            profile = user.profile
+            if profile and profile.group_id:
+                channels.append(f"{GROUP_CHANNEL_PREFIX}:{profile.group_id}")
+        except Exception:
+            pass
+    return channels
 
 
 def get_last_seq() -> int:

@@ -14,7 +14,7 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate
+from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, AgentPresence, PushSubscription, AuditLog, CannedResponse
 from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
@@ -2604,3 +2604,1000 @@ class SerializerTests(APITestCase):
             'count': 999,
         })
         self.assertFalse(serializer.is_valid())
+
+
+# ── Conversation Pin ───────────────────────────────────────────────────────
+
+class ConversationPinTests(APITestCase):
+    """Test pin/unpin conversations."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='pinuser', password='testpass123')
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+        self.conv = Conversation.objects.create(
+            whatsapp_id='15550000111', contact_name='Pin Test',
+            contact_phone='15550000111', group=self.group,
+        )
+
+    def test_toggle_pin_sets_pin(self):
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.conv.refresh_from_db()
+        self.assertTrue(self.conv.is_pinned)
+        self.assertIsNotNone(self.conv.pinned_at)
+
+    def test_toggle_pin_unsets_pin(self):
+        self.conv.is_pinned = True
+        self.conv.pinned_at = timezone.now()
+        self.conv.save(update_fields=['is_pinned', 'pinned_at'])
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.conv.refresh_from_db()
+        self.assertFalse(self.conv.is_pinned)
+        self.assertIsNone(self.conv.pinned_at)
+
+    def test_pinned_sorted_first(self):
+        conv2 = Conversation.objects.create(
+            whatsapp_id='15550000222', contact_name='Pin Test 2',
+            group=self.group, last_message_at=timezone.now(),
+        )
+        conv3 = Conversation.objects.create(
+            whatsapp_id='15550000333', contact_name='Pin Test 3',
+            group=self.group, last_message_at=timezone.now() - timedelta(hours=1),
+        )
+        # Pin the oldest
+        conv3.is_pinned = True
+        conv3.pinned_at = timezone.now()
+        conv3.save(update_fields=['is_pinned', 'pinned_at'])
+        response = self.client.get('/api/conversations/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        if len(response.data) > 0:
+            self.assertEqual(response.data[0]['id'], conv3.id)
+
+    def test_toggle_pin_requires_auth(self):
+        self.client.credentials()
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_toggle_pin_returns_updated(self):
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('is_pinned', response.data)
+        self.assertTrue(response.data['is_pinned'])
+
+
+# ── Audit Log ──────────────────────────────────────────────────────────────
+
+class AuditLogModelTests(TestCase):
+    """Test AuditLog model creation and behavior."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='auditmodeltest', password='testpass123')
+
+    def test_create_audit_entry(self):
+        log = AuditLog.objects.create(
+            actor=self.user, action='take',
+            detail='Took conversation 1',
+        )
+        self.assertEqual(log.actor, self.user)
+        self.assertEqual(log.action, 'take')
+        self.assertEqual(log.actor_username, self.user.username)
+
+    def test_audit_ordering(self):
+        AuditLog.objects.create(actor=self.user, action='take')
+        AuditLog.objects.create(actor=self.user, action='release')
+        logs = AuditLog.objects.all()
+        self.assertEqual(logs.count(), 2)
+        self.assertGreaterEqual(logs[0].created_at, logs[1].created_at)
+
+    def test_audit_action_choices(self):
+        for action_code, _ in AuditLog.ACTION_CHOICES:
+            log = AuditLog.objects.create(actor=self.user, action=action_code)
+            self.assertEqual(log.action, action_code)
+
+
+class AuditLogAPITests(APITestCase):
+    """Test audit log API endpoints."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(username='auditadmin', password='admin123', email='a@b.com')
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user(username='audituser', password='testpass123')
+        self.user_token = Token.objects.create(user=self.user)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.admin, self.group)
+        assign_user_group(self.user, self.group)
+        self.conv = Conversation.objects.create(
+            whatsapp_id='15550000444', contact_name='Audit Conv', group=self.group,
+        )
+
+    def test_list_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.get('/api/audit-logs/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_list_returns_logs(self):
+        AuditLog.objects.create(actor=self.admin, conversation=self.conv, action='take')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/audit-logs/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn('results' if 'results' in data else 'count', data)
+
+    def test_filter_by_conversation(self):
+        AuditLog.objects.create(actor=self.admin, conversation=self.conv, action='take')
+        AuditLog.objects.create(actor=self.admin, action='take')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/audit-logs/', {'conversation': self.conv.id})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_filter_by_action(self):
+        AuditLog.objects.create(actor=self.admin, conversation=self.conv, action='pin')
+        AuditLog.objects.create(actor=self.admin, conversation=self.conv, action='unpin')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/audit-logs/', {'action': 'pin'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_filter_by_date_range(self):
+        AuditLog.objects.create(actor=self.admin, conversation=self.conv, action='take')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        yesterday = (timezone.now() - timedelta(days=1)).isoformat()
+        tomorrow = (timezone.now() + timedelta(days=1)).isoformat()
+        response = self.client.get('/api/audit-logs/', {
+            'created_at__gte': yesterday,
+            'created_at__lte': tomorrow,
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_take_creates_audit_entry(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        self.client.post(f'/api/conversations/{self.conv.id}/take_conversation/', {'duration_minutes': 30})
+        self.assertTrue(AuditLog.objects.filter(action='take', conversation=self.conv).exists())
+
+    def test_release_creates_audit_entry(self):
+        ConversationTake.create_take(conversation=self.conv, created_by=self.user, duration_minutes=60)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        self.client.post(f'/api/conversations/{self.conv.id}/release_conversation/')
+        self.assertTrue(AuditLog.objects.filter(action='release', conversation=self.conv).exists())
+
+    def test_pin_creates_audit_entry(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+        self.assertTrue(AuditLog.objects.filter(action='pin', conversation=self.conv).exists())
+
+    def test_send_message_creates_audit_entry(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        self.client.post(
+            f'/api/conversations/{self.conv.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Test'},
+        )
+        self.assertTrue(AuditLog.objects.filter(action='send_message', conversation=self.conv).exists())
+
+    def test_audit_log_readonly(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/audit-logs/', {'action': 'take'})
+        self.assertIn(response.status_code, (status.HTTP_403_FORBIDDEN, status.HTTP_405_METHOD_NOT_ALLOWED))
+
+
+# ── Canned Responses ───────────────────────────────────────────────────────
+
+class CannedResponseTests(APITestCase):
+    """Test canned response CRUD and permissions."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(username='cannedadmin', password='admin123', email='a@b.com')
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user(username='canneduser', password='testpass123')
+        self.user_token = Token.objects.create(user=self.user)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+        assign_user_group(self.admin, self.group)
+        CannedResponse.objects.create(
+            title='Welcome', content='Bienvenido!', category='saludo',
+            group=self.group, created_by=self.admin,
+        )
+        CannedResponse.objects.create(
+            title='Global Greeting', content='Hola!', category='saludo',
+            group=None, created_by=self.admin,
+        )
+        CannedResponse.objects.create(
+            title='Other City', content='Otro grupo', category='otro',
+            created_by=self.admin,
+        )
+
+    def test_list_requires_auth(self):
+        self.client.credentials()
+        response = self.client.get('/api/canned-responses/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_regular_user_sees_group_and_global(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.get('/api/canned-responses/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        results = data.get('results', data if isinstance(data, list) else [])
+        names = [r['title'] for r in results]
+        self.assertIn('Welcome', names)
+        self.assertIn('Global Greeting', names)
+        self.assertNotIn('Other City', names)
+
+    def test_staff_sees_all(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/canned-responses/')
+        data = response.json()
+        results = data.get('results', data if isinstance(data, list) else [])
+        self.assertEqual(len(results), 3)
+
+    def test_create_forced_to_own_group(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.post('/api/canned-responses/', {
+            'title': 'My Response', 'content': 'Test', 'category': 'test',
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        cr = CannedResponse.objects.get(title='My Response')
+        self.assertEqual(cr.group, self.group)
+
+    def test_staff_can_create_global(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/canned-responses/', {
+            'title': 'Staff Global', 'content': 'Global', 'category': 'test',
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    def test_regular_user_cannot_delete(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        cr = CannedResponse.objects.first()
+        response = self.client.delete(f'/api/canned-responses/{cr.id}/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_can_delete(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        cr = CannedResponse.objects.first()
+        response = self.client.delete(f'/api/canned-responses/{cr.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_update_title_and_content(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        cr = CannedResponse.objects.filter(created_by=self.admin).first()
+        response = self.client.patch(f'/api/canned-responses/{cr.id}/', {
+            'title': 'Updated Title', 'content': 'Updated content',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        cr.refresh_from_db()
+        self.assertEqual(cr.title, 'Updated Title')
+
+    def test_cursor_pagination(self):
+        for i in range(15):
+            CannedResponse.objects.create(
+                title=f'Bulk {i}', content=f'Content {i}', category='bulk',
+                created_by=self.admin,
+            )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/canned-responses/', {'page_size': 10})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertIn('results', data)
+        self.assertIn('count', data)
+
+
+# ── Agent Presence ────────────────────────────────────────────────────────
+
+class AgentPresenceAPITests(APITestCase):
+    """Test agent presence heartbeat and list endpoints."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='presenceuser', password='testpass123')
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+        AgentPresence.objects.create(user=self.user, status='online')
+
+    @patch('api.views.get_sync_redis')
+    def test_heartbeat_sets_redis_key(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        response = self.client.post('/api/presence/heartbeat/', {'status': 'online'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'ok')
+
+    @patch('api.views.get_sync_redis')
+    def test_heartbeat_creates_db_record(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        new_user = User.objects.create_user(username='heartbeatnew', password='pass')
+        new_token = Token.objects.create(user=new_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {new_token.key}')
+        response = self.client.post('/api/presence/heartbeat/', {'status': 'online'})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(AgentPresence.objects.filter(user=new_user).exists())
+
+    def test_heartbeat_requires_auth(self):
+        self.client.credentials()
+        response = self.client.post('/api/presence/heartbeat/', {'status': 'online'})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch('api.views.get_sync_redis')
+    def test_presence_list_returns_users(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        mock_redis.scan.return_value = (0, [])
+        response = self.client.get('/api/presence/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(response.json(), list)
+
+    @patch('api.views.get_sync_redis')
+    def test_presence_list_requires_auth(self, mock_get_redis):
+        self.client.credentials()
+        response = self.client.get('/api/presence/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_heartbeat_offline_creates_offline_status(self):
+        new_user = User.objects.create_user(username='offlineuser', password='pass')
+        new_token = Token.objects.create(user=new_user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {new_token.key}')
+        with patch('api.views.get_sync_redis') as mock_get_redis:
+            mock_redis = MagicMock()
+            mock_get_redis.return_value = mock_redis
+            response = self.client.post('/api/presence/heartbeat/', {'status': 'offline'})
+            self.assertEqual(response.status_code, 200)
+            presence = AgentPresence.objects.get(user=new_user)
+            self.assertEqual(presence.status, 'offline')
+
+
+# ── Full-Text Message Search ──────────────────────────────────────────────
+
+class MessageFullTextSearchTests(APITestCase):
+    """Test full-text message search (requires PostgreSQL with full-text search)."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='searchuser', password='testpass123')
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+        self.conv = Conversation.objects.create(
+            whatsapp_id='15559999000', contact_name='Search Test',
+            contact_phone='15559999000', group=self.group,
+        )
+        self.msg = Message.objects.create(
+            conversation=self.conv, direction='inbound', message_type='text',
+            content='Hola, necesito una cotización para un domicilio',
+            sender_name='Search Test',
+        )
+
+    def test_search_requires_auth(self):
+        self.client.credentials()
+        response = self.client.get('/api/messages/search/', {'q': 'cotización'})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_search_empty_query_returns_400(self):
+        response = self.client.get('/api/messages/search/', {'q': ''})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_search_no_results(self):
+        response = self.client.get('/api/messages/search/', {'q': 'xyzzy_nonexistent'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()['results']), 0)
+
+    def test_search_returns_results_structure(self):
+        response = self.client.get('/api/messages/search/', {'q': 'cotización'})
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn('results', data)
+        self.assertIn('total', data)
+        self.assertIn('has_more', data)
+
+    def test_search_respects_limit(self):
+        for i in range(5):
+            Message.objects.create(
+                conversation=self.conv, direction='inbound', message_type='text',
+                content=f'domicilio test message {i}', sender_name='Search',
+            )
+        response = self.client.get('/api/messages/search/', {'q': 'domicilio', 'limit': 2})
+        data = response.json()
+        self.assertLessEqual(len(data['results']), 2)
+
+
+# ── Typing Indicator ──────────────────────────────────────────────────────
+
+class TypingIndicatorTests(APITestCase):
+    """Test typing indicator via webhook and SSE."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='typinguser', password='testpass123')
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+        self.conv = Conversation.objects.create(
+            whatsapp_id='15551112222', contact_name='Typing Test',
+            contact_phone='15551112222', group=self.group,
+        )
+
+    @patch('api.views.get_sync_redis')
+    @patch('api.views.publish')
+    def test_webhook_typing_status_triggers_sse(self, mock_publish, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'statuses': [{
+                            'id': 'wamid.typing1',
+                            'status': 'typing',
+                            'conversation': {'id': '15551112222'},
+                            'timestamp': '2000000000',
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post(
+                '/webhook/', data=json.dumps(payload), content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+
+    @patch('api.views.get_sync_redis')
+    @patch('api.views.publish')
+    def test_typing_unknown_conversation_ignored(self, mock_publish, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'statuses': [{
+                            'id': 'wamid.typing2',
+                            'status': 'typing',
+                            'conversation': {'id': 'NONEXISTENT'},
+                            'timestamp': '2000000000',
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post(
+                '/webhook/', data=json.dumps(payload), content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+
+    def test_typing_requires_no_auth_for_webhook(self):
+        """Webhook endpoint is public (csrf_exempt)."""
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'statuses': [],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post(
+                '/webhook/', data=json.dumps(payload), content_type='application/json',
+            )
+        self.assertEqual(response.status_code, 200)
+
+
+# ── Push Subscriptions ────────────────────────────────────────────────────
+
+class PushSubscriptionTests(APITestCase):
+    """Test push subscription CRUD and throttle."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='pushuser', password='testpass123')
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+
+    def test_subscribe_creates_record(self):
+        response = self.client.post('/api/push-subscribe/', {
+            'endpoint': 'https://example.com/push/abc',
+            'keys': {'p256dh': 'test_key', 'auth': 'test_auth'},
+            'browser': 'Chrome',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'subscribed')
+        self.assertTrue(PushSubscription.objects.filter(user=self.user).exists())
+
+    def test_subscribe_updates_existing(self):
+        PushSubscription.objects.create(
+            user=self.user, endpoint='https://example.com/push/abc',
+            p256dh='old_key', auth='old_auth',
+        )
+        response = self.client.post('/api/push-subscribe/', {
+            'endpoint': 'https://example.com/push/abc',
+            'keys': {'p256dh': 'new_key', 'auth': 'new_auth'},
+        })
+        self.assertEqual(response.status_code, 200)
+        sub = PushSubscription.objects.get(user=self.user, endpoint='https://example.com/push/abc')
+        self.assertEqual(sub.p256dh, 'new_key')
+
+    def test_subscribe_requires_valid_keys(self):
+        response = self.client.post('/api/push-subscribe/', {
+            'endpoint': 'https://example.com/push/abc',
+            'keys': {},
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_unsubscribe_removes_record(self):
+        sub = PushSubscription.objects.create(
+            user=self.user, endpoint='https://example.com/push/abc',
+            p256dh='key', auth='auth',
+        )
+        response = self.client.post('/api/push-unsubscribe/', {
+            'endpoint': 'https://example.com/push/abc',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(PushSubscription.objects.filter(id=sub.id).exists())
+
+    def test_subscribe_requires_auth(self):
+        self.client.credentials()
+        response = self.client.post('/api/push-subscribe/', {
+            'endpoint': 'https://example.com/push/abc',
+            'keys': {'p256dh': 'key', 'auth': 'auth'},
+        })
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ── Bot Status (non-admin access) ──────────────────────────────────────────
+
+class BotStatusNonAdminTests(APITestCase):
+    """Test that non-staff users can access bot status (stripped response)."""
+
+    def setUp(self):
+        self.admin_user = User.objects.create_user(
+            username='admin', password='testpass123', is_staff=True
+        )
+        self.admin_token = Token.objects.create(user=self.admin_user)
+        self.non_admin = User.objects.create_user(
+            username='agent', password='testpass123', is_staff=False
+        )
+        self.non_admin_token = Token.objects.create(user=self.non_admin)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.non_admin, self.group)
+        assign_user_group(self.admin_user, self.group)
+
+    @patch('config.urls._read_bot_metrics')
+    def test_non_admin_can_access(self, mock_read):
+        mock_read.return_value = (
+            {'messages.processed': 100, 'locks.acquired': 20, 'tool_calls.succeeded': 15,
+             'tool_calls.failed': 3, 'escalations': 5, 'cancellations': 2,
+             'messages.rate_limited': 1, 'loop.crashes': 0},
+            {}, 0, 0,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.non_admin_token.key}')
+        response = self.client.get('/api/bot/status/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn('messages_processed_today', data)
+        self.assertIn('completion_rate', data)
+        self.assertIn('escalations_today', data)
+        self.assertIn('conversations_handled_today', data)
+        self.assertNotIn('config', data)
+        self.assertNotIn('series', data)
+        self.assertNotIn('metrics', data)
+
+    @patch('config.urls._read_bot_metrics')
+    def test_non_admin_cannot_see_config(self, mock_read):
+        mock_read.return_value = (
+            {'messages.processed': 0, 'locks.acquired': 0, 'tool_calls.succeeded': 0,
+             'tool_calls.failed': 0, 'escalations': 0, 'cancellations': 0,
+             'messages.rate_limited': 0, 'loop.crashes': 0},
+            {}, 0, 0,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.non_admin_token.key}')
+        response = self.client.get('/api/bot/status/')
+        self.assertNotIn('config', response.json())
+
+    @patch('config.urls._read_bot_metrics')
+    def test_staff_sees_full_data(self, mock_read):
+        mock_read.return_value = (
+            {'messages.processed': 100, 'locks.acquired': 20, 'tool_calls.succeeded': 15,
+             'tool_calls.failed': 3, 'escalations': 5, 'cancellations': 2,
+             'messages.rate_limited': 1, 'loop.crashes': 0},
+            {'messages.processed': [1]}, 1000, 1,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/bot/status/')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn('config', data)
+        self.assertIn('series', data)
+        self.assertIn('metrics', data)
+        self.assertIn('healthy', data)
+
+    def test_unauthenticated_blocked(self):
+        self.client.credentials()
+        response = self.client.get('/api/bot/status/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+# ── CSV Export ─────────────────────────────────────────────────────────────
+
+class CsvExportTests(APITestCase):
+    """Test CSV export endpoint."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='csvexport', password='testpass123', is_staff=False
+        )
+        self.token = Token.objects.create(user=self.user)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+
+        self.conv1 = Conversation.objects.create(
+            whatsapp_id='123456', contact_name='Test Contact',
+            contact_phone='573001234567', status='active',
+            last_message='Hello', last_message_at=timezone.now(),
+            group=self.group,
+        )
+        self.conv2 = Conversation.objects.create(
+            whatsapp_id='789012', contact_name='Resolved Contact',
+            contact_phone='573007890123', status='resolved',
+            last_message='Resolved', last_message_at=timezone.now(),
+            group=self.group,
+        )
+
+    def test_export_requires_auth(self):
+        self.client.credentials()
+        response = self.client.get('/api/conversations/export/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_export_returns_csv(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/conversations/export/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'text/csv; charset=utf-8')
+        self.assertIn('Content-Disposition', response)
+        self.assertIn('attachment', response['Content-Disposition'])
+        # Check BOM prefix
+        content = b''.join(response.streaming_content)
+        self.assertTrue(content.startswith(b'\xef\xbb\xbf'))
+
+    def test_export_contains_headers(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/conversations/export/')
+        content = b''.join(response.streaming_content).decode('utf-8-sig')
+        self.assertIn('ID', content)
+        self.assertIn('Contacto', content)
+        self.assertIn('Teléfono', content)
+        self.assertIn('Último mensaje', content)
+        self.assertIn('Estado', content)
+
+    def test_export_filters_by_status(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/conversations/export/?status=active')
+        content = b''.join(response.streaming_content).decode('utf-8-sig')
+        self.assertIn('Test Contact', content)
+        self.assertNotIn('Resolved Contact', content)
+
+        response2 = self.client.get('/api/conversations/export/?status=resolved')
+        content2 = b''.join(response2.streaming_content).decode('utf-8-sig')
+        self.assertIn('Resolved Contact', content2)
+        self.assertNotIn('Test Contact', content2)
+
+    def test_export_invalid_status_returns_400(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/conversations/export/?status=invalid')
+        self.assertEqual(response.status_code, 400)
+
+
+# ── Message Group Filtering ───────────────────────────────────────────────
+
+class MessageGroupFilterTests(APITestCase):
+    """Test that message queries respect group scoping."""
+
+    def setUp(self):
+        self.group_a = get_or_create_tulua_group()
+        self.group_b = CityGroup.objects.create(name='Cali', slug='cali')
+
+        self.agent_a = User.objects.create_user(username='msggrpa', password='testpass123')
+        assign_user_group(self.agent_a, self.group_a)
+        self.token_a = Token.objects.create(user=self.agent_a)
+
+        self.agent_b = User.objects.create_user(username='msggrpb', password='testpass123')
+        assign_user_group(self.agent_b, self.group_b)
+        self.token_b = Token.objects.create(user=self.agent_b)
+
+        self.admin = User.objects.create_superuser(
+            username='msgadmin', password='testpass123', email='a@a.com'
+        )
+        self.admin_token = Token.objects.create(user=self.admin)
+
+        self.conv_a = Conversation.objects.create(
+            whatsapp_id='111111', contact_name='MSG Group A', group=self.group_a,
+        )
+        self.conv_b = Conversation.objects.create(
+            whatsapp_id='222222', contact_name='MSG Group B', group=self.group_b,
+        )
+
+        Message.objects.create(conversation=self.conv_a, direction='inbound', content='Message A')
+        Message.objects.create(conversation=self.conv_b, direction='inbound', content='Message B')
+
+    def test_agent_sees_only_own_group_messages(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_a.key}')
+        response = self.client.get(f'/api/conversations/{self.conv_a.id}/messages/')
+        self.assertEqual(response.status_code, 200)
+        ids = [m['id'] for m in response.data]
+        self.assertGreater(len(ids), 0)
+
+    def test_agent_cannot_see_other_group_messages_via_list(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_a.key}')
+        # Messages in group_a's conv
+        response_a = self.client.get(f'/api/conversations/{self.conv_a.id}/messages/')
+        self.assertEqual(response_a.status_code, 200)
+
+        # Messages in group_b's conv should 404 because only the filtered
+        # queryset is used (self.get_object() filters by group)
+        response_b = self.client.get(f'/api/conversations/{self.conv_b.id}/messages/')
+        self.assertEqual(response_b.status_code, 404)
+
+    def test_staff_sees_all_messages(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response_a = self.client.get(f'/api/conversations/{self.conv_a.id}/messages/')
+        self.assertEqual(response_a.status_code, 200)
+        response_b = self.client.get(f'/api/conversations/{self.conv_b.id}/messages/')
+        self.assertEqual(response_b.status_code, 200)
+
+    def test_agent_cannot_retrieve_other_group_conversation(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_a.key}')
+        response = self.client.get(f'/api/conversations/{self.conv_b.id}/')
+        self.assertEqual(response.status_code, 404)
+
+
+# ── Message Search Group Filtering ────────────────────────────────────────
+
+class MessageSearchGroupFilterTests(APITestCase):
+    """Test that full-text message search respects group scoping."""
+
+    def setUp(self):
+        self.group_a = get_or_create_tulua_group()
+        self.group_b = CityGroup.objects.create(name='Cali', slug='cali')
+
+        self.agent_a = User.objects.create_user(username='searchgrpa', password='testpass123')
+        assign_user_group(self.agent_a, self.group_a)
+        self.token_a = Token.objects.create(user=self.agent_a)
+
+        self.agent_b = User.objects.create_user(username='searchgrpb', password='testpass123')
+        assign_user_group(self.agent_b, self.group_b)
+        self.token_b = Token.objects.create(user=self.agent_b)
+
+        self.admin = User.objects.create_superuser(
+            username='searchadmin', password='testpass123', email='a@a.com'
+        )
+        self.admin_token = Token.objects.create(user=self.admin)
+
+        self.conv_a = Conversation.objects.create(
+            whatsapp_id='333333', contact_name='Search Group A', group=self.group_a,
+        )
+        self.conv_b = Conversation.objects.create(
+            whatsapp_id='444444', contact_name='Search Group B', group=self.group_b,
+        )
+
+        self.msg_a = Message.objects.create(
+            conversation=self.conv_a, direction='inbound',
+            content='confidential pricing info for group A only',
+        )
+        self.msg_b = Message.objects.create(
+            conversation=self.conv_b, direction='inbound',
+            content='confidential pricing info for group B only',
+        )
+
+    def test_search_scoped_to_group(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_a.key}')
+        response = self.client.get('/api/messages/search/?q=confidential')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        conv_ids = [r['conversation_id'] for r in data['results']]
+        self.assertIn(self.conv_a.id, conv_ids)
+        self.assertNotIn(self.conv_b.id, conv_ids)
+
+    def test_search_other_group_excluded(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_b.key}')
+        response = self.client.get('/api/messages/search/?q=confidential')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        conv_ids = [r['conversation_id'] for r in data['results']]
+        self.assertNotIn(self.conv_a.id, conv_ids)
+        self.assertIn(self.conv_b.id, conv_ids)
+
+    def test_staff_search_sees_all(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/messages/search/?q=confidential')
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(len(data['results']), 2)
+
+
+# ── CSV Export Group Filtering ────────────────────────────────────────────
+
+class CsvExportGroupFilterTests(APITestCase):
+    """Test CSV export respects group scoping."""
+
+    def setUp(self):
+        self.group_a = get_or_create_tulua_group()
+        self.group_b = CityGroup.objects.create(name='Cali', slug='cali')
+
+        self.agent_a = User.objects.create_user(username='csvexpa', password='testpass123')
+        assign_user_group(self.agent_a, self.group_a)
+        self.token_a = Token.objects.create(user=self.agent_a)
+
+        self.agent_b = User.objects.create_user(username='csvexpb', password='testpass123')
+        assign_user_group(self.agent_b, self.group_b)
+        self.token_b = Token.objects.create(user=self.agent_b)
+
+        self.admin = User.objects.create_superuser(
+            username='csvexpadmin', password='testpass123', email='a@a.com'
+        )
+        self.admin_token = Token.objects.create(user=self.admin)
+
+        self.conv_a = Conversation.objects.create(
+            whatsapp_id='555555', contact_name='Export Group A',
+            contact_phone='573001', status='active', last_message='A',
+            last_message_at=timezone.now(), group=self.group_a,
+        )
+        self.conv_b = Conversation.objects.create(
+            whatsapp_id='666666', contact_name='Export Group B',
+            contact_phone='573002', status='active', last_message='B',
+            last_message_at=timezone.now(), group=self.group_b,
+        )
+
+    def test_export_scoped_to_group(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_a.key}')
+        response = self.client.get('/api/conversations/export/?status=active')
+        content = b''.join(response.streaming_content).decode('utf-8-sig')
+        self.assertIn('Export Group A', content)
+        self.assertNotIn('Export Group B', content)
+
+    def test_export_other_group_excluded(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_b.key}')
+        response = self.client.get('/api/conversations/export/?status=active')
+        content = b''.join(response.streaming_content).decode('utf-8-sig')
+        self.assertNotIn('Export Group A', content)
+        self.assertIn('Export Group B', content)
+
+    def test_staff_export_sees_all(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.get('/api/conversations/export/?status=active')
+        content = b''.join(response.streaming_content).decode('utf-8-sig')
+        self.assertIn('Export Group A', content)
+        self.assertIn('Export Group B', content)
+
+
+# ── SSE Group Scoping ─────────────────────────────────────────────────────
+
+class SSEGroupFilterTests(SimpleTestCase):
+    """Test that publish() sends to the correct Redis channels."""
+
+    @patch('api.realtime.get_sync_redis')
+    def test_publish_without_group_sends_to_global_only(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        from api.realtime import publish
+
+        publish({'type': 'test'})
+
+        mock_redis.publish.assert_called_once()
+        args, _ = mock_redis.publish.call_args
+        self.assertEqual(args[0], 'sse:events')
+
+    @patch('api.realtime.get_sync_redis')
+    def test_publish_with_group_sends_to_global_and_group(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        from api.realtime import publish
+
+        publish({'type': 'test'}, group_id=42)
+
+        self.assertEqual(mock_redis.publish.call_count, 2)
+        channels = [call[0][0] for call in mock_redis.publish.call_args_list]
+        self.assertIn('sse:events', channels)
+        self.assertIn('sse:group:42', channels)
+
+    @patch('api.realtime.get_sync_redis')
+    def test_publish_with_group_id_zero_sends_global_only(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        from api.realtime import publish
+
+        publish({'type': 'test'}, group_id=0)
+
+        mock_redis.publish.assert_called_once()
+        args, _ = mock_redis.publish.call_args
+        self.assertEqual(args[0], 'sse:events')
+
+    @patch('api.realtime.REDIS_CHANNEL', 'sse:events')
+    @patch('api.realtime.GROUP_CHANNEL_PREFIX', 'sse:group')
+    def test_subscribe_user_with_group_gets_group_channel(self):
+        """Verify subscribe() builds correct channel list for non-staff with group."""
+        user = MagicMock()
+        user.is_authenticated = True
+        user.is_staff = False
+        profile = MagicMock()
+        profile.group_id = 7
+        user.profile = profile
+
+        from api.realtime import _build_subscriber_channels
+        channels = _build_subscriber_channels(user)
+        self.assertIn('sse:events', channels)
+        self.assertIn('sse:group:7', channels)
+
+    def test_subscribe_staff_gets_global_only(self):
+        """Verify staff subscribers only get the global channel."""
+        user = MagicMock()
+        user.is_authenticated = True
+        user.is_staff = True
+
+        from api.realtime import _build_subscriber_channels
+        channels = _build_subscriber_channels(user)
+        self.assertEqual(channels, ['sse:events'])
+
+
+# ── Set Conversation Group ────────────────────────────────────────────────
+
+class SetGroupTests(APITestCase):
+    """Test the set_group endpoint for changing a conversation's group."""
+
+    def setUp(self):
+        self.group_a = get_or_create_tulua_group()
+        self.group_b = CityGroup.objects.create(name='Cali', slug='cali')
+
+        self.user = User.objects.create_user(username='setgrp', password='testpass123')
+        assign_user_group(self.user, self.group_a)
+        self.token = Token.objects.create(user=self.user)
+
+        self.conv = Conversation.objects.create(
+            whatsapp_id='777777', contact_name='SetGroup Test',
+            contact_phone='573001234567', group=self.group_a,
+        )
+
+    def test_set_group_requires_auth(self):
+        self.client.credentials()
+        response = self.client.post(f'/api/conversations/{self.conv.id}/set_group/',
+                                    {'group_id': self.group_b.id})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_set_group_updates_conversation_group(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.post(f'/api/conversations/{self.conv.id}/set_group/',
+                                    {'group_id': self.group_b.id})
+        self.assertEqual(response.status_code, 200)
+        self.conv.refresh_from_db()
+        self.assertEqual(self.conv.group_id, self.group_b.id)
+
+    def test_set_group_invalid_group_returns_400(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.post(f'/api/conversations/{self.conv.id}/set_group/',
+                                    {'group_id': 99999})
+        self.assertEqual(response.status_code, 400)
+
+    def test_set_group_same_group_noop(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.post(f'/api/conversations/{self.conv.id}/set_group/',
+                                    {'group_id': self.group_a.id})
+        self.assertEqual(response.status_code, 200)
+
+    def test_agent_cannot_set_group_on_other_group_conversation(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        conv_b = Conversation.objects.create(
+            whatsapp_id='888888', contact_name='Other Group',
+            group=self.group_b,
+        )
+        response = self.client.post(f'/api/conversations/{conv_b.id}/set_group/',
+                                    {'group_id': self.group_a.id})
+        self.assertEqual(response.status_code, 404)

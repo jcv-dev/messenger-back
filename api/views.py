@@ -26,7 +26,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
@@ -35,7 +35,9 @@ from .serializers import (
     BotScheduleSerializer, BotConfigSerializer,
     TakeConversationSerializer, InitiateConversationSerializer,
     UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
-    WhatsAppTemplateSerializer, CallSerializer,
+    WhatsAppTemplateSerializer, CallSerializer, AuditLogSerializer,
+    CannedResponseSerializer, AgentPresenceSerializer,
+    PushSubscriptionSerializer, MessageSearchSerializer,
     media_signer, sign_media_url,
 )
 from .redis_client import get_sync_redis
@@ -44,6 +46,7 @@ import json
 import subprocess
 import tempfile
 import logging
+import csv
 
 from django.core.cache import cache
 
@@ -69,6 +72,12 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+def _log_audit(actor, conversation, action, detail=''):
+    try:
+        AuditLog.objects.create(actor=actor, conversation=conversation, action=action, detail=detail)
+    except Exception:
+        logger.exception("Failed to create audit log entry")
+
 def publish_conversation_update(conversation, message=None, escalated=False):
     try:
         payload = {
@@ -79,9 +88,100 @@ def publish_conversation_update(conversation, message=None, escalated=False):
             payload['message'] = message
         if escalated:
             payload['escalated'] = True
-        publish(payload)
+        # Include typing indicator status
+        try:
+            redis = get_sync_redis()
+            typing_key = f'typing:{conversation.id}'
+            if redis.exists(typing_key):
+                payload['conversation']['typing'] = True
+        except Exception:
+            pass
+        publish(payload, group_id=conversation.group_id)
     except Exception:
         logger.exception("Failed to publish SSE conversation update")
+
+    # Push notification for inbound messages to the take owner
+    if message and message.get('direction') == 'inbound':
+        try:
+            from .models import PushSubscription
+            now_ts = int(time.time())
+
+            # Find who has the take on this conversation
+            active_take = ConversationTake.objects.filter(
+                conversation=conversation,
+                expires_at__gt=timezone.now(),
+            ).exclude(created_by__username='bot').first()
+
+            if active_take and active_take.created_by_id:
+                redis = get_sync_redis()
+                throttle_key = f'push:last:{active_take.created_by_id}:{conversation.id}'
+                try:
+                    last_push = redis.get(throttle_key)
+                    if last_push and now_ts - int(last_push) < 30:
+                        return
+                except Exception:
+                    pass
+
+                subscriptions = PushSubscription.objects.filter(user_id=active_take.created_by_id)
+                if subscriptions.exists():
+                    import threading
+                    from django.conf import settings as dj_settings
+                    contact_name = conversation.custom_name or conversation.contact_name
+                    msg_preview = (message.get('content') or '')[:120]
+                    push_payload = {
+                        'title': contact_name,
+                        'body': msg_preview,
+                        'icon': '/favicon.ico',
+                        'badge': '/favicon.ico',
+                        'tag': f'conversation-{conversation.id}',
+                        'data': {
+                            'url': '/',
+                            'conversation_id': conversation.id,
+                        },
+                    }
+                    for sub in subscriptions:
+                        threading.Thread(
+                            target=_send_push_notification,
+                            args=(sub, push_payload, throttle_key, now_ts),
+                            daemon=True,
+                        ).start()
+        except Exception:
+            logger.exception("Failed to send push notification")
+
+
+def _send_push_notification(subscription, payload, throttle_key, now_ts):
+    """Send a push notification to a single subscription. Ran in daemon thread."""
+    try:
+        from pywebpush import webpush, WebPushException
+        webpush(
+            subscription_info={
+                'endpoint': subscription.endpoint,
+                'keys': {
+                    'p256dh': subscription.p256dh,
+                    'auth': subscription.auth,
+                },
+            },
+            data=json.dumps(payload),
+            vapid_private_key=settings.VAPID_PRIVATE_KEY,
+            vapid_claims={
+                'sub': f'mailto:{settings.VAPID_CLAIMS_EMAIL}',
+            },
+        )
+        # Throttle successful push
+        try:
+            redis = get_sync_redis()
+            redis.setex(throttle_key, 30, str(now_ts))
+        except Exception:
+            pass
+    except Exception as e:
+        # Remove subscription on 410 Gone
+        if hasattr(e, 'status_code') and e.status_code == 410:
+            try:
+                subscription.delete()
+                logger.info("Removed expired push subscription %s", subscription.id)
+            except Exception:
+                pass
+        logger.debug("Push notification failed for sub %s: %s", subscription.id, str(e))
 
 def upload_media_to_whatsapp(file_path, phone_number_id, token):
     url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
@@ -554,7 +654,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return conversations for the user's group (staff sees all)"""
-        qs = Conversation.objects.select_related('group').order_by('-last_message_at', '-created_at')
+        qs = Conversation.objects.select_related('group').order_by('-is_pinned', 'pinned_at', '-last_message_at', '-created_at')
         now = timezone.now()
         last_msg = Message.objects.filter(conversation=OuterRef('pk')).order_by('-created_at')
 
@@ -686,6 +786,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             if hasattr(conversation, '_prefetched_objects_cache'):
                 conversation._prefetched_objects_cache.pop('takes', None)
             publish_conversation_update(conversation)
+            _log_audit(request.user, conversation, 'take')
             return Response(take_serializer.data, status=status.HTTP_201_CREATED)
 
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -706,10 +807,10 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 )
             active_take.delete()
         conversation.save()
-        # Clear prefetch cache so SSE serializes fresh takes, not stale prefetch
         if hasattr(conversation, '_prefetched_objects_cache'):
             conversation._prefetched_objects_cache.pop('takes', None)
         publish_conversation_update(conversation)
+        _log_audit(request.user, conversation, 'release')
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'])
@@ -769,6 +870,48 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
         publish_conversation_update(conversation)
         return Response({'custom_name': custom_name}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def set_group(self, request, pk=None):
+        """Move a conversation to a different group."""
+        from .serializers import SetGroupSerializer
+        conversation = self.get_object()
+        old_group_id = conversation.group_id
+        serializer = SetGroupSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        new_group_id = serializer.validated_data['group_id']
+        if old_group_id == new_group_id:
+            return Response({'group': conversation.group_id}, status=status.HTTP_200_OK)
+
+        conversation.group_id = new_group_id
+        conversation.save(update_fields=['group_id', 'updated_at'])
+
+        if hasattr(conversation, '_prefetched_objects_cache'):
+            conversation._prefetched_objects_cache.pop('takes', None)
+        publish_conversation_update(conversation)
+
+        return Response(ConversationSerializer(conversation).data)
+
+    @action(detail=True, methods=['post'])
+    def toggle_pin(self, request, pk=None):
+        """Toggle the pinned state of a conversation."""
+        conversation = self.get_object()
+        conversation.is_pinned = not conversation.is_pinned
+        conversation.pinned_at = timezone.now() if conversation.is_pinned else None
+        conversation.save(update_fields=['is_pinned', 'pinned_at'])
+        if hasattr(conversation, '_prefetched_objects_cache'):
+            conversation._prefetched_objects_cache.pop('takes', None)
+        publish_conversation_update(conversation)
+        _log_audit(request.user, conversation, 'pin' if conversation.is_pinned else 'unpin')
+        serializer = self.get_serializer(conversation)
+        return Response(serializer.data)
+
+    def destroy(self, request, *args, **kwargs):
+        conversation = self.get_object()
+        _log_audit(request.user, conversation, 'delete_conversation')
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=False, methods=['post'])
     def remove_expired_tags(self, request):
@@ -921,6 +1064,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
             serializer = MessageSerializer(message)
             publish_conversation_update(conversation, serializer.data)
+            if direction == 'outbound':
+                _log_audit(request.user, conversation, 'send_message', content[:200])
 
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -937,7 +1082,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if before:
             queryset = queryset.filter(last_message_at__lt=before)
 
-        queryset = queryset.order_by('-last_message_at', '-created_at')
+        queryset = queryset.order_by('-is_pinned', 'pinned_at', '-last_message_at', '-created_at')
         conv_page = list(queryset[:limit + 1])
         has_more = len(conv_page) > limit
         conv_page = conv_page[:limit]
@@ -1180,6 +1325,14 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         if user.is_authenticated and not user.is_staff:
             from django.utils import timezone as tz
             now = tz.now()
+            try:
+                profile = user.profile
+                if profile and profile.group_id:
+                    qs = qs.filter(conversation__group_id=profile.group_id)
+                else:
+                    return Message.objects.none()
+            except Exception:
+                return Message.objects.none()
             if self.action == 'list':
                 other_takes = ConversationTake.objects.filter(
                     conversation=OuterRef('conversation'),
@@ -1190,6 +1343,63 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
                 ).filter(_msg_other_take=False)
 
         return qs
+
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        """Full-text message search. Returns grouped results with snippets."""
+        q = request.query_params.get('q', '').strip()
+        if not q:
+            return Response({'error': 'Query parameter "q" is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        limit = min(int(request.query_params.get('limit', 50)), 50)
+        user = request.user
+        now = timezone.now()
+
+        from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramSimilarity
+        search_query = SearchQuery(q, config='spanish', search_type='websearch')
+        vector = SearchVector('content', weight='A', config='spanish')
+
+        qs = Message.objects.select_related('conversation').filter(
+            search_vector__search=search_query
+        )
+
+        if not user.is_staff:
+            try:
+                profile = user.profile
+                if profile and profile.group_id:
+                    qs = qs.filter(conversation__group_id=profile.group_id)
+                else:
+                    return Response({'results': [], 'total': 0, 'has_more': False})
+            except Exception:
+                return Response({'results': [], 'total': 0, 'has_more': False})
+            other_takes = ConversationTake.objects.filter(
+                conversation=OuterRef('conversation'),
+                expires_at__gt=now,
+            ).exclude(created_by=user).exclude(created_by__username='bot')
+            qs = qs.annotate(_msg_other_take=Exists(other_takes)).filter(_msg_other_take=False)
+
+        qs = qs.annotate(
+            rank=SearchRank(vector, search_query),
+        ).order_by('-rank')[:limit]
+
+        results = []
+        for msg in qs:
+            contact_name = msg.conversation.custom_name or msg.conversation.contact_name
+            snippet = msg.content[:200] if msg.content else ''
+            results.append({
+                'message_id': msg.id,
+                'conversation_id': msg.conversation_id,
+                'contact_name': contact_name,
+                'snippet': snippet,
+                'created_at': msg.created_at,
+                'rank': float(msg.rank) if hasattr(msg, 'rank') else 0.0,
+            })
+
+        return Response({
+            'results': results,
+            'total': len(results),
+            'has_more': False,
+        })
 
 
 from rest_framework.pagination import PageNumberPagination
@@ -1532,6 +1742,214 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
+    """View audit log entries (admin only)."""
+    queryset = AuditLog.objects.select_related('actor').all()
+    serializer_class = AuditLogSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    pagination_class = UserPagination
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        conversation = self.request.query_params.get('conversation')
+        actor = self.request.query_params.get('actor')
+        action = self.request.query_params.get('action')
+        gte = self.request.query_params.get('created_at__gte')
+        lte = self.request.query_params.get('created_at__lte')
+        if conversation:
+            qs = qs.filter(conversation_id=conversation)
+        if actor:
+            qs = qs.filter(actor_id=actor)
+        if action:
+            qs = qs.filter(action=action)
+        if gte:
+            qs = qs.filter(created_at__gte=gte)
+        if lte:
+            qs = qs.filter(created_at__lte=lte)
+        return qs
+
+
+class CannedResponseViewSet(viewsets.ModelViewSet):
+    """Manage canned responses. Regular users see own group + global; staff see all."""
+    serializer_class = CannedResponseSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = UserPagination
+
+    def get_queryset(self):
+        user = self.request.user
+        if user.is_staff:
+            return CannedResponse.objects.select_related('group', 'created_by').all()
+        try:
+            profile = user.profile
+            group_id = profile.group_id if profile else None
+            if group_id:
+                return CannedResponse.objects.select_related('group', 'created_by').filter(
+                    Q(group_id=group_id) | Q(group__isnull=True)
+                )
+        except Exception:
+            pass
+        return CannedResponse.objects.select_related('group', 'created_by').filter(group__isnull=True)
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        group_id = None
+        if not user.is_staff:
+            try:
+                group_id = user.profile.group_id
+            except Exception:
+                pass
+        serializer.save(created_by=user, group_id=group_id)
+
+    def get_permissions(self):
+        if self.action in ('destroy',):
+            return [IsAuthenticated(), IsAdminUser()]
+        return [IsAuthenticated()]
+
+
+# ── Agent Presence ────────────────────────────────────────────────────────
+
+
+PRESENCE_REDIS_PREFIX = 'agent:presence'
+PRESENCE_TTL = 70
+
+
+def _get_presence_redis_key(user_id):
+    return f'{PRESENCE_REDIS_PREFIX}:{user_id}'
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def presence_heartbeat(request):
+    """Update agent presence: refresh Redis TTL, update DB on status change."""
+    status_value = request.data.get('status', 'online')
+    if status_value not in ('online', 'away', 'offline'):
+        status_value = 'online'
+
+    redis = get_sync_redis()
+    try:
+        key = _get_presence_redis_key(request.user.id)
+        redis.setex(key, PRESENCE_TTL, status_value)
+    except Exception:
+        logger.exception("Presence heartbeat Redis error")
+
+    if status_value == 'offline':
+        AgentPresence.objects.update_or_create(
+            user=request.user,
+            defaults={'status': 'offline'},
+        )
+    else:
+        AgentPresence.objects.update_or_create(
+            user=request.user,
+            defaults={'status': status_value, 'heartbeat_interval': 30},
+        )
+
+    # Publish presence update via SSE
+    from .realtime import publish
+    publish({
+        'type': 'presence.update',
+        'user_id': request.user.id,
+        'username': request.user.username,
+        'status': status_value,
+    })
+
+    return JsonResponse({'status': 'ok'})
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def presence_list(request):
+    """List all agents in the user's group with their presence status."""
+    user = request.user
+    redis = get_sync_redis()
+
+    # Get all presence keys from Redis
+    presences = {}
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = redis.scan(cursor, match=f'{PRESENCE_REDIS_PREFIX}:*')
+            for key in keys:
+                try:
+                    uid = int(key.split(':')[-1])
+                    status_val = redis.get(key)
+                    if status_val:
+                        presences[uid] = status_val.decode() if isinstance(status_val, bytes) else status_val
+                except (ValueError, TypeError):
+                    pass
+            if cursor == 0:
+                break
+    except Exception:
+        logger.exception("Presence list Redis error")
+
+    # Query users — staff sees all, non-staff sees own group
+    from django.contrib.auth.models import User
+    users_qs = User.objects.select_related('profile__group', 'presence')
+    if not user.is_staff:
+        try:
+            group_id = user.profile.group_id
+            users_qs = users_qs.filter(profile__group_id=group_id)
+        except Exception:
+            users_qs = users_qs.filter(pk=user.pk)
+
+    results = []
+    for u in users_qs:
+        status = presences.get(u.id, 'offline')
+        last_seen = None
+        try:
+            if hasattr(u, 'presence') and u.presence:
+                last_seen = u.presence.last_seen
+        except Exception:
+            pass
+        results.append({
+            'user_id': u.id,
+            'username': u.username,
+            'first_name': u.first_name,
+            'status': status,
+            'last_seen': last_seen,
+        })
+
+    return JsonResponse(results, safe=False)
+
+
+# ── Push Subscriptions ───────────────────────────────────────────────────
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def push_subscribe(request):
+    """Create or update a push notification subscription."""
+    endpoint = request.data.get('endpoint', '').strip()
+    p256dh = request.data.get('keys', {}).get('p256dh', '')
+    auth = request.data.get('keys', {}).get('auth', '')
+    browser = request.data.get('browser', '')
+
+    if not endpoint or not p256dh or not auth:
+        return JsonResponse({'error': 'endpoint, keys.p256dh, and keys.auth are required'}, status=400)
+
+    PushSubscription.objects.update_or_create(
+        user=request.user,
+        endpoint=endpoint,
+        defaults={'p256dh': p256dh, 'auth': auth, 'browser': browser},
+    )
+    return JsonResponse({'status': 'subscribed'})
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def push_unsubscribe(request):
+    """Remove a push notification subscription."""
+    endpoint = request.data.get('endpoint', '')
+    if endpoint:
+        PushSubscription.objects.filter(user=request.user, endpoint=endpoint).delete()
+    else:
+        PushSubscription.objects.filter(user=request.user).delete()
+    return JsonResponse({'status': 'unsubscribed'})
+
+
 # ── Template webhook handlers ─────────────────────────────────────────────
 
 
@@ -1736,7 +2154,8 @@ def _publish_call_event(call, event_type):
             'type': f'call.{event_type}',
             'call': _serialize_call_for_sse(call),
         }
-        publish(payload)
+        group_id = call.conversation.group_id if call.conversation_id else None
+        publish(payload, group_id=group_id)
     except Exception:
         logger.exception("Failed to publish call SSE event type=%s", event_type)
 
@@ -1984,6 +2403,28 @@ def whatsapp_webhook(request):
 
             for status_event in statuses:
                 _handle_call_status_webhook(status_event, value.get('metadata', {}))
+                # Handle typing indicator
+                s = status_event.get('status', '')
+                if s == 'typing':
+                    try:
+                        conv_id = status_event.get('conversation', {}).get('id')
+                        if conv_id:
+                            conv = Conversation.objects.filter(whatsapp_id=conv_id).first()
+                            if conv:
+                                redis = get_sync_redis()
+                                typing_key = f'typing:{conv.id}'
+                                try:
+                                    redis.setex(typing_key, 8, '1')
+                                except Exception:
+                                    pass
+                                from .realtime import publish
+                                publish({
+                                    'type': 'conversation.typing',
+                                    'conversation_id': conv.id,
+                                    'typing': True,
+                                }, group_id=conv.group_id)
+                    except Exception:
+                        logger.exception("Error handling typing indicator")
 
             if not messages:
                 return JsonResponse({'status': 'no_message'}, status=200)
@@ -2294,7 +2735,7 @@ async def realtime_events(request):
     except SSEToken.DoesNotExist:
         return HttpResponse(status=401)
 
-    subscriber_id, event_queue, _, _ = await subscribe()
+    subscriber_id, event_queue, _, _ = await subscribe(user=sse_token.user)
 
     async def event_stream():
         try:
@@ -2767,6 +3208,14 @@ def call_list(request):
 
     user = request.user
     if not user.is_staff:
+        try:
+            profile = user.profile
+            if profile and profile.group_id:
+                qs = qs.filter(conversation__group_id=profile.group_id)
+            else:
+                qs = qs.none()
+        except Exception:
+            qs = qs.none()
         other_human_takes = ConversationTake.objects.filter(
             conversation=OuterRef('conversation'),
             expires_at__gt=timezone.now(),
@@ -2807,6 +3256,14 @@ def call_active(request):
 
     user = request.user
     if not user.is_staff:
+        try:
+            profile = user.profile
+            if profile and profile.group_id:
+                qs = qs.filter(conversation__group_id=profile.group_id)
+            else:
+                qs = qs.none()
+        except Exception:
+            qs = qs.none()
         other_human_takes = ConversationTake.objects.filter(
             conversation=OuterRef('conversation'),
             expires_at__gt=timezone.now(),
@@ -2952,3 +3409,92 @@ def call_settings(request):
             {'error': f"HTTP {e.code}: {err_body[:300]}"},
             status=e.code,
         )
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def export_conversations_csv(request):
+    status_filter = request.query_params.get('status', 'active')
+    if status_filter not in ('active', 'resolved', 'archived'):
+        return JsonResponse({'error': 'Invalid status filter'}, status=400)
+
+    qs = Conversation.objects.select_related('group').prefetch_related(
+        'takes', 'tags', 'notes',
+    )
+
+    if not request.user.is_staff:
+        try:
+            profile = request.user.profile
+            if profile and profile.group_id:
+                qs = qs.filter(group_id=profile.group_id)
+            else:
+                qs = qs.none()
+        except Exception:
+            qs = qs.none()
+        other_human_takes = ConversationTake.objects.filter(
+            conversation=OuterRef('id'),
+            expires_at__gt=timezone.now(),
+        ).exclude(created_by__isnull=True).exclude(created_by=request.user).exclude(
+            created_by__username='bot'
+        )
+        qs = qs.annotate(
+            _has_other_human_take=Exists(other_human_takes)
+        ).filter(_has_other_human_take=False)
+
+    qs = qs.filter(status=status_filter).order_by('-last_message_at')
+
+    def stream():
+        import io
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow([
+            'ID', 'Contacto', 'Teléfono', 'Último mensaje',
+            'Fecha último mensaje', 'Estado', 'Agente',
+            'Tags', 'Notas', 'Creado', 'Actualizado',
+        ])
+        yield buffer.getvalue().encode('utf-8-sig')
+        buffer.truncate(0)
+        buffer.seek(0)
+
+        for conv in qs.iterator(chunk_size=200):
+            now = timezone.now()
+            active_take = None
+            for t in conv.takes.all():
+                if t.expires_at and t.expires_at > now:
+                    active_take = t
+                    break
+
+            agent_name = ''
+            if active_take and active_take.created_by:
+                agent_name = active_take.created_by.get_full_name() or active_take.created_by.username
+
+            tag_names = ', '.join(
+                t.tag_name for t in conv.tags.all()
+                if t.expires_at is None or t.expires_at > now
+            )
+            note_contents = ' | '.join(
+                n.content[:100] for n in conv.notes.all()
+                if n.expires_at is None or n.expires_at > now
+            )
+
+            writer.writerow([
+                conv.id,
+                conv.custom_name or conv.contact_name or '',
+                conv.contact_phone or '',
+                conv.last_message or '',
+                conv.last_message_at.isoformat() if conv.last_message_at else '',
+                conv.get_status_display() if hasattr(conv, 'get_status_display') else conv.status,
+                agent_name,
+                tag_names,
+                note_contents,
+                conv.created_at.isoformat() if conv.created_at else '',
+                conv.updated_at.isoformat() if conv.updated_at else '',
+            ])
+            yield buffer.getvalue().encode('utf-8-sig')
+            buffer.truncate(0)
+            buffer.seek(0)
+
+    response = StreamingHttpResponse(stream(), content_type='text/csv; charset=utf-8')
+    response['Content-Disposition'] = f'attachment; filename="conversaciones_{status_filter}_{timezone.now().strftime("%Y%m%d")}.csv"'
+    return response

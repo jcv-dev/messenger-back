@@ -181,6 +181,11 @@ TURN_SERVER_CREDENTIAL = config('TURN_SERVER_CREDENTIAL', default='')
 # Message retention in minutes — messages and their media files older than this are deleted
 MESSAGE_RETENTION_MINUTES = config('MESSAGE_RETENTION_MINUTES', default=0, cast=int)
 
+# Web Push (VAPID) for browser push notifications
+VAPID_PRIVATE_KEY = config('VAPID_PRIVATE_KEY', default='')
+VAPID_PUBLIC_KEY = config('VAPID_PUBLIC_KEY', default='')
+VAPID_CLAIMS_EMAIL = config('VAPID_CLAIMS_EMAIL', default='admin@domi.app')
+
 REDIS_URL = config('REDIS_URL', default='redis://localhost:6379/0')
 
 if REDIS_URL:

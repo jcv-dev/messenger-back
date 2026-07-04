@@ -18,13 +18,9 @@ from api.admin import admin_call_settings
 def health_check(request):
     return HttpResponse("ok")
 
-@api_view(['GET'])
-@authentication_classes([TokenAuthentication])
-@permission_classes([IsAdminUser])
-def bot_status(request):
+def _read_bot_metrics():
+    """Read raw metrics from Redis. Returns (metrics, series, first_minute, bucket_count)."""
     import time as _time
-    from api.bot.lock import _LOCK_TTL
-    from api.bot.limits import _WINDOW
     from api.redis_client import get_sync_redis
 
     METRIC_NAMES = [
@@ -82,6 +78,50 @@ def bot_status(request):
         for name in METRIC_NAMES:
             series[name] = [0] * bucket_count
             metrics[name] = 0
+
+    return metrics, series, first_minute, bucket_count
+
+
+def _compute_non_staff_bot_status(metrics, series):
+    """Compute aggregate bot status for non-staff users (no config secrets, no time-series)."""
+    processed = metrics.get('messages.processed', 0)
+    succeeded = metrics.get('tool_calls.succeeded', 0)
+    failed = metrics.get('tool_calls.failed', 0)
+    total_tools = succeeded + failed
+    completion_rate = round((succeeded / total_tools * 100) if total_tools > 0 else 0, 1)
+    escalations = metrics.get('escalations', 0)
+    crashes = metrics.get('loop.crashes', 0)
+    uptime_seconds = 86400 if crashes == 0 else max(0, 86400 - crashes * 300)
+
+    handler_breakdown = {
+        'completadas': succeeded,
+        'fallidas': failed,
+        'cancelaciones': metrics.get('cancellations', 0),
+        'rate_limited': metrics.get('messages.rate_limited', 0),
+    }
+
+    return {
+        'healthy': True,
+        'messages_processed_today': processed,
+        'conversations_handled_today': metrics.get('locks.acquired', 0),
+        'completion_rate': completion_rate,
+        'escalations_today': escalations,
+        'uptime_seconds': uptime_seconds,
+        'handler_breakdown': handler_breakdown,
+    }
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def bot_status(request):
+    from api.bot.lock import _LOCK_TTL
+    from api.bot.limits import _WINDOW
+
+    metrics, series, first_minute, bucket_count = _read_bot_metrics()
+
+    if not request.user.is_staff:
+        return JsonResponse(_compute_non_staff_bot_status(metrics, series))
 
     return JsonResponse({
         "healthy": True,

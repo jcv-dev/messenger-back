@@ -8,7 +8,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -241,6 +241,7 @@ class ConversationSerializer(serializers.ModelSerializer):
             'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
             'last_message_at', 'status', 'resolved_by_bot', 'tags', 'active_tags', 'notes',
             'active_notes', 'active_take', 'unread_count', 'group',
+            'is_pinned', 'pinned_at',
             'created_at', 'updated_at'
         ]
 
@@ -283,6 +284,7 @@ class ConversationListSerializer(serializers.ModelSerializer):
             'id', 'whatsapp_id', 'contact_name', 'contact_phone', 'whatsapp_username', 'custom_name', 'last_message',
             'last_message_at', 'status', 'resolved_by_bot', 'active_tags', 'active_take', 'unread_count', 'created_at',
             'last_message_sender', 'last_message_direction', 'group',
+            'is_pinned', 'pinned_at',
         ]
 
     def get_active_take(self, obj):
@@ -358,6 +360,16 @@ class InitiateConversationSerializer(serializers.Serializer):
         return cleaned
 
 
+class SetGroupSerializer(serializers.Serializer):
+    group_id = serializers.IntegerField()
+
+    def validate_group_id(self, value):
+        from .models import CityGroup
+        if not CityGroup.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError("Group does not exist or is inactive.")
+        return value
+
+
 class BotExemptContactSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
 
@@ -428,6 +440,25 @@ class WhatsAppTemplateSerializer(serializers.ModelSerializer):
         return value
 
 
+class AuditLogSerializer(serializers.ModelSerializer):
+    actor_username = serializers.CharField(source='actor.username', read_only=True)
+    action_display = serializers.CharField(source='get_action_display', read_only=True)
+
+    class Meta:
+        model = AuditLog
+        fields = ['id', 'actor', 'actor_username', 'conversation', 'action', 'action_display', 'detail', 'created_at']
+
+
+class CannedResponseSerializer(serializers.ModelSerializer):
+    group_name = serializers.CharField(source='group.name', read_only=True)
+    created_by_username = serializers.CharField(source='created_by.username', read_only=True)
+
+    class Meta:
+        model = CannedResponse
+        fields = ['id', 'title', 'content', 'category', 'group', 'group_name', 'created_by', 'created_by_username', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_by', 'created_at', 'updated_at']
+
+
 class SendTemplateSerializer(serializers.Serializer):
     template_id = serializers.IntegerField()
     parameters = serializers.JSONField(required=False, default=dict)
@@ -479,3 +510,28 @@ class CallSerializer(serializers.ModelSerializer):
 
     def get_contact_name(self, obj):
         return obj.conversation.contact_name
+
+
+class AgentPresenceSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source='user.username', read_only=True)
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+
+    class Meta:
+        model = AgentPresence
+        fields = ['id', 'user', 'username', 'first_name', 'status', 'last_seen', 'heartbeat_interval']
+
+
+class PushSubscriptionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PushSubscription
+        fields = ['id', 'endpoint', 'p256dh', 'auth', 'browser', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
+class MessageSearchSerializer(serializers.Serializer):
+    message_id = serializers.IntegerField()
+    conversation_id = serializers.IntegerField()
+    contact_name = serializers.CharField()
+    snippet = serializers.CharField()
+    created_at = serializers.DateTimeField()
+    rank = serializers.FloatField()

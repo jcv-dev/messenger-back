@@ -10,6 +10,8 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
 from datetime import timedelta
+from django.contrib.postgres.search import SearchVectorField
+from django.contrib.postgres.indexes import GinIndex
 
 
 EXPIRY_CHOICES = [
@@ -91,6 +93,8 @@ class Conversation(models.Model):
         default='active'
     )
     resolved_by_bot = models.BooleanField(default=False)
+    is_pinned = models.BooleanField(default=False, db_index=True)
+    pinned_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -99,10 +103,11 @@ class Conversation(models.Model):
         return f"{self.contact_name} ({contact_id})"
 
     class Meta:
-        ordering = ['-last_message_at', '-created_at']
+        ordering = ['-is_pinned', 'pinned_at', '-last_message_at', '-created_at']
         indexes = [
             models.Index(fields=['status', 'last_message_at'], name='conv_status_lastmsg_idx'),
             models.Index(fields=['whatsapp_id'], name='conv_waid_idx'),
+            models.Index(fields=['is_pinned', 'pinned_at'], name='conv_pin_idx'),
         ]
 
 
@@ -124,6 +129,7 @@ class Message(models.Model):
     metadata = models.JSONField(null=True, blank=True, default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
+    search_vector = SearchVectorField(null=True, blank=True)
     context_message = models.ForeignKey(
         'self', on_delete=models.SET_NULL, null=True, blank=True,
         related_name='replies'
@@ -137,6 +143,7 @@ class Message(models.Model):
         indexes = [
             models.Index(fields=['conversation', 'created_at'], name='msg_conv_created_idx'),
             models.Index(fields=['conversation', 'is_read', 'direction'], name='msg_unread_idx'),
+            GinIndex(fields=['search_vector'], name='msg_search_gin_idx'),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -277,6 +284,54 @@ class SSEToken(models.Model):
 
     def is_valid(self):
         return not self.used and self.expires_at > timezone.now()
+
+
+class AuditLog(models.Model):
+    """Security-relevant action log."""
+    ACTION_CHOICES = [
+        ('take', 'Take'),
+        ('release', 'Release'),
+        ('pin', 'Pin'),
+        ('unpin', 'Unpin'),
+        ('send_message', 'Send Message'),
+        ('delete_conversation', 'Delete Conversation'),
+        ('toggle_status', 'Toggle Status'),
+    ]
+
+    actor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='audit_logs')
+    conversation = models.ForeignKey(Conversation, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
+    action = models.CharField(max_length=32, choices=ACTION_CHOICES)
+    detail = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    def __str__(self):
+        return f"{self.actor.username} {self.action} {self.conversation_id or '—'}"
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['actor', 'created_at'], name='audit_actor_created_idx'),
+            models.Index(fields=['conversation', 'created_at'], name='audit_conv_created_idx'),
+        ]
+
+
+class CannedResponse(models.Model):
+    """Pre-written responses for quick insertion by agents."""
+    title = models.CharField(max_length=120)
+    content = models.TextField()
+    category = models.CharField(max_length=60, blank=True, default='')
+    group = models.ForeignKey(CityGroup, on_delete=models.CASCADE, null=True, blank=True, related_name='canned_responses')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='canned_responses')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.title
+
+    class Meta:
+        ordering = ['category', 'title']
+        verbose_name = "Canned Response"
+        verbose_name_plural = "Canned Responses"
 
 
 class BotExemptContact(models.Model):
@@ -454,3 +509,44 @@ class WhatsAppTemplate(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.language}) — {self.status}"
+
+
+class AgentPresence(models.Model):
+    """Tracks agent online/away/offline status with heartbeat interval."""
+    STATUS_CHOICES = [
+        ('online', 'Online'),
+        ('away', 'Away'),
+        ('offline', 'Offline'),
+    ]
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='presence')
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='offline')
+    last_seen = models.DateTimeField(auto_now=True)
+    heartbeat_interval = models.PositiveSmallIntegerField(default=30)
+
+    def __str__(self):
+        return f"{self.user.username} — {self.status}"
+
+    class Meta:
+        ordering = ['user__username']
+        verbose_name = "Agent Presence"
+        verbose_name_plural = "Agent Presences"
+
+
+class PushSubscription(models.Model):
+    """Web Push subscription for browser push notifications."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_subscriptions')
+    endpoint = models.URLField(max_length=512)
+    p256dh = models.CharField(max_length=256)
+    auth = models.CharField(max_length=128)
+    browser = models.CharField(max_length=64, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('user', 'endpoint')]
+        ordering = ['-created_at']
+        verbose_name = "Push Subscription"
+        verbose_name_plural = "Push Subscriptions"
+
+    def __str__(self):
+        return f"{self.user.username} — {self.browser or 'desconocido'}"
