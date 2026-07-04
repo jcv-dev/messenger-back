@@ -16,7 +16,7 @@ from django.views.decorators.cache import cache_page
 from django.db import transaction
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timezone as dt_timezone, timedelta
 from django.shortcuts import get_object_or_404
 from django.db.models import Exists, OuterRef, Subquery, Q, Count, Prefetch
 from django.core.signing import BadSignature
@@ -2858,8 +2858,8 @@ def call_recordings(request):
 
         take = ConversationTake.objects.filter(
             conversation=call.conversation,
-            created_at__lte=call.start_time or call.created_at,
-            expires_at__gt=call.start_time or call.created_at,
+            created_at__lte=call.end_time or call.start_time or call.created_at + timedelta(minutes=5),
+            expires_at__gt=call.created_at - timedelta(minutes=5),
         ).order_by('-created_at').first()
 
         data.append({
