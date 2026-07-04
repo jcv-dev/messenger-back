@@ -2594,6 +2594,15 @@ def call_answer(request):
             logger.info("call_answer %s: recording NOT enabled (config false/missing)", call_id)
         call.save()
 
+        ConversationTake.objects.update_or_create(
+            conversation=call.conversation,
+            created_by=request.user,
+            defaults={
+                'expires_at': timezone.now() + timedelta(minutes=30),
+                'duration_minutes': 30,
+            },
+        )
+
         pre_accept_call(call_id, sdp)
         accept_call(call_id, sdp, recording=recording)
 
@@ -2723,6 +2732,15 @@ def call_initiate(request):
             recording_announcement_language=(
                 recording.get('announcement_language') if recording else None
             ),
+        )
+
+        ConversationTake.objects.update_or_create(
+            conversation=conversation,
+            created_by=request.user,
+            defaults={
+                'expires_at': timezone.now() + timedelta(minutes=30),
+                'duration_minutes': 30,
+            },
         )
 
         _publish_call_event(call, 'outgoing_pending')
@@ -2858,8 +2876,8 @@ def call_recordings(request):
 
         take = ConversationTake.objects.filter(
             conversation=call.conversation,
-            created_at__lte=call.end_time or call.start_time or call.created_at + timedelta(minutes=5),
-            expires_at__gt=call.created_at - timedelta(minutes=5),
+        ).exclude(
+            created_by__username='bot',
         ).order_by('-created_at').first()
 
         data.append({
