@@ -2826,7 +2826,9 @@ def call_recordings(request):
     limit = int(request.query_params.get('limit', 50))
     limit = min(limit, 100)
 
-    qs = Call.objects.filter(recording_local_path__isnull=False).select_related('conversation')
+    qs = Call.objects.filter(
+        recording_status='ENABLED'
+    ).select_related('conversation')
 
     if before:
         qs = qs.filter(id__lt=int(before))
@@ -2839,6 +2841,7 @@ def call_recordings(request):
     data = []
     for call in results:
         recording_url = call.recording_local_path or ''
+        has_recording = bool(recording_url)
         if recording_url.startswith('/media/'):
             recording_url = sign_media_url(recording_url)
 
@@ -2860,6 +2863,7 @@ def call_recordings(request):
             'client_phone': call.conversation.contact_phone,
             'agent_name': take.created_by.username if take and take.created_by else None,
             'recording_url': recording_url,
+            'has_recording': has_recording,
         })
 
     cursor = results[-1].id if results else None
