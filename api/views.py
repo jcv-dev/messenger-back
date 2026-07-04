@@ -2791,7 +2791,7 @@ def call_turn_config(request):
 
 @api_view(['GET', 'POST'])
 @authentication_classes([TokenAuthentication])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsAdminUser])
 def call_settings(request):
     phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
     token = settings.WHATSAPP_API_TOKEN

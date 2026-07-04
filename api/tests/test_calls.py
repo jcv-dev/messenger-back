@@ -517,7 +517,7 @@ class HandleCallStatusWebhookTests(TestCase):
 @override_settings(CACHES=_LOCMEM_CACHES)
 class CallEndpointTests(TestCase):
     def setUp(self):
-        self.user = User.objects.create_user(username="agent", password="test123")
+        self.user = User.objects.create_user(username="agent", password="test123", is_staff=True)
         self.token = Token.objects.create(user=self.user)
         self.client = APIClient()
         self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.token.key}")
