@@ -2556,7 +2556,7 @@ def _get_recording_config():
         from .models import BotConfig
         cfg = BotConfig.objects.filter(key='call_recording_enabled').first()
         if cfg and cfg.value:
-            return {"status": "ENABLED", "purpose": "quality assurance", "announcement_language": "es"}
+            return {"status": "ENABLED", "purpose": "seguridad y calidad", "announcement_language": "es"}
     except Exception:
         pass
     return None
