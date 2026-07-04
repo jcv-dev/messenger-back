@@ -79,7 +79,7 @@ def _read_bot_metrics():
             series[name] = [0] * bucket_count
             metrics[name] = 0
 
-    return metrics, series, first_minute, bucket_count
+    return metrics, series, first_minute, last_minute, bucket_count
 
 
 def _compute_non_staff_bot_status(metrics, series):
@@ -118,7 +118,7 @@ def bot_status(request):
     from api.bot.lock import _LOCK_TTL
     from api.bot.limits import _WINDOW
 
-    metrics, series, first_minute, bucket_count = _read_bot_metrics()
+    metrics, series, first_minute, last_minute, bucket_count = _read_bot_metrics()
 
     if not request.user.is_staff:
         return JsonResponse(_compute_non_staff_bot_status(metrics, series))

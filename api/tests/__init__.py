@@ -3178,7 +3178,7 @@ class BotStatusNonAdminTests(APITestCase):
             {'messages.processed': 100, 'locks.acquired': 20, 'tool_calls.succeeded': 15,
              'tool_calls.failed': 3, 'escalations': 5, 'cancellations': 2,
              'messages.rate_limited': 1, 'loop.crashes': 0},
-            {}, 0, 0,
+            {}, 0, 86400, 1440,
         )
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.non_admin_token.key}')
         response = self.client.get('/api/bot/status/')
@@ -3198,7 +3198,7 @@ class BotStatusNonAdminTests(APITestCase):
             {'messages.processed': 0, 'locks.acquired': 0, 'tool_calls.succeeded': 0,
              'tool_calls.failed': 0, 'escalations': 0, 'cancellations': 0,
              'messages.rate_limited': 0, 'loop.crashes': 0},
-            {}, 0, 0,
+            {}, 0, 86400, 1440,
         )
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.non_admin_token.key}')
         response = self.client.get('/api/bot/status/')
@@ -3210,7 +3210,7 @@ class BotStatusNonAdminTests(APITestCase):
             {'messages.processed': 100, 'locks.acquired': 20, 'tool_calls.succeeded': 15,
              'tool_calls.failed': 3, 'escalations': 5, 'cancellations': 2,
              'messages.rate_limited': 1, 'loop.crashes': 0},
-            {'messages.processed': [1]}, 1000, 1,
+            {'messages.processed': [1]}, 1000, 86400, 1440,
         )
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
         response = self.client.get('/api/bot/status/')

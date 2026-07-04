@@ -19,6 +19,7 @@ router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
 router.register(r'canned-responses', CannedResponseViewSet, basename='canned-response')
 
 urlpatterns = [
+    path('conversations/export/', export_conversations_csv, name='conversations-export'),
     path('', include(router.urls)),
     path('sse-token/', issue_sse_token, name='issue-sse-token'),
     path('media-proxy/', media_proxy, name='media-proxy'),
@@ -37,5 +38,4 @@ urlpatterns = [
     path('presence/', presence_list, name='presence-list'),
     path('push-subscribe/', push_subscribe, name='push-subscribe'),
     path('push-unsubscribe/', push_unsubscribe, name='push-unsubscribe'),
-    path('conversations/export/', export_conversations_csv, name='conversations-export'),
 ]
