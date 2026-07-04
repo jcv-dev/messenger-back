@@ -1835,8 +1835,10 @@ def _handle_call_webhook(call_event, metadata, contacts):
         _publish_call_event(call, 'terminated')
 
     elif event_type == 'call_recording_available':
+        logger.info("call_recording_available webhook received for call %s", call_id)
         call = Call.objects.filter(call_id=call_id).first()
         if not call:
+            logger.warning("call_recording_available: Call %s not found in DB", call_id)
             return
 
         rec = call_event.get('call_recording', {})
@@ -1846,6 +1848,7 @@ def _handle_call_webhook(call_event, metadata, contacts):
         call.recording_audio_sha256 = audio.get('sha256')
         call.recording_audio_mime_type = audio.get('mime_type')
         call.save()
+        logger.info("call_recording_available: metadata saved for call %s", call_id)
         _publish_call_event(call, 'recording_available')
 
         cdn_url = audio.get('url')
@@ -2586,6 +2589,9 @@ def call_answer(request):
             call.recording_status = recording.get('status')
             call.recording_purpose = recording.get('purpose')
             call.recording_announcement_language = recording.get('announcement_language')
+            logger.info("call_answer %s: recording ENABLED (config)", call_id)
+        else:
+            logger.info("call_answer %s: recording NOT enabled (config false/missing)", call_id)
         call.save()
 
         pre_accept_call(call_id, sdp)
@@ -2660,6 +2666,11 @@ def call_initiate(request):
     recipient = request.data.get('recipient')
     sdp = request.data.get('sdp')
     recording = _get_recording_config()
+
+    if recording:
+        logger.info("call_initiate: recording ENABLED (config)")
+    else:
+        logger.info("call_initiate: recording NOT enabled (config false/missing)")
 
     if not to_number and not recipient:
         return JsonResponse({'error': 'to or recipient required'}, status=400)
