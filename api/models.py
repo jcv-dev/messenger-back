@@ -415,6 +415,7 @@ class Call(models.Model):
     recording_audio_url = models.URLField(max_length=1024, null=True, blank=True)
     recording_audio_sha256 = models.CharField(max_length=255, null=True, blank=True)
     recording_audio_mime_type = models.CharField(max_length=100, null=True, blank=True)
+    recording_local_path = models.CharField(max_length=1024, null=True, blank=True)
     sdp_offer = models.TextField(null=True, blank=True)
     sdp_answer = models.TextField(null=True, blank=True)
     error_code = models.IntegerField(null=True, blank=True)

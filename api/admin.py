@@ -92,7 +92,7 @@ class CallAdmin(admin.ModelAdmin):
         'recording_status', 'recording_purpose',
         'recording_announcement_language',
         'recording_audio_id', 'recording_audio_url',
-        'recording_audio_sha256', 'recording_audio_mime_type',
+        'recording_audio_sha256', 'recording_audio_mime_type', 'recording_local_path',
         'sdp_offer', 'sdp_answer',
         'error_code', 'error_message',
         'created_at', 'updated_at',

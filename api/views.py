@@ -1848,6 +1848,25 @@ def _handle_call_webhook(call_event, metadata, contacts):
         call.save()
         _publish_call_event(call, 'recording_available')
 
+        cdn_url = audio.get('url')
+        if cdn_url and settings.WHATSAPP_API_TOKEN:
+            try:
+                token = settings.WHATSAPP_API_TOKEN
+                req = urllib.request.Request(cdn_url, headers={'Authorization': f'Bearer {token}'})
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    raw = resp.read()
+                ext = '.ogg'
+                filename = f"{uuid.uuid4().hex}{ext}"
+                local_dir = os.path.join(settings.MEDIA_ROOT, 'recordings')
+                os.makedirs(local_dir, exist_ok=True)
+                local_path = os.path.join(local_dir, filename)
+                with open(local_path, 'wb') as f:
+                    f.write(raw)
+                call.recording_local_path = f"{settings.MEDIA_URL}recordings/{filename}"
+                call.save(update_fields=['recording_local_path'])
+            except Exception as e:
+                logger.error("Failed to download call recording %s: %s", call_id, e)
+
 
 def _handle_call_status_webhook(status_event, metadata):
     call_id = status_event.get('id')
@@ -2529,13 +2548,23 @@ def static_map(request):
 
 # --- Call REST endpoints ---
 
+def _get_recording_config():
+    try:
+        from .models import BotConfig
+        cfg = BotConfig.objects.filter(key='call_recording_enabled').first()
+        if cfg and cfg.value:
+            return {"status": "ENABLED", "purpose": "quality assurance", "announcement_language": "es"}
+    except Exception:
+        pass
+    return None
+
+
 @api_view(['POST'])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
 def call_answer(request):
     call_id = request.data.get('call_id')
     sdp = request.data.get('sdp')
-    recording = request.data.get('recording')
 
     if not call_id or not sdp:
         return JsonResponse({'error': 'call_id and sdp required'}, status=400)
@@ -2547,6 +2576,8 @@ def call_answer(request):
             {'error': 'Call already answered or terminated'},
             status=409,
         )
+
+    recording = _get_recording_config()
 
     try:
         call.sdp_answer = sdp
@@ -2628,7 +2659,7 @@ def call_initiate(request):
     to_number = request.data.get('to')
     recipient = request.data.get('recipient')
     sdp = request.data.get('sdp')
-    recording = request.data.get('recording')
+    recording = _get_recording_config()
 
     if not to_number and not recipient:
         return JsonResponse({'error': 'to or recipient required'}, status=400)
@@ -2785,6 +2816,59 @@ def call_turn_config(request):
         })
 
     return JsonResponse({"iceServers": ice_servers})
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated, IsAdminUser])
+def call_recordings(request):
+    before = request.query_params.get('before')
+    limit = int(request.query_params.get('limit', 50))
+    limit = min(limit, 100)
+
+    qs = Call.objects.filter(recording_local_path__isnull=False).select_related('conversation')
+
+    if before:
+        qs = qs.filter(id__lt=int(before))
+
+    qs = qs.order_by('-id')[:limit + 1]
+
+    has_more = len(qs) > limit
+    results = qs[:limit]
+
+    data = []
+    for call in results:
+        recording_url = call.recording_local_path or ''
+        if recording_url.startswith('/media/'):
+            recording_url = sign_media_url(recording_url)
+
+        take = ConversationTake.objects.filter(
+            conversation=call.conversation,
+            created_at__lte=call.start_time or call.created_at,
+            expires_at__gt=call.start_time or call.created_at,
+        ).order_by('-created_at').first()
+
+        data.append({
+            'id': call.id,
+            'call_id': call.call_id,
+            'direction': call.direction,
+            'status': call.status,
+            'start_time': call.start_time,
+            'end_time': call.end_time,
+            'duration_seconds': call.duration_seconds,
+            'client_name': call.conversation.contact_name,
+            'client_phone': call.conversation.contact_phone,
+            'agent_name': take.created_by.username if take and take.created_by else None,
+            'recording_url': recording_url,
+        })
+
+    cursor = results[-1].id if results else None
+
+    return JsonResponse({
+        'results': data,
+        'cursor': cursor,
+        'has_more': has_more,
+    })
 
 
 @api_view(['GET', 'POST'])

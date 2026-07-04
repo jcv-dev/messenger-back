@@ -580,13 +580,11 @@ class CallEndpointTests(TestCase):
     @patch("api.views.accept_call")
     @patch("api.views._publish_call_event")
     def test_call_answer_with_recording(self, mock_publish, mock_accept, mock_pre_accept):
+        from api.models import BotConfig
+        BotConfig.objects.update_or_create(key='call_recording_enabled', defaults={'value': True})
         response = self.client.post(
             "/api/calls/answer/",
-            {
-                "call_id": "wacid_endpoint_1",
-                "sdp": "v=0\nanswer...",
-                "recording": {"status": "ENABLED", "purpose": "qa"},
-            },
+            {"call_id": "wacid_endpoint_1", "sdp": "v=0\nanswer..."},
             format="json",
         )
         self.assertEqual(response.status_code, 200)
