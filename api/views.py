@@ -2890,7 +2890,8 @@ def call_recordings(request):
             'duration_seconds': call.duration_seconds,
             'client_name': call.conversation.contact_name,
             'client_phone': call.conversation.contact_phone,
-            'agent_name': take.created_by.username if take and take.created_by else None,
+            'agent_username': take.created_by.username if take and take.created_by else None,
+            'agent_full_name': take.created_by.get_full_name() or take.created_by.first_name if take and take.created_by else None,
             'recording_url': recording_url,
             'has_recording': has_recording,
         })
