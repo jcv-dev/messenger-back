@@ -548,7 +548,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_permissions(self):
-        if self.action == 'destroy':
+        if self.action in ('destroy', 'remove_expired_tags', 'send_template'):
             return [IsAuthenticated(), IsAdminUser()]
         return super().get_permissions()
 
@@ -1093,8 +1093,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def send_template(self, request, pk=None):
         """Send a WhatsApp template to this conversation (admin only)."""
-        if not request.user.is_staff:
-            return Response({'error': 'Admin only'}, status=status.HTTP_403_FORBIDDEN)
 
         from .serializers import SendTemplateSerializer
         serializer = SendTemplateSerializer(data=request.data)
