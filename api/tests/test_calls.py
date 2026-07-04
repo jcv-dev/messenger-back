@@ -684,9 +684,81 @@ class CallEndpointTests(TestCase):
             data = response.json()
             self.assertEqual(len(data["iceServers"]), 1)
 
-    def test_call_settings_get(self):
+    @patch("api.views.urllib.request")
+    def test_call_settings_get(self, mock_request):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'{"calling": {"status": "ENABLED", "call_icon_visibility": "DEFAULT", "callback_permission_status": "ENABLED"}}'
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+
         response = self.client.get("/api/calls/settings/")
-        self.assertIn(response.status_code, (200, 401, 502))
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ENABLED")
+        self.assertEqual(data["call_icon_visibility"], "DEFAULT")
+        self.assertEqual(data["callback_permission_status"], "ENABLED")
+        mock_request.Request.assert_called_once()
+
+    @patch("api.views.urllib.request")
+    def test_call_settings_get_error(self, mock_request):
+        mock_request.urlopen.side_effect = __import__("urllib").error.HTTPError(
+            url="", code=400, msg="Bad Request", hdrs={}, fp=None,
+        )
+
+        response = self.client.get("/api/calls/settings/")
+        self.assertEqual(response.status_code, 400)
+        data = response.json()
+        self.assertIn("error", data)
+
+    @patch("api.views.urllib.request")
+    def test_call_settings_post(self, mock_request):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'{"success": true}'
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+
+        response = self.client.post(
+            "/api/calls/settings/",
+            {
+                "status": "ENABLED",
+                "call_icon_visibility": "DISABLE_ALL",
+                "callback_permission_status": "DISABLED",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["success"])
+
+        _args, kwargs = mock_request.Request.call_args
+        posted_body = json.loads(kwargs["data"].decode())
+
+        self.assertEqual(posted_body["calling"]["status"], "ENABLED")
+        self.assertEqual(posted_body["calling"]["call_icon_visibility"], "DISABLE_ALL")
+        self.assertEqual(posted_body["calling"]["callback_permission_status"], "DISABLED")
+
+    def test_call_settings_post_no_fields(self):
+        response = self.client.post(
+            "/api/calls/settings/",
+            {"unrelated": "value"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        data = response.json()
+        self.assertIn("error", data)
+
+    @patch("api.views.urllib.request")
+    def test_call_settings_post_error(self, mock_request):
+        mock_request.urlopen.side_effect = __import__("urllib").error.HTTPError(
+            url="", code=500, msg="Server Error", hdrs={}, fp=None,
+        )
+
+        response = self.client.post(
+            "/api/calls/settings/",
+            {"status": "ENABLED"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 500)
+        data = response.json()
+        self.assertIn("error", data)
 
 
 # ---------------------------------------------------------------------------

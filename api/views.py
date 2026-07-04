@@ -2795,18 +2795,19 @@ def call_turn_config(request):
 def call_settings(request):
     phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
     token = settings.WHATSAPP_API_TOKEN
+    base_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/settings"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
 
     if request.method == 'GET':
-        url = (
-            f"https://graph.facebook.com/v20.0/"
-            f"{phone_number_id}/whatsapp_business_profile"
-        )
-        headers = {"Authorization": f"Bearer {token}"}
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(base_url, headers=headers)
         try:
             with urllib.request.urlopen(req) as resp:
                 data = json.loads(resp.read().decode())
-            return JsonResponse(data.get('data', [{}])[0])
+            calling = data.get('calling', {})
+            return JsonResponse(calling)
         except urllib.error.HTTPError as e:
             err_body = e.read().decode() if hasattr(e, 'read') else ''
             return JsonResponse(
@@ -2814,32 +2815,23 @@ def call_settings(request):
                 status=e.code,
             )
 
-    show_button = request.data.get('show_call_button')
-    if show_button is not None:
-        url = (
-            f"https://graph.facebook.com/v20.0/"
-            f"{phone_number_id}/whatsapp_business_profile"
+    calling_data = {}
+    for field in ('status', 'call_icon_visibility', 'callback_permission_status'):
+        if field in request.data:
+            calling_data[field] = request.data[field]
+
+    if not calling_data:
+        return JsonResponse({'error': 'No valid fields provided'}, status=400)
+
+    payload = {"calling": calling_data}
+    body = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(base_url, data=body, headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return JsonResponse(json.loads(resp.read().decode()))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if hasattr(e, 'read') else ''
+        return JsonResponse(
+            {'error': f"HTTP {e.code}: {err_body[:300]}"},
+            status=e.code,
         )
-        payload = {
-            "messaging_product": "whatsapp",
-            "call_to_action": {
-                "button_type": "CALL_NOW" if show_button else "NONE",
-            },
-        }
-        body = json.dumps(payload).encode('utf-8')
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-        try:
-            with urllib.request.urlopen(req) as resp:
-                return JsonResponse(json.loads(resp.read().decode()))
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode() if hasattr(e, 'read') else ''
-            return JsonResponse(
-                {'error': f"HTTP {e.code}: {err_body[:300]}"},
-                status=e.code,
-            )
-
-    return JsonResponse({'error': 'No valid field provided'}, status=400)

@@ -2,7 +2,17 @@
 Admin configuration for API
 """
 from django.contrib import admin
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, UserProfile, BotExemptContact
+from django.contrib.admin.views.decorators import staff_member_required
+from django.shortcuts import render, redirect
+from django.urls import path
+from django.conf import settings
+from django.contrib import messages
+from django.http import HttpResponseNotAllowed
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, UserProfile, BotExemptContact, Call
+
+import json
+import urllib.request
+import urllib.error
 
 
 @admin.register(Conversation)
@@ -63,3 +73,97 @@ class UserProfileAdmin(admin.ModelAdmin):
 class BotExemptContactAdmin(admin.ModelAdmin):
     list_display = ['contact_phone', 'contact_name', 'created_by', 'created_at']
     search_fields = ['contact_phone', 'contact_name']
+
+
+@admin.register(Call)
+class CallAdmin(admin.ModelAdmin):
+    list_display = [
+        'call_id', 'conversation', 'direction', 'status',
+        'recording_status', 'start_time', 'end_time',
+        'duration_seconds', 'created_at',
+    ]
+    list_filter = ['direction', 'status', 'created_at']
+    search_fields = ['call_id', 'conversation__contact_name', 'conversation__contact_phone']
+    readonly_fields = [
+        'call_id', 'conversation', 'direction', 'status',
+        'from_number', 'to_number', 'recipient_bsuid',
+        'start_time', 'end_time', 'duration_seconds',
+        'biz_opaque_callback_data',
+        'recording_status', 'recording_purpose',
+        'recording_announcement_language',
+        'recording_audio_id', 'recording_audio_url',
+        'recording_audio_sha256', 'recording_audio_mime_type',
+        'sdp_offer', 'sdp_answer',
+        'error_code', 'error_message',
+        'created_at', 'updated_at',
+    ]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@staff_member_required
+def admin_call_settings(request):
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    token = settings.WHATSAPP_API_TOKEN
+    base_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/settings"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    if request.method == 'POST':
+        calling_data = {}
+        for field in ('status', 'call_icon_visibility', 'callback_permission_status'):
+            val = request.POST.get(field)
+            if val:
+                calling_data[field] = val
+
+        if calling_data:
+            payload = {"calling": calling_data}
+            body = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(base_url, data=body, headers=headers, method='POST')
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    resp_data = json.loads(resp.read().decode())
+                if resp_data.get('success'):
+                    messages.success(request, 'Call settings updated successfully.')
+                else:
+                    messages.warning(request, f"Meta API response: {resp_data}")
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode() if hasattr(e, 'read') else ''
+                messages.error(request, f"HTTP {e.code}: {err_body[:500]}")
+        return redirect('admin-call-settings')
+
+    if request.method != 'GET':
+        return HttpResponseNotAllowed(['GET', 'POST'])
+
+    current_settings = {}
+    api_error = None
+    req = urllib.request.Request(base_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+        current_settings = data.get('calling', {})
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if hasattr(e, 'read') else ''
+        api_error = f"HTTP {e.code}: {err_body[:500]}"
+    except Exception as e:
+        api_error = str(e)
+
+    context = {
+        **admin.site.each_context(request),
+        'title': 'Call Settings',
+        'current_settings': current_settings,
+        'api_error': api_error,
+        'phone_number_id': phone_number_id,
+        'opts': {
+            'app_label': 'api',
+            'model_name': 'call',
+            'verbose_name_plural': 'Call settings',
+        },
+    }
+    return render(request, 'admin/call_settings.html', context)

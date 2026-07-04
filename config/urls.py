@@ -13,6 +13,7 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.permissions import IsAdminUser
 from api.views import whatsapp_webhook, realtime_events
+from api.admin import admin_call_settings
 
 def health_check(request):
     return HttpResponse("ok")
@@ -119,4 +120,5 @@ urlpatterns = [
 ]
 
 if settings.DEBUG:
+    urlpatterns.append(path('manage/call-settings/', admin_call_settings, name='admin-call-settings'))
     urlpatterns.append(path('manage/', admin.site.urls))

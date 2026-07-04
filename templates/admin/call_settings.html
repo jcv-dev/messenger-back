@@ -1,0 +1,83 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+  .call-settings-form { max-width: 600px; }
+  .call-settings-form .form-row { padding: 10px 0; }
+  .call-settings-form label { font-weight: 600; display: block; margin-bottom: 4px; }
+  .call-settings-form select { width: 100%; }
+  .call-settings-form .help { font-size: 12px; color: #666; margin-top: 2px; }
+  .current-value { display: inline-block; margin-left: 8px; font-size: 12px; color: #447e9b; }
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label='api' %}">Api</a>
+  &rsaquo; {{ title }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+  <h1>{{ title }}</h1>
+
+  {% if api_error %}
+  <div class="errornote">{{ api_error }}</div>
+  {% endif %}
+
+  <div class="module" style="margin-top: 20px;">
+    <form class="call-settings-form" method="post">
+      {% csrf_token %}
+
+      <div class="form-row">
+        <label for="id_status">Calling status</label>
+        <select name="status" id="id_status">
+          <option value="ENABLED" {% if current_settings.status == "ENABLED" %}selected{% endif %}>ENABLED</option>
+          <option value="DISABLED" {% if current_settings.status == "DISABLED" %}selected{% endif %}>DISABLED</option>
+        </select>
+        <div class="help">Enable or disable calling on this phone number.</div>
+      </div>
+
+      <div class="form-row">
+        <label for="id_call_icon_visibility">Call icon visibility</label>
+        <select name="call_icon_visibility" id="id_call_icon_visibility">
+          <option value="DEFAULT" {% if current_settings.call_icon_visibility == "DEFAULT" %}selected{% endif %}>DEFAULT</option>
+          <option value="DISABLE_ALL" {% if current_settings.call_icon_visibility == "DISABLE_ALL" %}selected{% endif %}>DISABLE_ALL</option>
+        </select>
+        <div class="help">
+          DEFAULT — show call button in chat and profile.
+          DISABLE_ALL — hide the call button everywhere.
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label for="id_callback_permission_status">Callback permission</label>
+        <select name="callback_permission_status" id="id_callback_permission_status">
+          <option value="ENABLED" {% if current_settings.callback_permission_status == "ENABLED" %}selected{% endif %}>ENABLED</option>
+          <option value="DISABLED" {% if current_settings.callback_permission_status == "DISABLED" %}selected{% endif %}>DISABLED</option>
+        </select>
+        <div class="help">
+          Prompt WhatsApp users for call permission after they call your business.
+        </div>
+      </div>
+
+      <div class="submit-row" style="margin-top: 20px;">
+        <input type="submit" value="Save" class="default">
+      </div>
+    </form>
+  </div>
+
+  <div class="module" style="margin-top: 20px;">
+    <h2>Phone number</h2>
+    <p>Phone Number ID: <strong>{{ phone_number_id }}</strong></p>
+    {% if current_settings %}
+    <p>Raw settings from Meta API:</p>
+    <pre style="background:#f8f8f8; border:1px solid #ddd; padding:10px; overflow-x:auto;">{{ current_settings|pprint }}</pre>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
