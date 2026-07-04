@@ -378,6 +378,60 @@ TEMPLATE_QUALITY_CHOICES = [
 ]
 
 
+class Call(models.Model):
+    DIRECTION_CHOICES = [
+        ('inbound', 'Inbound'),
+        ('outbound', 'Outbound'),
+    ]
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('ringing', 'Ringing'),
+        ('connected', 'Connected'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('rejected', 'Rejected'),
+        ('missed', 'Missed'),
+    ]
+
+    call_id = models.CharField(max_length=255, unique=True)
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE, related_name='calls'
+    )
+    direction = models.CharField(max_length=20, choices=DIRECTION_CHOICES)
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='pending')
+    from_number = models.CharField(max_length=20)
+    to_number = models.CharField(max_length=20)
+    recipient_bsuid = models.CharField(max_length=255, null=True, blank=True)
+    start_time = models.DateTimeField(null=True, blank=True)
+    end_time = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.PositiveIntegerField(null=True, blank=True)
+    biz_opaque_callback_data = models.CharField(max_length=512, null=True, blank=True)
+    deeplink_payload = models.CharField(max_length=1024, null=True, blank=True)
+    cta_payload = models.CharField(max_length=1024, null=True, blank=True)
+    recording_status = models.CharField(max_length=20, null=True, blank=True)
+    recording_purpose = models.CharField(max_length=250, null=True, blank=True)
+    recording_announcement_language = models.CharField(max_length=20, null=True, blank=True)
+    recording_audio_id = models.CharField(max_length=255, null=True, blank=True)
+    recording_audio_url = models.URLField(max_length=1024, null=True, blank=True)
+    recording_audio_sha256 = models.CharField(max_length=255, null=True, blank=True)
+    recording_audio_mime_type = models.CharField(max_length=100, null=True, blank=True)
+    sdp_offer = models.TextField(null=True, blank=True)
+    sdp_answer = models.TextField(null=True, blank=True)
+    error_code = models.IntegerField(null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Call {self.call_id} ({self.direction}/{self.status})"
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['conversation', 'created_at']),
+        ]
+
+
 class WhatsAppTemplate(models.Model):
     """WhatsApp message template. Managed via admin UI and synced with Meta Graph API."""
     name = models.CharField(max_length=512)

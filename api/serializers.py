@@ -8,7 +8,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -468,3 +468,14 @@ class BulkSendTemplateSerializer(serializers.Serializer):
                     f"Choices: {', '.join(PARAMETER_SOURCE_CHOICES)}"
                 )
         return value
+
+
+class CallSerializer(serializers.ModelSerializer):
+    contact_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Call
+        fields = '__all__'
+
+    def get_contact_name(self, obj):
+        return obj.conversation.contact_name

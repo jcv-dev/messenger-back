@@ -2,6 +2,80 @@
 
 Python 3.12. Django 5.2 + DRF. Single-app flat structure (`api/` is the only app in `INSTALLED_APPS`).
 
+## WhatsApp Calling
+
+Calling is implemented via the **WhatsApp Cloud API Calls endpoints** (same Graph API v20.0, same auth).
+The backend acts as a **pure signaling relay** — it never touches audio. WebRTC media flows directly
+between the browser and WhatsApp servers (optionally relayed through coturn).
+
+### Model
+
+`Call` in `api/models.py` — stores call metadata, SDP offer/answer, recording info, and error details.
+Related to `Conversation` via `ForeignKey`. Has `call_id` (unique, from WhatsApp), `direction`
+(inbound/outbound), and `status` (pending/ringing/connected/completed/failed/rejected/missed).
+
+### API helpers (`api/views.py`)
+
+- `_call_whatsapp_api()` — POST to WhatsApp `/calls` endpoint, reuses the same rate limiter
+- `send_whatsapp_call_action()` — constructs the payload and delegates to `_call_whatsapp_api`
+- `pre_accept_call()` / `accept_call()` — two-step WebRTC answer flow (pre_accept → accept)
+- `reject_call()` / `terminate_call()` / `initiate_call()` — call lifecycle actions
+- `initiate_call()` supports `to_number`, `recipient_bsuid`, and `recording` dict
+
+### Webhook handlers
+
+- `_resolve_conversation()` — finds/creates Conversation from call webhook fields
+- `_handle_call_webhook()` — handles `connect`, `terminate`, and `call_recording_available` events
+- `_handle_call_status_webhook()` — handles `RINGING`/`ACCEPTED`/`REJECTED` status updates
+- `whatsapp_webhook()` modified to process `calls[]` and `statuses[]` arrays before early-returning
+- `_publish_call_event()` — publishes `call.*` SSE events with `active_take` ownership info
+
+### REST endpoints (`/api/calls/*`)
+
+All authenticated via `TokenAuthentication` + `IsAuthenticated`:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/calls/answer/` | POST | Agent accepts call; sends pre_accept + accept to WhatsApp |
+| `/api/calls/reject/` | POST | Agent rejects call |
+| `/api/calls/terminate/` | POST | Agent hangs up active call |
+| `/api/calls/initiate/` | POST | Agent starts outbound call |
+| `/api/calls/list/` | GET | Cursor-paginated call list, optional `conversation_id` filter |
+| `/api/calls/active/` | GET | Returns the currently active (pending/ringing/connected) call |
+| `/api/calls/turn-config/` | GET | Returns STUN + optional TURN ICE server config |
+| `/api/calls/settings/` | GET/POST | Get/update WhatsApp Business calling profile |
+
+### Ownership filtering
+
+`call_list` and `call_active` apply the same `Exists` subquery as conversations:
+non-staff users only see calls for conversations they own or that are untaken/bot-taken.
+
+### SSE events
+
+- `call.incoming` — new inbound call, includes `sdp_offer` and `active_take`
+- `call.connected` — call was answered (by this agent or another)
+- `call.terminated` — call ended
+- `call.rejected` — call was rejected
+- `call.outgoing_pending` — outbound call initiated, waiting for WhatsApp confirmation
+- `call.outgoing_accepted` — WhatsApp accepted outbound call, carries `sdp_answer`
+- `call.ringing` — call is ringing on the recipient's side
+- `call.recording_available` — recording ready for download
+
+### Ownership routing (`_serialize_call`)
+
+Every SSE call payload includes `active_take` (created_by_id, created_by_username).
+The frontend's `_isCallVisibleToMe()` filters events client-side.
+
+### TURN config (`config/settings.py`)
+
+```
+TURN_SERVER_URL = config('TURN_SERVER_URL', default='turn:localhost:3478')
+TURN_SERVER_USERNAME = config('TURN_SERVER_USERNAME', default='domi')
+TURN_SERVER_CREDENTIAL = config('TURN_SERVER_CREDENTIAL', default='')
+```
+
+coturn runs via `docker-compose.yml` with `network_mode: host`.
+
 ## Commands
 
 ```

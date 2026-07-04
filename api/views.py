@@ -16,6 +16,8 @@ from django.views.decorators.cache import cache_page
 from django.db import transaction
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from datetime import datetime, timezone as dt_timezone
+from django.shortcuts import get_object_or_404
 from django.db.models import Exists, OuterRef, Subquery, Q, Count, Prefetch
 from django.core.signing import BadSignature
 import threading
@@ -24,7 +26,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
@@ -33,7 +35,7 @@ from .serializers import (
     BotScheduleSerializer, BotConfigSerializer,
     TakeConversationSerializer, InitiateConversationSerializer,
     UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
-    WhatsAppTemplateSerializer,
+    WhatsAppTemplateSerializer, CallSerializer,
     media_signer, sign_media_url,
 )
 from .redis_client import get_sync_redis
@@ -451,6 +453,94 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
             except Exception:
                 logger.exception('Failed to update send_error for message %d', message_id)
 
+
+# --- WhatsApp Calling API helpers ---
+
+def _call_whatsapp_api(phone_number_id, payload):
+    token = settings.WHATSAPP_API_TOKEN
+    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/calls"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps(payload).encode('utf-8')
+
+    acquire_rate_capacity(phone_number_id)
+
+    try:
+        req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+        with urllib.request.urlopen(req) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if hasattr(e, 'read') else ''
+        logger.error("WhatsApp /calls API error %s: %s", e.code, err_body[:500])
+        raise
+
+
+def send_whatsapp_call_action(phone_number_id, action, call_id=None, to=None,
+                               recipient=None, session=None, biz_data=None,
+                               recording=None):
+    payload = {"messaging_product": "whatsapp", "action": action}
+    if call_id:
+        payload["call_id"] = call_id
+    if to:
+        payload["to"] = to
+    if recipient:
+        payload["recipient"] = recipient
+    if session:
+        payload["session"] = session
+    if biz_data:
+        payload["biz_opaque_callback_data"] = biz_data
+    if recording:
+        payload["recording"] = recording
+    return _call_whatsapp_api(phone_number_id, payload)
+
+
+def pre_accept_call(call_id, sdp_answer):
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    session = {"sdp_type": "answer", "sdp": sdp_answer}
+    return send_whatsapp_call_action(
+        phone_number_id, "pre_accept", call_id=call_id, session=session
+    )
+
+
+def accept_call(call_id, sdp_answer, recording=None):
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    session = {"sdp_type": "answer", "sdp": sdp_answer}
+    return send_whatsapp_call_action(
+        phone_number_id, "accept", call_id=call_id, session=session,
+        recording=recording,
+    )
+
+
+def reject_call(call_id):
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    return send_whatsapp_call_action(
+        phone_number_id, "reject", call_id=call_id
+    )
+
+
+def terminate_call(call_id):
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    return send_whatsapp_call_action(
+        phone_number_id, "terminate", call_id=call_id
+    )
+
+
+def initiate_call(to_number=None, recipient_bsuid=None, sdp_offer=None,
+                  biz_data=None, recording=None):
+    if not to_number and not recipient_bsuid:
+        raise ValueError("Either to_number or recipient_bsuid is required")
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    session = {"sdp_type": "offer", "sdp": sdp_offer}
+    response = send_whatsapp_call_action(
+        phone_number_id, "connect", to=to_number, recipient=recipient_bsuid,
+        session=session, biz_data=biz_data, recording=recording,
+    )
+    calls = response.get("calls", [])
+    if calls:
+        return calls[0].get("id")
+    return None
 
 
 class ConversationViewSet(viewsets.ModelViewSet):
@@ -1572,6 +1662,232 @@ def _handle_template_components_webhook(value: dict):
         logger.info("Template %s components updated from webhook", template.name)
 
 
+# --- Call webhook handlers ---
+
+def _resolve_conversation(metadata, contacts, call_event):
+    business_number = metadata.get('display_phone_number', '')
+    to_number = call_event.get('to', '')
+    from_number = call_event.get('from', '')
+    from_user_id = call_event.get('from_user_id', '')
+    to_user_id = call_event.get('to_user_id', '')
+    call_id = call_event.get('id', '')
+
+    user_phone = ''
+    if to_number and to_number != business_number:
+        user_phone = to_number
+    elif from_number and from_number != business_number:
+        user_phone = from_number
+
+    user_bsuid = from_user_id or to_user_id or ''
+
+    identifiers = [user_phone, user_bsuid]
+    for c in contacts:
+        wa = c.get('wa_id', '')
+        uid = c.get('user_id', '')
+        if wa and wa not in (business_number, ''):
+            identifiers.append(wa)
+        if uid and uid not in (business_number, ''):
+            identifiers.append(uid)
+
+    for ident in identifiers:
+        if not ident:
+            continue
+        conv = Conversation.objects.filter(whatsapp_id=ident).first()
+        if conv:
+            return conv
+
+    wa_id = user_phone or user_bsuid or call_id[:20]
+    contact_name = ''
+    for c in contacts:
+        cid = c.get('wa_id', '') or c.get('user_id', '')
+        if cid and cid in identifiers:
+            contact_name = c.get('profile', {}).get('name', wa_id)
+            break
+
+    return Conversation.objects.create(
+        whatsapp_id=wa_id,
+        contact_name=contact_name or wa_id,
+        contact_phone=user_phone if user_phone and user_phone.isdigit() else None,
+        group=get_default_group(),
+    )
+
+
+def _serialize_call_for_sse(call):
+    now = timezone.now()
+    active_take = ConversationTake.objects.filter(
+        conversation=call.conversation,
+        expires_at__gt=now,
+    ).select_related('created_by').first()
+
+    take_info = None
+    if active_take and active_take.created_by:
+        take_info = {
+            'created_by_id': active_take.created_by.id,
+            'created_by_username': active_take.created_by.username,
+            'created_by_first_name': active_take.created_by.first_name,
+        }
+
+    data = CallSerializer(call).data
+    data['active_take'] = take_info
+    return data
+
+
+def _publish_call_event(call, event_type):
+    try:
+        payload = {
+            'type': f'call.{event_type}',
+            'call': _serialize_call_for_sse(call),
+        }
+        publish(payload)
+    except Exception:
+        logger.exception("Failed to publish call SSE event type=%s", event_type)
+
+
+def _handle_call_webhook(call_event, metadata, contacts):
+    call_id = call_event.get('id')
+    event_type = call_event.get('event')
+    direction = call_event.get('direction')
+
+    if not call_id:
+        return
+
+    conversation = _resolve_conversation(metadata, contacts, call_event)
+    deeplink = call_event.get('deeplink_payload', '')
+    cta = call_event.get('cta_payload', '')
+
+    if event_type == 'connect':
+        session = call_event.get('session', {})
+        sdp_content = session.get('sdp', '')
+        sdp_type = session.get('sdp_type', '')
+        direction_db = 'inbound' if direction == 'USER_INITIATED' else 'outbound'
+        biz_data = call_event.get('biz_opaque_callback_data', '')
+
+        if direction_db == 'inbound':
+            call = Call.objects.create(
+                call_id=call_id,
+                conversation=conversation,
+                direction='inbound',
+                status='pending',
+                from_number=call_event.get('from', ''),
+                to_number=call_event.get('to', ''),
+                sdp_offer=sdp_content,
+                biz_opaque_callback_data=biz_data,
+                deeplink_payload=deeplink,
+                cta_payload=cta,
+            )
+            _publish_call_event(call, 'incoming')
+        else:
+            call = Call.objects.filter(call_id=call_id).first()
+            if call:
+                call.sdp_answer = sdp_content
+                call.status = 'ringing'
+                call.deeplink_payload = deeplink or call.deeplink_payload
+                call.cta_payload = cta or call.cta_payload
+                call.save()
+                _publish_call_event(call, 'outgoing_accepted')
+
+    elif event_type == 'terminate':
+        call = Call.objects.filter(call_id=call_id).first()
+        if not call:
+            return
+
+        status_value = call_event.get('status', [])
+        start_time_ts = call_event.get('start_time')
+        end_time_ts = call_event.get('end_time')
+        duration_val = call_event.get('duration')
+        errors = call_event.get('errors', [])
+
+        if isinstance(status_value, list):
+            status_value = status_value[0] if status_value else 'completed'
+
+        if status_value == 'Completed':
+            call.status = 'completed'
+        elif status_value == 'Failed':
+            call.status = 'failed'
+        else:
+            call.status = 'completed' if call.status == 'connected' else 'failed'
+
+        if start_time_ts:
+            try:
+                call.start_time = datetime.fromtimestamp(
+                    int(start_time_ts), tz=dt_timezone.utc
+                )
+            except (ValueError, OSError):
+                pass
+        if end_time_ts:
+            try:
+                call.end_time = datetime.fromtimestamp(
+                    int(end_time_ts), tz=dt_timezone.utc
+                )
+            except (ValueError, OSError):
+                pass
+        call.duration_seconds = duration_val
+
+        if deeplink:
+            call.deeplink_payload = deeplink
+        if cta:
+            call.cta_payload = cta
+
+        if errors:
+            first_err = errors[0] if isinstance(errors, list) else errors
+            call.error_code = first_err.get('code')
+            call.error_message = first_err.get('message')
+
+        call.save()
+        _publish_call_event(call, 'terminated')
+
+    elif event_type == 'call_recording_available':
+        call = Call.objects.filter(call_id=call_id).first()
+        if not call:
+            return
+
+        rec = call_event.get('call_recording', {})
+        audio = rec.get('audio', {})
+        call.recording_audio_id = audio.get('id')
+        call.recording_audio_url = audio.get('url')
+        call.recording_audio_sha256 = audio.get('sha256')
+        call.recording_audio_mime_type = audio.get('mime_type')
+        call.save()
+        _publish_call_event(call, 'recording_available')
+
+
+def _handle_call_status_webhook(status_event, metadata):
+    call_id = status_event.get('id')
+    status_value = status_event.get('status')
+
+    if not call_id or not status_value:
+        return
+
+    call = Call.objects.filter(call_id=call_id).first()
+    if not call:
+        return
+
+    status_map = {
+        'RINGING': 'ringing',
+        'ACCEPTED': 'connected',
+        'REJECTED': 'rejected',
+    }
+    new_status = status_map.get(status_value, call.status)
+
+    if new_status == 'connected' and not call.start_time:
+        ts = status_event.get('timestamp')
+        if ts:
+            try:
+                call.start_time = datetime.fromtimestamp(int(ts), tz=dt_timezone.utc)
+            except (ValueError, OSError):
+                pass
+
+    call.status = new_status
+    call.save()
+
+    event_type_map = {
+        'RINGING': 'ringing',
+        'ACCEPTED': 'connected',
+        'REJECTED': 'rejected',
+    }
+    _publish_call_event(call, event_type_map.get(status_value, 'updated'))
+
+
 # Webhook endpoint for WhatsApp (verification + incoming messages)
 @csrf_exempt
 def whatsapp_webhook(request):
@@ -1638,10 +1954,19 @@ def whatsapp_webhook(request):
                 return JsonResponse({'status': 'template_components_handled'}, status=200)
 
             messages = value.get('messages', [])
+            calls = value.get('calls', [])
+            statuses = value.get('statuses', [])
+            contacts = value.get('contacts', [])
+
+            # Process call events before early-return on empty messages
+            for call_event in calls:
+                _handle_call_webhook(call_event, value.get('metadata', {}), contacts)
+
+            for status_event in statuses:
+                _handle_call_status_webhook(status_event, value.get('metadata', {}))
+
             if not messages:
                 return JsonResponse({'status': 'no_message'}, status=200)
-
-            contacts = value.get('contacts', [])
 
             for msg in messages:
                 msg_type = msg.get('type', 'text')
@@ -2202,3 +2527,319 @@ def static_map(request):
     buf = io_module.BytesIO()
     cropped.save(buf, format='PNG')
     return HttpResponse(buf.getvalue(), content_type='image/png')
+
+
+# --- Call REST endpoints ---
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_answer(request):
+    call_id = request.data.get('call_id')
+    sdp = request.data.get('sdp')
+    recording = request.data.get('recording')
+
+    if not call_id or not sdp:
+        return JsonResponse({'error': 'call_id and sdp required'}, status=400)
+
+    call = get_object_or_404(Call, call_id=call_id)
+
+    if call.status not in ('pending',):
+        return JsonResponse(
+            {'error': 'Call already answered or terminated'},
+            status=409,
+        )
+
+    try:
+        call.sdp_answer = sdp
+        call.status = 'connected'
+        if recording:
+            call.recording_status = recording.get('status')
+            call.recording_purpose = recording.get('purpose')
+            call.recording_announcement_language = recording.get('announcement_language')
+        call.save()
+
+        pre_accept_call(call_id, sdp)
+        accept_call(call_id, sdp, recording=recording)
+
+        _publish_call_event(call, 'connected')
+
+        return JsonResponse({'success': True, 'call_id': call_id})
+    except Exception as e:
+        logger.exception("Failed to answer call %s", call_id)
+        call.status = 'failed'
+        call.error_message = str(e)
+        call.save()
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_reject(request):
+    call_id = request.data.get('call_id')
+
+    if not call_id:
+        return JsonResponse({'error': 'call_id required'}, status=400)
+
+    call = get_object_or_404(Call, call_id=call_id)
+
+    try:
+        reject_call(call_id)
+        call.status = 'rejected'
+        call.end_time = timezone.now()
+        call.save()
+        _publish_call_event(call, 'rejected')
+        return JsonResponse({'success': True})
+    except Exception as e:
+        logger.exception("Failed to reject call %s", call_id)
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_terminate(request):
+    call_id = request.data.get('call_id')
+
+    if not call_id:
+        return JsonResponse({'error': 'call_id required'}, status=400)
+
+    call = get_object_or_404(Call, call_id=call_id)
+
+    try:
+        terminate_call(call_id)
+        call.status = 'completed'
+        call.end_time = timezone.now()
+        if call.start_time:
+            call.duration_seconds = int(
+                (call.end_time - call.start_time).total_seconds()
+            )
+        call.save()
+        _publish_call_event(call, 'terminated')
+        return JsonResponse({'success': True})
+    except Exception as e:
+        logger.exception("Failed to terminate call %s", call_id)
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+@api_view(['POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_initiate(request):
+    to_number = request.data.get('to')
+    recipient = request.data.get('recipient')
+    sdp = request.data.get('sdp')
+    recording = request.data.get('recording')
+
+    if not to_number and not recipient:
+        return JsonResponse({'error': 'to or recipient required'}, status=400)
+    if not sdp:
+        return JsonResponse({'error': 'sdp required'}, status=400)
+
+    if to_number:
+        conversation = Conversation.objects.filter(whatsapp_id=to_number).first()
+        if not conversation:
+            conversation = Conversation.objects.create(
+                whatsapp_id=to_number,
+                contact_name=to_number,
+                contact_phone=to_number if to_number.isdigit() else None,
+                group=get_default_group(),
+            )
+    else:
+        conversation = Conversation.objects.filter(whatsapp_id=recipient).first()
+        if not conversation:
+            conversation = Conversation.objects.create(
+                whatsapp_id=recipient,
+                contact_name=recipient[:50],
+                group=get_default_group(),
+            )
+
+    try:
+        call_id = initiate_call(
+            to_number=to_number, recipient_bsuid=recipient,
+            sdp_offer=sdp, recording=recording,
+        )
+
+        if not call_id:
+            return JsonResponse(
+                {'error': 'Failed to initiate call — no call_id returned'},
+                status=502,
+            )
+
+        phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+
+        call = Call.objects.create(
+            call_id=call_id,
+            conversation=conversation,
+            direction='outbound',
+            status='pending',
+            from_number=phone_number_id,
+            to_number=to_number or '',
+            recipient_bsuid=recipient or '',
+            sdp_offer=sdp,
+            recording_status=recording.get('status') if recording else None,
+            recording_purpose=recording.get('purpose') if recording else None,
+            recording_announcement_language=(
+                recording.get('announcement_language') if recording else None
+            ),
+        )
+
+        _publish_call_event(call, 'outgoing_pending')
+
+        return JsonResponse({'success': True, 'call_id': call_id})
+    except Exception as e:
+        logger.exception("Failed to initiate call to %s", to_number)
+        return JsonResponse({'error': str(e)}, status=500)
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_list(request):
+    before = request.query_params.get('before')
+    conversation_id = request.query_params.get('conversation_id')
+    limit = int(request.query_params.get('limit', 50))
+    limit = min(limit, 100)
+
+    qs = Call.objects.select_related('conversation')
+
+    if conversation_id:
+        qs = qs.filter(conversation_id=conversation_id)
+
+    user = request.user
+    if not user.is_staff:
+        other_human_takes = ConversationTake.objects.filter(
+            conversation=OuterRef('conversation'),
+            expires_at__gt=timezone.now(),
+        ).exclude(created_by__isnull=True).exclude(created_by=user).exclude(
+            created_by__username='bot'
+        )
+        qs = qs.annotate(
+            _has_other_human_take=Exists(other_human_takes)
+        ).filter(_has_other_human_take=False)
+
+    if before:
+        try:
+            pivot = Call.objects.get(id=before)
+            qs = qs.filter(created_at__lt=pivot.created_at)
+        except Call.DoesNotExist:
+            pass
+
+    qs = qs[:limit + 1]
+    results = list(qs)
+    has_more = len(results) > limit
+    if has_more:
+        results = results[:limit]
+
+    return JsonResponse({
+        'results': CallSerializer(results, many=True).data,
+        'cursor': results[-1].id if results else None,
+        'has_more': has_more,
+    })
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_active(request):
+    qs = Call.objects.filter(
+        status__in=('pending', 'ringing', 'connected')
+    )
+
+    user = request.user
+    if not user.is_staff:
+        other_human_takes = ConversationTake.objects.filter(
+            conversation=OuterRef('conversation'),
+            expires_at__gt=timezone.now(),
+        ).exclude(created_by__isnull=True).exclude(created_by=user).exclude(
+            created_by__username='bot'
+        )
+        qs = qs.annotate(
+            _has_other_human_take=Exists(other_human_takes)
+        ).filter(_has_other_human_take=False)
+
+    active_call = qs.order_by('-created_at').first()
+
+    if active_call:
+        return JsonResponse({'active': True, 'call': CallSerializer(active_call).data})
+    return JsonResponse({'active': False, 'call': None})
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_turn_config(request):
+    turn_url = settings.TURN_SERVER_URL
+    turn_username = settings.TURN_SERVER_USERNAME
+    turn_credential = settings.TURN_SERVER_CREDENTIAL
+
+    ice_servers = []
+
+    stun_host = urllib.parse.urlparse(turn_url).hostname or 'localhost'
+    ice_servers.append({"urls": f"stun:{stun_host}:3478"})
+
+    if turn_url and turn_username and turn_credential:
+        ice_servers.append({
+            "urls": turn_url,
+            "username": turn_username,
+            "credential": turn_credential,
+        })
+
+    return JsonResponse({"iceServers": ice_servers})
+
+
+@api_view(['GET', 'POST'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated])
+def call_settings(request):
+    phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
+    token = settings.WHATSAPP_API_TOKEN
+
+    if request.method == 'GET':
+        url = (
+            f"https://graph.facebook.com/v20.0/"
+            f"{phone_number_id}/whatsapp_business_profile"
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+            return JsonResponse(data.get('data', [{}])[0])
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode() if hasattr(e, 'read') else ''
+            return JsonResponse(
+                {'error': f"HTTP {e.code}: {err_body[:300]}"},
+                status=e.code,
+            )
+
+    show_button = request.data.get('show_call_button')
+    if show_button is not None:
+        url = (
+            f"https://graph.facebook.com/v20.0/"
+            f"{phone_number_id}/whatsapp_business_profile"
+        )
+        payload = {
+            "messaging_product": "whatsapp",
+            "call_to_action": {
+                "button_type": "CALL_NOW" if show_button else "NONE",
+            },
+        }
+        body = json.dumps(payload).encode('utf-8')
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return JsonResponse(json.loads(resp.read().decode()))
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode() if hasattr(e, 'read') else ''
+            return JsonResponse(
+                {'error': f"HTTP {e.code}: {err_body[:300]}"},
+                status=e.code,
+            )
+
+    return JsonResponse({'error': 'No valid field provided'}, status=400)

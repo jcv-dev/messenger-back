@@ -173,6 +173,11 @@ WEBHOOK_TOKEN = config('WEBHOOK_TOKEN', default='')
 WHATSAPP_APP_SECRET = config('WHATSAPP_APP_SECRET', default='')
 WA_RATE_LIMIT_THRESHOLD = config('WA_RATE_LIMIT_THRESHOLD', default=70, cast=int)
 
+# TURN/STUN server for WebRTC calling
+TURN_SERVER_URL = config('TURN_SERVER_URL', default='turn:localhost:3478')
+TURN_SERVER_USERNAME = config('TURN_SERVER_USERNAME', default='domi')
+TURN_SERVER_CREDENTIAL = config('TURN_SERVER_CREDENTIAL', default='')
+
 # Message retention in minutes — messages and their media files older than this are deleted
 MESSAGE_RETENTION_MINUTES = config('MESSAGE_RETENTION_MINUTES', default=0, cast=int)
 
