@@ -11,7 +11,7 @@ from rest_framework.throttling import UserRateThrottle
 from django.http import HttpResponse, JsonResponse
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.authentication import TokenAuthentication
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from api.views import whatsapp_webhook, realtime_events
 from api.admin import admin_call_settings
 
