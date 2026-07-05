@@ -725,17 +725,22 @@ class ConversationViewSet(viewsets.ModelViewSet):
             except Exception:
                 qs = qs.none()
 
-            # Only filter out other-human-taken conversations for list views
-            # Detail actions rely on action-level permission checks instead
-            # Pinned conversations bypass the filter
-            if self.action in ('list', 'active_conversations'):
-                other_human_takes = ConversationTake.objects.filter(
-                    conversation=OuterRef('pk'),
-                    expires_at__gt=now,
-                ).exclude(created_by__isnull=True).exclude(created_by=user).exclude(created_by__username='bot')
-                qs = qs.annotate(
-                    _has_other_human_take=Exists(other_human_takes)
-                ).filter(
+        # Annotate other-human-take for ALL users for list views
+        if user.is_authenticated and self.action in ('list', 'active_conversations'):
+            other_human_takes = ConversationTake.objects.filter(
+                conversation=OuterRef('pk'),
+                expires_at__gt=now,
+            ).exclude(created_by__isnull=True).exclude(created_by=user).exclude(created_by__username='bot')
+            qs = qs.annotate(
+                _has_other_human_take=Exists(other_human_takes)
+            )
+
+            # For ALL users: hide group-pinned conversations taken by another human
+            qs = qs.filter(~Q(is_pinned=True, _has_other_human_take=True))
+
+            # For non-staff: also hide non-pinned conversations taken by another human
+            if not user.is_staff:
+                qs = qs.filter(
                     Q(_has_other_human_take=False)
                     | Q(_has_user_pin=True)
                 )
