@@ -15,7 +15,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.utils import timezone
 
-from api.models import Conversation, Message, ConversationNote, ConversationTake, ConversationTag
+from api.models import Conversation, Message, ConversationNote, ConversationTake, ConversationTag, AgentTakeRecord, create_agent_take_record, release_agent_take_records, set_first_response
 from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
@@ -102,6 +102,10 @@ async def _cleanup_expired_items():
     if not affected:
         return
 
+    await sync_to_async(lambda: AgentTakeRecord.objects.filter(
+        released_at__isnull=True,
+        taken_at__lt=now,
+    ).update(released_at=now))()
     await sync_to_async(lambda: ConversationTake.objects.filter(expires_at__lt=now).delete())()
     await sync_to_async(lambda: ConversationTag.objects.filter(expires_at__lt=now, expires_at__isnull=False).delete())()
     await sync_to_async(lambda: ConversationNote.objects.filter(expires_at__lt=now, expires_at__isnull=False).delete())()
@@ -167,6 +171,7 @@ async def _release_bot_take(conversation, escalated=False):
     bot = await get_bot_user_async()
     if not bot:
         return
+    await sync_to_async(lambda: release_agent_take_records(conversation, agent=bot))()
     await sync_to_async(lambda: ConversationTake.objects.filter(
         created_by=bot,
         conversation=conversation,
@@ -192,6 +197,7 @@ def _renew_bot_take(conversation):
     bot = get_bot_user()
     if not bot:
         return
+    release_agent_take_records(conversation, agent=bot)
     ConversationTake.objects.filter(
         created_by=bot,
         conversation=conversation,
@@ -201,6 +207,7 @@ def _renew_bot_take(conversation):
         created_by=bot,
         duration_minutes=5,
     )
+    create_agent_take_record(conversation, bot, duration_minutes=5)
     publish_conversation_update(conversation)
 
 
@@ -743,6 +750,7 @@ async def bot_loop():
 
                 bot = await sync_to_async(get_bot_user)()
                 if bot:
+                    await sync_to_async(lambda: release_agent_take_records(None, agent=bot))()
                     await sync_to_async(lambda: ConversationTake.objects.filter(
                         created_by=bot,
                         expires_at__gt=timezone.now(),

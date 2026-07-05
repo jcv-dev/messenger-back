@@ -551,6 +551,73 @@ class AgentPresence(models.Model):
         verbose_name_plural = "Agent Presences"
 
 
+class AgentTakeRecord(models.Model):
+    """Immutable record of a conversation take for historical stats.
+    
+    Created when an agent takes a conversation (or the bot takes it).
+    Persists even after the ConversationTake is deleted.
+    """
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='take_records')
+    agent = models.ForeignKey(User, on_delete=models.CASCADE, related_name='take_records')
+    taken_at = models.DateTimeField()
+    released_at = models.DateTimeField(null=True, blank=True)
+    first_response_at = models.DateTimeField(null=True, blank=True)
+    duration_minutes = models.PositiveIntegerField(default=10)
+
+    def __str__(self):
+        return f"TakeRecord: {self.agent.username} → {self.conversation.contact_name} @ {self.taken_at}"
+
+    class Meta:
+        ordering = ['-taken_at']
+        indexes = [
+            models.Index(fields=['agent', 'taken_at'], name='takerecord_agent_taken_idx'),
+            models.Index(fields=['conversation', 'taken_at'], name='takerecord_conv_taken_idx'),
+        ]
+        verbose_name = "Agent Take Record"
+        verbose_name_plural = "Agent Take Records"
+
+
+def create_agent_take_record(conversation, agent, taken_at=None, duration_minutes=10):
+    """Create an immutable take record (called when an agent takes a conversation)."""
+    from django.utils import timezone
+    AgentTakeRecord.objects.create(
+        conversation=conversation,
+        agent=agent,
+        taken_at=taken_at or timezone.now(),
+        duration_minutes=duration_minutes,
+    )
+
+
+def release_agent_take_records(conversation=None, agent=None):
+    """Mark AgentTakeRecords as released.
+    
+    If conversation is specified, only release records for that conversation.
+    If agent is specified, only release records for that agent.
+    If both are None, releases ALL unreleased records (used at bot startup).
+    """
+    from django.utils import timezone
+    qs = AgentTakeRecord.objects.filter(released_at__isnull=True)
+    if conversation:
+        qs = qs.filter(conversation=conversation)
+    if agent:
+        qs = qs.filter(agent=agent)
+    qs.update(released_at=timezone.now())
+
+
+def set_first_response(conversation, agent, responded_at=None):
+    """Set first_response_at on the agent's active take record if not already set."""
+    from django.utils import timezone
+    record = AgentTakeRecord.objects.filter(
+        conversation=conversation,
+        agent=agent,
+        released_at__isnull=True,
+        first_response_at__isnull=True,
+    ).order_by('taken_at').first()
+    if record:
+        record.first_response_at = responded_at or timezone.now()
+        record.save(update_fields=['first_response_at'])
+
+
 class PushSubscription(models.Model):
     """Web Push subscription for browser push notifications."""
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='push_subscriptions')

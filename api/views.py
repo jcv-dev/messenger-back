@@ -26,7 +26,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription, AgentTakeRecord, create_agent_take_record, release_agent_take_records, set_first_response
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
@@ -839,6 +839,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             if conversation.resolved_by_bot:
                 conversation.resolved_by_bot = False
                 conversation.save(update_fields=['resolved_by_bot'])
+            release_agent_take_records(conversation)
             ConversationTake.objects.filter(conversation=conversation).delete()
             get_sync_redis().delete(f"bot:escalated:{conversation.id}")
             duration_minutes = serializer.validated_data.get('duration_minutes', 10)
@@ -847,6 +848,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 created_by=request.user,
                 duration_minutes=duration_minutes,
             )
+            create_agent_take_record(conversation, request.user, duration_minutes=duration_minutes)
             take_serializer = ConversationTakeSerializer(take)
             conversation.save()
             # Clear prefetch cache so SSE serializes fresh takes, not stale prefetch
@@ -872,6 +874,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     {'error': 'Solo el propietario o un administrador pueden liberar'},
                     status=status.HTTP_403_FORBIDDEN,
                 )
+            release_agent_take_records(conversation, agent=active_take.created_by)
             active_take.delete()
         conversation.save()
         if hasattr(conversation, '_prefetched_objects_cache'):
@@ -889,6 +892,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation = self.get_object()
 
         # 1. Release any human take
+        release_agent_take_records(conversation)
         ConversationTake.objects.filter(conversation=conversation).delete()
 
         try:
@@ -1011,6 +1015,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         tags_count = ConversationTag.objects.filter(expires_at__lt=now).delete()[0]
         notes_count = ConversationNote.objects.filter(expires_at__lt=now).delete()[0]
+        AgentTakeRecord.objects.filter(released_at__isnull=True, taken_at__lt=now).update(released_at=now)
         takes_count = ConversationTake.objects.filter(expires_at__lt=now).delete()[0]
         return Response({'deleted_count': tags_count + notes_count + takes_count})
 
@@ -1154,6 +1159,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     context_wamid=context_wamid,
                 ))
 
+            if direction == 'outbound' and message_type not in ('edit', 'reaction'):
+                set_first_response(conversation, request.user)
+
             serializer = MessageSerializer(message)
             publish_conversation_update(conversation, serializer.data)
             if direction == 'outbound':
@@ -1195,6 +1203,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         conversation.tags.filter(expires_at__lt=now, expires_at__isnull=False).delete()
         conversation.notes.filter(expires_at__lt=now, expires_at__isnull=False).delete()
+        AgentTakeRecord.objects.filter(
+            conversation=conversation,
+            released_at__isnull=True,
+            taken_at__lt=now,
+        ).update(released_at=now)
         conversation.takes.filter(expires_at__lt=now).delete()
         serializer = ConversationSerializer(conversation)
         data = serializer.data
@@ -1906,7 +1919,7 @@ class CannedResponseViewSet(viewsets.ModelViewSet):
 
 
 PRESENCE_REDIS_PREFIX = 'agent:presence'
-PRESENCE_TTL = 70
+PRESENCE_TTL = 120
 
 
 def _get_presence_redis_key(user_id):
@@ -3132,6 +3145,7 @@ def call_answer(request):
             logger.info("call_answer %s: recording NOT enabled (config false/missing)", call_id)
         call.save()
 
+        release_agent_take_records(call.conversation)
         ConversationTake.objects.filter(conversation=call.conversation).delete()
         ConversationTake.objects.create(
             conversation=call.conversation,
@@ -3139,6 +3153,7 @@ def call_answer(request):
             duration_minutes=10,
             expires_at=timezone.now() + timedelta(minutes=10),
         )
+        create_agent_take_record(call.conversation, request.user, duration_minutes=10)
 
         pre_accept_call(call_id, sdp)
         accept_call(call_id, sdp, recording=recording)
@@ -3271,6 +3286,7 @@ def call_initiate(request):
             ),
         )
 
+        release_agent_take_records(conversation)
         ConversationTake.objects.filter(conversation=conversation).delete()
         ConversationTake.objects.create(
             conversation=conversation,
@@ -3278,6 +3294,7 @@ def call_initiate(request):
             duration_minutes=10,
             expires_at=timezone.now() + timedelta(minutes=10),
         )
+        create_agent_take_record(conversation, request.user, duration_minutes=10)
 
         _publish_call_event(call, 'outgoing_pending')
 
@@ -3616,7 +3633,8 @@ def export_conversations_csv(request):
 @permission_classes([IsAuthenticated, IsAdminUser])
 def agent_stats(request):
     """Per-agent statistics for admin view."""
-    from django.db.models import Count
+    from django.db.models import Count, Avg, F
+    from django.db.models.functions import ExtractEpoch
     import redis as sync_redis
 
     days = int(request.query_params.get('days', 30))
@@ -3631,9 +3649,21 @@ def agent_stats(request):
     )
 
     conv_counts = dict(
-        ConversationTake.objects.filter(
-            created_by__in=agents, created_at__gte=since,
-        ).values('created_by_id').annotate(cnt=Count('conversation_id', distinct=True)).values_list('created_by_id', 'cnt')
+        AgentTakeRecord.objects.filter(
+            agent__in=agents, taken_at__gte=since,
+        ).values('agent_id').annotate(cnt=Count('conversation_id', distinct=True)).values_list('agent_id', 'cnt')
+    )
+
+    avg_response_times = dict(
+        AgentTakeRecord.objects.filter(
+            agent__in=agents,
+            taken_at__gte=since,
+            first_response_at__isnull=False,
+        ).values('agent_id').annotate(
+            avg_seconds=Avg(
+                ExtractEpoch(F('first_response_at')) - ExtractEpoch(F('taken_at'))
+            )
+        ).values_list('agent_id', 'avg_seconds')
     )
 
     presences = {}
@@ -3660,6 +3690,7 @@ def agent_stats(request):
             except Exception:
                 online_status = 'offline'
 
+        avg_rt = avg_response_times.get(uid)
         results.append({
             'id': uid,
             'username': agent.username,
@@ -3670,6 +3701,7 @@ def agent_stats(request):
             'status': online_status,
             'messages_sent': msg_counts.get(uid, 0),
             'conversations_handled': conv_counts.get(uid, 0),
+            'avg_response_time_seconds': round(avg_rt, 1) if avg_rt else None,
         })
 
     return Response({'results': results, 'days': days})

@@ -124,6 +124,7 @@ def bot_status(request):
     if not request.user.is_staff:
         return JsonResponse(_compute_non_staff_bot_status(metrics, series))
 
+    summary = _compute_non_staff_bot_status(metrics, series)
     return JsonResponse({
         "healthy": True,
         "metrics": metrics,
@@ -131,6 +132,12 @@ def bot_status(request):
         "from_ts": first_minute,
         "to_ts": last_minute,
         "bucket_count": bucket_count,
+        "messages_processed_today": summary["messages_processed_today"],
+        "conversations_handled_today": summary["conversations_handled_today"],
+        "completion_rate": summary["completion_rate"],
+        "escalations_today": summary["escalations_today"],
+        "uptime_seconds": summary["uptime_seconds"],
+        "handler_breakdown": summary["handler_breakdown"],
         "config": {
             "lock_ttl": _LOCK_TTL,
             "rate_window": _WINDOW,
