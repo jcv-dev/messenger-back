@@ -446,6 +446,9 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
             return FlowResult(state=AWAITING_FIJO_NAME, messages=[
                 _text_msg("¿Cuál es el nombre de tu negocio?"),
             ])
+        if button_id == "pedido":
+            return FlowResult(escalate=True, escalate_reason="Cliente preguntó sobre su pedido desde el menú principal",
+                              messages=[_text_msg("Un asesor te atenderá pronto.")])
         if button_id == "escalate":
             return FlowResult(escalate=True, escalate_reason="Cliente solicitó asesor desde el menú principal",
                               messages=[_text_msg("Un asesor te atenderá pronto.")])
@@ -470,6 +473,8 @@ async def handle_welcome(session: dict, text: str, button_id: str | None,
         return await handle_welcome(session, text, "cotizar", conversation)
     if intent == "domii_fijo":
         return await handle_welcome(session, text, "domii_fijo", conversation)
+    if intent == "pedido":
+        return await handle_welcome(session, text, "pedido", conversation)
     if intent == "escalate":
         return await handle_welcome(session, text, "escalate", conversation)
     if intent == "faq":
@@ -489,6 +494,7 @@ def _welcome_interactive() -> dict:
             {"id": "cotizar", "title": "Cotizar domicilio", "description": "Calcula el precio de un envío"},
             {"id": "domii_fijo", "title": "Domii Fijo", "description": "Domiciliario dedicado por horas/días"},
             {"id": "faq", "title": "Preguntas frecuentes", "description": "Horarios, cobertura, pagos"},
+            {"id": "pedido", "title": "Preguntar sobre mi pedido", "description": "Consulta el estado de tu pedido"},
             {"id": "escalate", "title": "Hablar con un asesor", "description": "Atención personalizada"},
         ]}],
     )
@@ -1723,10 +1729,11 @@ async def advance(conversation, session: dict, user_text: str,
         ])
 
     if not button_id and len(user_text) <= 150 and _GLOBAL_ESCALATE.search(user_text):
+        reason = await _escalation_note(session, "Cliente solicit\u00f3 asesor durante la conversaci\u00f3n")
         session.clear()
         return FlowResult(
             escalate=True,
-            escalate_reason="Cliente solicit\u00f3 asesor durante la conversaci\u00f3n",
+            escalate_reason=reason,
             messages=[_text_msg("Un asesor te atender\u00e1 pronto.")],
         )
 

@@ -9,6 +9,7 @@ from django.conf import settings
 from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.throttling import UserRateThrottle
 from django.http import HttpResponse, JsonResponse
+from django.views.generic import TemplateView
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.permissions import IsAdminUser, IsAuthenticated
@@ -156,6 +157,7 @@ urlpatterns = [
     path('api/events/', realtime_events, name='realtime_events'),
     path('webhook/', whatsapp_webhook),
     path('health', health_check, name='health_check'),
+    path('privacy/', TemplateView.as_view(template_name='privacy.html'), name='privacy'),
     path('api/bot/status/', bot_status, name='bot-status'),
 ]
 

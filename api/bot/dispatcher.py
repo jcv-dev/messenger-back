@@ -504,13 +504,14 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
 
     if _FAQ_PATTERNS_ESCALATE.search(user_text):
         incr_metric("escalations")
+        reason = await state_flow._escalation_note(session, "Cliente solicit\u00f3 hablar con un asesor durante la conversaci\u00f3n")
         await sync_to_async(delete_session)(conversation_id)
         await _release_bot_take(conversation, escalated=True)
         bot = await get_bot_user_async()
         if bot:
             await sync_to_async(ConversationNote.create_note)(
                 conversation=conversation,
-                content="[Bot] Cliente solicit\u00f3 hablar con un asesor durante la conversaci\u00f3n",
+                content=f"[Bot] {reason}",
                 expiry_type='custom',
                 custom_expiry_minutes=10,
                 created_by=bot,
@@ -524,13 +525,14 @@ async def _handle_with_state_machine(session, conversation, conversation_id, use
     # --- Button-based escalation (from confusion handler) ---
     if button_id == "escalate":
         incr_metric("escalations")
+        reason = await state_flow._escalation_note(session, "Cliente solicit\u00f3 asesor")
         await sync_to_async(delete_session)(conversation_id)
         await _release_bot_take(conversation, escalated=True)
         bot = await get_bot_user_async()
         if bot:
             await sync_to_async(ConversationNote.create_note)(
                 conversation=conversation,
-                content="[Bot] Cliente solicit\u00f3 asesor tras dificultades",
+                content=f"[Bot] {reason}",
                 expiry_type='custom',
                 custom_expiry_minutes=10,
                 created_by=bot,

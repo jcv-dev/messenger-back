@@ -31,6 +31,7 @@ _STATE_OPTIONS: dict[str, list[dict]] = {
         {"id": "cotizar", "label": "Cotizar domicilio / pedido / envío / calcular precio / quiero un domicilio / necesito enviar / mandar algo / domicilio / delivery / mensajería / cotizar envío / hacer domicilio"},
         {"id": "domii_fijo", "label": "Domii Fijo / domiciliario dedicado / contratar / por horas / por días / mensajero fijo / empleado / necesito un domiciliario / quiero un mensajero"},
         {"id": "faq", "label": "Preguntas frecuentes / horario / cobertura / pago / información / dudas / cómo funciona / necesito info / qué tal / cómo es / información general / consulta"},
+        {"id": "pedido", "label": "Preguntar sobre mi pedido / estado pedido / consultar pedido / mi pedido / quiero saber de mi pedido / información de pedido / solicitud / orden / seguimiento de pedido / cómo va mi pedido / dónde está mi pedido / rastrear pedido / ver pedido"},
         {"id": "escalate", "label": "Hablar con un asesor / agente humano / persona / ayuda / asesor / me atiende alguien / necesito ayuda / ayúdame / operador / atención al cliente"},
     ],
     "AWAITING_PROFILE": [
