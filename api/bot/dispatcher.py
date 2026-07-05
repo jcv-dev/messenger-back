@@ -340,24 +340,35 @@ async def handle_inbound(event: dict):
         session = await sync_to_async(get_session)(conversation_id)
 
         # --- Rich first message gate (applies to both bot modes) ---
-        if session is None and not button_id and _is_rich_first_message_heuristic(user_text):
-            from .llm_fallback import is_rich_first_message
-            if await is_rich_first_message(user_text):
+        if session is None and not button_id:
+            address_matches = _extract_address_matches(user_text)
+            should_escalate = len(address_matches) >= 2
+
+            if not should_escalate and _is_rich_first_message_heuristic(user_text):
+                from .llm_fallback import is_rich_first_message
+                should_escalate = await is_rich_first_message(user_text)
+
+            if should_escalate:
                 incr_metric("escalations")
                 await sync_to_async(delete_session)(conversation_id)
                 await _release_bot_take(conversation, escalated=True)
                 bot = await get_bot_user_async()
                 if bot:
+                    if len(address_matches) >= 2:
+                        addr_str = '" y "'.join(address_matches)
+                        note = f"[Bot] Cliente proporcion\u00f3 {len(address_matches)} direcciones: \"{addr_str}\". Transferido a agente."
+                    else:
+                        note = "[Bot] Cliente proporcion\u00f3 informaci\u00f3n completa en su primer mensaje. Transferido a agente."
                     await sync_to_async(ConversationNote.create_note)(
                         conversation=conversation,
-                        content="[Bot] Cliente proporcionó información completa en su primer mensaje. Transferido a agente.",
+                        content=note,
                         expiry_type='custom',
                         custom_expiry_minutes=10,
                         created_by=bot,
                     )
                 await sync_to_async(send_reply)(
                     conversation,
-                    "He revisado tu mensaje y veo que tienes toda la información lista. Un asesor te atenderá para procesar tu solicitud rápidamente.",
+                    "He revisado tu mensaje y veo que tienes toda la informaci\u00f3n lista. Un asesor te atender\u00e1 para procesar tu solicitud r\u00e1pidamente.",
                 )
                 return
 
@@ -403,8 +414,9 @@ _PAYMENT_WORDS = re.compile(r"\b(cuenta|factura|pago|recibo|total|tarjeta|transf
 _RICH_FIRST_ADDRESS = re.compile(
     r"\b(cra\b|calle\b|carrera\b|avenida|transversal|diagonal|autopista|"
     r"barrio|torre\b|apto\b|apartamento|oficina|local\b|km\b|"
-    r"#\d+|nro|n\.?\s*\d|esquina|"
-    r"dirección|direccion|donde|ubicación)\b",
+    r"nro|n\.?\s*\d|esquina|"
+    r"dirección|direccion|donde|ubicación)\b"
+    r"|#\d+",
     re.I,
 )
 
@@ -436,6 +448,32 @@ def _is_rich_first_message_heuristic(text: str) -> bool:
     if _RICH_FIRST_PERSONAL.search(text):
         score += 1
     return score >= 2
+
+
+# Address extraction pattern — captures full address strings for escalation notes.
+# Matches Colombian address format: "Calle 22 #19-19 barrio Rojas"
+_ADDRESS_EXTRACT = re.compile(
+    r"\b(?:calle|cra\b|carrera|avenida|transversal|diagonal|autopista)"
+    r"\s+\S+\s+#\s*\S+"
+    r"(?:[ \t]+(?!\b(?:calle|cra\b|carrera|avenida|transversal|diagonal|autopista)\b)\S+){0,4}",
+    re.I,
+)
+
+
+def _extract_address_matches(text: str) -> list[str]:
+    """Extract distinct address-like strings from *text*.
+    
+    Returns a deduplicated list of address strings, preserving order.
+    """
+    matches = _ADDRESS_EXTRACT.findall(text)
+    seen = set()
+    result = []
+    for m in matches:
+        m_norm = m.strip().lower()
+        if m_norm not in seen and len(m_norm) > 5:
+            seen.add(m_norm)
+            result.append(m.strip())
+    return result
 
 
 def _is_actual_cancel(user_text: str) -> bool:
