@@ -494,7 +494,7 @@ def _welcome_interactive() -> dict:
             {"id": "cotizar", "title": "Cotizar domicilio", "description": "Calcula el precio de un envío"},
             {"id": "domii_fijo", "title": "Domii Fijo", "description": "Domiciliario dedicado por horas/días"},
             {"id": "faq", "title": "Preguntas frecuentes", "description": "Horarios, cobertura, pagos"},
-            {"id": "pedido", "title": "Preguntar sobre mi pedido", "description": "Consulta el estado de tu pedido"},
+            {"id": "pedido", "title": "Preguntar sobre pedido", "description": "Consulta el estado de tu pedido"},
             {"id": "escalate", "title": "Hablar con un asesor", "description": "Atención personalizada"},
         ]}],
     )

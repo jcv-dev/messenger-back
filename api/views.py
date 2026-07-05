@@ -1363,7 +1363,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
             fts_rank=SearchRank(vector, search_query),
             trigram_sim=TrigramSimilarity('content', q),
         ).filter(
-            Q(search_vector__search=search_query) | Q(trigram_sim__gt=0.15)
+            Q(search_vector=search_query) | Q(trigram_sim__gt=0.15)
         )
 
         if not user.is_staff:
