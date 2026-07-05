@@ -235,6 +235,7 @@ def send_reply(conversation, text):
         'text', text, conversation.contact_phone, msg.id, conversation.id,
     )
 
+    conversation._last_msg_direction = 'outbound'
     publish_conversation_update(conversation, msg_data)
     return msg
 
@@ -673,6 +674,7 @@ def _send_interactive_payload(conversation, interactive_payload: dict):
     conversation.save(update_fields=["last_message", "last_message_at"])
 
     msg_data = MessageSerializer(msg).data
+    conversation._last_msg_direction = 'outbound'
     publish_conversation_update(conversation, msg_data)
 
 

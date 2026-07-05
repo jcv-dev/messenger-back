@@ -1170,6 +1170,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 set_first_response(conversation, request.user)
 
+            conversation._last_msg_direction = direction
             serializer = MessageSerializer(message)
             publish_conversation_update(conversation, serializer.data)
             if direction == 'outbound':
@@ -1286,6 +1287,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation.last_message = f'[{message_type.capitalize()}]'
         conversation.last_message_at = timezone.now()
         conversation.save()
+
+        conversation._last_msg_direction = 'outbound'
 
         if message_type not in ('edit', 'reaction'):
             transaction.on_commit(lambda: _send_pool.submit(
@@ -1415,6 +1418,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.last_message = f'[{template.name}]'
         conversation.last_message_at = timezone.now()
         conversation.save()
+
+        conversation._last_msg_direction = 'outbound'
 
         transaction.on_commit(lambda: _send_pool.submit(
             send_whatsapp_outbound,
@@ -1836,6 +1841,8 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             conv.last_message = f'[{template.name}]'
             conv.last_message_at = timezone.now()
             conv.save(update_fields=['last_message', 'last_message_at'])
+
+            conv._last_msg_direction = 'outbound'
 
             transaction.on_commit(lambda c=conv, p=payload, m=message: _send_pool.submit(
                 send_whatsapp_outbound,

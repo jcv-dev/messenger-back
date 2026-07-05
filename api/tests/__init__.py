@@ -530,6 +530,15 @@ class MessageViewSetTests(APITestCase):
         msg = Message.objects.get(content='No name sent')
         self.assertEqual(msg.sender, self.user)
 
+    def test_outbound_message_sets_last_message_direction_outbound(self):
+        self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Agent direction test'},
+        )
+        response = self.client.get('/api/conversations/active_conversations/')
+        conv_data = next(c for c in response.data['results'] if c['id'] == self.conversation.id)
+        self.assertEqual(conv_data['last_message_direction'], 'outbound')
+
 
 # ── Model logic ─────────────────────────────────────────────────────────────
 
