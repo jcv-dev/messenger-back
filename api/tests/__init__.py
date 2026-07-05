@@ -348,6 +348,37 @@ class ConversationViewSetTests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
 
+    @patch('api.views.get_sync_redis')
+    def test_take_conversation_does_not_delete_escalation_cooldown(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        # Simulate an existing escalation cooldown in Redis
+        mock_redis.exists.return_value = False
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/take_conversation/',
+            {'duration_minutes': 15},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        # take_conversation should no longer delete the escalation cooldown key
+        for call_args in mock_redis.delete.call_args_list:
+            key = call_args[0][0] if call_args[0] else ''
+            self.assertNotIn('bot:escalated', str(key),
+                             'take_conversation should not delete the escalation cooldown')
+
+    def test_take_from_bot_creates_human_take(self):
+        bot_user = User.objects.create_user(username='bot', password='pass')
+        ConversationTake.create_take(
+            conversation=self.conversation, created_by=bot_user, duration_minutes=30,
+        )
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/take_conversation/',
+            {'duration_minutes': 15},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNotNone(response.data)
+        self.assertEqual(response.data['created_by']['id'], self.user.id)
+        self.assertEqual(response.data['duration_minutes'], 15)
+
     def test_remove_tag(self):
         response = self.client.post(
             f'/api/conversations/{self.conversation.id}/remove_tag/',
@@ -1570,6 +1601,18 @@ class SSEPrefetchFreshnessTests(APITestCase):
         meta = self.client.get(f'/api/conversations/{self.conv.id}/metadata/')
         self.assertIsNone(meta.data.get('active_take'))
 
+    @patch('api.views.get_sync_redis')
+    def test_release_sets_escalation_cooldown(self, mock_get_redis):
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+        conv_id = self.conv.id
+        ConversationTake.create_take(
+            conversation=self.conv, created_by=self.user, duration_minutes=60,
+        )
+        response = self.client.post(f'/api/conversations/{conv_id}/release_conversation/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        mock_redis.setex.assert_called_once_with(f"bot:escalated:{conv_id}", 600, "1")
+
 
 # ── Cursor Pagination ────────────────────────────────────────────────────────
 
@@ -2101,6 +2144,22 @@ class BotDispatcherTests(SimpleTestCase):
         mock_filter.return_value.exists.return_value = False
         from api.bot.dispatcher import has_domii_tag
         self.assertFalse(has_domii_tag(1))
+
+    @patch('api.bot.dispatcher.get_bot_user')
+    @patch('api.bot.dispatcher.ConversationTake.objects.filter')
+    def test_has_active_human_take_false_when_no_take(self, mock_filter, mock_get_bot):
+        mock_filter.return_value.select_related.return_value.first.return_value = None
+        from api.bot.dispatcher import has_active_human_take
+        self.assertFalse(has_active_human_take(1))
+
+    @patch('api.bot.dispatcher.get_bot_user')
+    @patch('api.bot.dispatcher.ConversationTake.objects.filter')
+    def test_has_active_human_take_false_when_created_by_none(self, mock_filter, mock_get_bot):
+        mock_take = MagicMock()
+        mock_take.created_by = None
+        mock_filter.return_value.select_related.return_value.first.return_value = mock_take
+        from api.bot.dispatcher import has_active_human_take
+        self.assertFalse(has_active_human_take(1))
 
 
 # ── Bot Schedule API Tests ─────────────────────────────────────────────────

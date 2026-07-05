@@ -823,6 +823,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         except ConversationNote.DoesNotExist:
             return Response({'error': 'Note not found'}, status=status.HTTP_404_NOT_FOUND)
 
+    @transaction.atomic
     @action(detail=True, methods=['post'])
     def take_conversation(self, request, pk=None):
         """Take a conversation for a set amount of time"""
@@ -845,7 +846,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 conversation.save(update_fields=['resolved_by_bot'])
             release_agent_take_records(conversation)
             ConversationTake.objects.filter(conversation=conversation).delete()
-            get_sync_redis().delete(f"bot:escalated:{conversation.id}")
             duration_minutes = serializer.validated_data.get('duration_minutes', 10)
             take = ConversationTake.create_take(
                 conversation=conversation,
@@ -880,6 +880,10 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 )
             release_agent_take_records(conversation, agent=active_take.created_by)
             active_take.delete()
+            try:
+                get_sync_redis().setex(f"bot:escalated:{conversation.id}", 600, "1")
+            except Exception:
+                pass
         conversation.save()
         if hasattr(conversation, '_prefetched_objects_cache'):
             conversation._prefetched_objects_cache.pop('takes', None)
