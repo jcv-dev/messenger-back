@@ -2163,14 +2163,8 @@ def _publish_call_event(call, event_type):
             default_group = get_default_group()
             if default_group:
                 group_id = default_group.id
-        from api.realtime import GROUP_CHANNEL_PREFIX, REDIS_CHANNEL
-        from api.redis_client import get_sync_redis
-        r = get_sync_redis()
-        data = json.dumps(payload, default=str)
-        if group_id:
-            r.publish(f"{GROUP_CHANNEL_PREFIX}:{group_id}", data)
-        else:
-            r.publish(REDIS_CHANNEL, data)
+        from api.realtime import publish
+        publish(payload, group_id=group_id)
     except Exception:
         logger.exception("Failed to publish call SSE event type=%s", event_type)
 
