@@ -249,15 +249,9 @@ class ConversationSerializer(serializers.ModelSerializer):
         ]
 
     def get_is_pinned_by_me(self, obj):
-        request = self.context.get('request')
-        if not request or not request.user.is_authenticated:
-            return False
         return obj._has_user_pin if hasattr(obj, '_has_user_pin') else False
 
     def get_pinned_by_me_at(self, obj):
-        request = self.context.get('request')
-        if not request or not request.user.is_authenticated:
-            return None
         return getattr(obj, '_user_pin_at', None)
 
     def get_unread_count(self, obj):
@@ -306,15 +300,9 @@ class ConversationListSerializer(serializers.ModelSerializer):
         ]
 
     def get_is_pinned_by_me(self, obj):
-        request = self.context.get('request')
-        if not request or not request.user.is_authenticated:
-            return False
         return obj._has_user_pin if hasattr(obj, '_has_user_pin') else False
 
     def get_pinned_by_me_at(self, obj):
-        request = self.context.get('request')
-        if not request or not request.user.is_authenticated:
-            return None
         return getattr(obj, '_user_pin_at', None)
 
     def get_active_take(self, obj):
