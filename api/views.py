@@ -13,12 +13,12 @@ from django.http import FileResponse, HttpResponse, HttpResponseNotFound, JsonRe
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.cache import cache_page
-from django.db import transaction
+from django.db import transaction, models
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from datetime import datetime, timezone as dt_timezone, timedelta
 from django.shortcuts import get_object_or_404
-from django.db.models import Exists, OuterRef, Subquery, Q, Count, Prefetch
+from django.db.models import Exists, OuterRef, Subquery, Q, Count, Prefetch, Value
 from django.core.signing import BadSignature
 import threading
 import hmac
@@ -26,7 +26,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
@@ -556,6 +556,35 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
 
 # --- WhatsApp Calling API helpers ---
 
+CALL_ERROR_MESSAGES = {
+    138006: "El destinatario no tiene habilitados los permisos para recibir llamadas.",
+    138007: "Llamada rechazada por el destinatario.",
+    138008: "El destinatario no contestó la llamada.",
+    368: "Se ha excedido el límite de llamadas. Intente más tarde.",
+    100: "Error de autenticación con WhatsApp. Verifique la configuración del token.",
+}
+
+
+class CallAPIError(Exception):
+    def __init__(self, message, error_code=None, error_subcode=None, original_message=None, http_status=None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.error_subcode = error_subcode
+        self.original_message = original_message
+        self.http_status = http_status
+
+
+def _parse_whatsapp_error(e):
+    err_data = {}
+    try:
+        err_body = e.read().decode() if hasattr(e, 'read') else '{}'
+        parsed = json.loads(err_body)
+        err_data = parsed.get('error', {})
+    except Exception:
+        pass
+    return err_data
+
+
 def _call_whatsapp_api(phone_number_id, payload):
     token = settings.WHATSAPP_API_TOKEN
     url = f"https://graph.facebook.com/v20.0/{phone_number_id}/calls"
@@ -572,9 +601,21 @@ def _call_whatsapp_api(phone_number_id, payload):
         with urllib.request.urlopen(req) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
-        err_body = e.read().decode() if hasattr(e, 'read') else ''
-        logger.error("WhatsApp /calls API error %s: %s", e.code, err_body[:500])
-        raise
+        err_data = _parse_whatsapp_error(e)
+        error_code = err_data.get('code')
+        error_subcode = err_data.get('error_subcode')
+        error_message = err_data.get('message', '')
+        logger.error("WhatsApp /calls API error %s: %s", e.code, error_message[:500])
+        friendly = CALL_ERROR_MESSAGES.get(error_code)
+        if not friendly:
+            friendly = f"Error al conectar con WhatsApp ({e.code})"
+        raise CallAPIError(
+            friendly,
+            error_code=error_code,
+            error_subcode=error_subcode,
+            original_message=error_message,
+            http_status=e.code,
+        )
 
 
 def send_whatsapp_call_action(phone_number_id, action, call_id=None, to=None,
@@ -654,11 +695,28 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Return conversations for the user's group (staff sees all)"""
-        qs = Conversation.objects.select_related('group').order_by('-is_pinned', 'pinned_at', '-last_message_at', '-created_at')
+        qs = Conversation.objects.select_related('group')
         now = timezone.now()
         last_msg = Message.objects.filter(conversation=OuterRef('pk')).order_by('-created_at')
 
         user = self.request.user
+
+        # Annotate user pin BEFORE visibility filter so it can be referenced
+        if user.is_authenticated:
+            user_pin = ConversationUserPin.objects.filter(
+                conversation=OuterRef('pk'),
+                user=user,
+            )
+            qs = qs.annotate(
+                _has_user_pin=Exists(user_pin),
+                _user_pin_at=Subquery(user_pin.values('pinned_at')[:1]),
+            )
+        else:
+            qs = qs.annotate(
+                _has_user_pin=Value(False, output_field=models.BooleanField()),
+                _user_pin_at=Value(None, output_field=models.DateTimeField()),
+            )
+
         if user.is_authenticated and not user.is_staff:
             try:
                 profile = user.profile
@@ -669,6 +727,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
             # Only filter out other-human-taken conversations for list views
             # Detail actions rely on action-level permission checks instead
+            # Pinned conversations bypass the filter
             if self.action in ('list', 'active_conversations'):
                 other_human_takes = ConversationTake.objects.filter(
                     conversation=OuterRef('pk'),
@@ -676,7 +735,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 ).exclude(created_by__isnull=True).exclude(created_by=user).exclude(created_by__username='bot')
                 qs = qs.annotate(
                     _has_other_human_take=Exists(other_human_takes)
-                ).filter(_has_other_human_take=False)
+                ).filter(
+                    Q(_has_other_human_take=False)
+                    | Q(is_pinned=True)
+                    | Q(_has_user_pin=True)
+                )
+
+        qs = qs.order_by(
+            '-is_pinned', 'pinned_at', '-_has_user_pin', '-last_message_at', '-created_at'
+        )
 
         return qs.annotate(
             _last_msg_sender=Subquery(last_msg.values('sender_name')[:1]),
@@ -774,7 +841,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 conversation.save(update_fields=['resolved_by_bot'])
             ConversationTake.objects.filter(conversation=conversation).delete()
             get_sync_redis().delete(f"bot:escalated:{conversation.id}")
-            duration_minutes = serializer.validated_data.get('duration_minutes', 30)
+            duration_minutes = serializer.validated_data.get('duration_minutes', 10)
             take = ConversationTake.create_take(
                 conversation=conversation,
                 created_by=request.user,
@@ -896,15 +963,40 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def toggle_pin(self, request, pk=None):
-        """Toggle the pinned state of a conversation."""
+        """Toggle pinned state. type=group (group-wide, visible to all in the group)
+        or type=personal (default, user-specific)."""
         conversation = self.get_object()
-        conversation.is_pinned = not conversation.is_pinned
-        conversation.pinned_at = timezone.now() if conversation.is_pinned else None
-        conversation.save(update_fields=['is_pinned', 'pinned_at'])
+        pin_type = request.data.get('type', 'personal')
+
+        if pin_type == 'group':
+            conversation.is_pinned = not conversation.is_pinned
+            conversation.pinned_at = timezone.now() if conversation.is_pinned else None
+            conversation.save(update_fields=['is_pinned', 'pinned_at'])
+            _log_audit(request.user, conversation, 'pin' if conversation.is_pinned else 'unpin', 'group')
+        else:
+            user_pin, created = ConversationUserPin.objects.get_or_create(
+                conversation=conversation, user=request.user,
+            )
+            if not created:
+                user_pin.delete()
+                _log_audit(request.user, conversation, 'unpin', 'personal')
+            else:
+                _log_audit(request.user, conversation, 'pin', 'personal')
+
+        # Set annotations on instance so serializer can find them
+        user_pin_exists = ConversationUserPin.objects.filter(
+            conversation=conversation, user=request.user,
+        ).exists()
+        conversation._has_user_pin = user_pin_exists
+        if user_pin_exists:
+            pin_obj = ConversationUserPin.objects.get(conversation=conversation, user=request.user)
+            conversation._user_pin_at = pin_obj.pinned_at
+        else:
+            conversation._user_pin_at = None
+
         if hasattr(conversation, '_prefetched_objects_cache'):
             conversation._prefetched_objects_cache.pop('takes', None)
         publish_conversation_update(conversation)
-        _log_audit(request.user, conversation, 'pin' if conversation.is_pinned else 'unpin')
         serializer = self.get_serializer(conversation)
         return Response(serializer.data)
 
@@ -1082,7 +1174,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if before:
             queryset = queryset.filter(last_message_at__lt=before)
 
-        queryset = queryset.order_by('-is_pinned', 'pinned_at', '-last_message_at', '-created_at')
+        queryset = queryset.order_by('-is_pinned', 'pinned_at', '-_has_user_pin', '-last_message_at', '-created_at')
         conv_page = list(queryset[:limit + 1])
         has_more = len(conv_page) > limit
         conv_page = conv_page[:limit]
@@ -3040,13 +3132,12 @@ def call_answer(request):
             logger.info("call_answer %s: recording NOT enabled (config false/missing)", call_id)
         call.save()
 
-        ConversationTake.objects.update_or_create(
+        ConversationTake.objects.filter(conversation=call.conversation).delete()
+        ConversationTake.objects.create(
             conversation=call.conversation,
             created_by=request.user,
-            defaults={
-                'expires_at': timezone.now() + timedelta(minutes=30),
-                'duration_minutes': 30,
-            },
+            duration_minutes=10,
+            expires_at=timezone.now() + timedelta(minutes=10),
         )
 
         pre_accept_call(call_id, sdp)
@@ -3180,21 +3271,40 @@ def call_initiate(request):
             ),
         )
 
-        ConversationTake.objects.update_or_create(
+        ConversationTake.objects.filter(conversation=conversation).delete()
+        ConversationTake.objects.create(
             conversation=conversation,
             created_by=request.user,
-            defaults={
-                'expires_at': timezone.now() + timedelta(minutes=30),
-                'duration_minutes': 30,
-            },
+            duration_minutes=10,
+            expires_at=timezone.now() + timedelta(minutes=10),
         )
 
         _publish_call_event(call, 'outgoing_pending')
 
         return JsonResponse({'success': True, 'call_id': call_id})
+    except CallAPIError as e:
+        logger.exception("Failed to initiate call to %s: %s", to_number, e.original_message or str(e))
+        call = Call.objects.create(
+            call_id=f'failed-{uuid4().hex[:8]}',
+            conversation=conversation,
+            direction='outbound',
+            status='failed',
+            from_number=settings.WHATSAPP_PHONE_NUMBER_ID,
+            to_number=to_number or '',
+            error_code=e.error_code,
+            error_message=str(e),
+        )
+        return JsonResponse({
+            'error': str(e),
+            'error_code': e.error_code,
+            'error_subcode': e.error_subcode,
+        }, status=500)
     except Exception as e:
         logger.exception("Failed to initiate call to %s", to_number)
-        return JsonResponse({'error': str(e)}, status=500)
+        return JsonResponse({
+            'error': 'Error inesperado al iniciar la llamada. Intente nuevamente.',
+            'error_code': None,
+        }, status=500)
 
 
 @api_view(['GET'])
@@ -3499,3 +3609,67 @@ def export_conversations_csv(request):
     response = StreamingHttpResponse(stream(), content_type='text/csv; charset=utf-8')
     response['Content-Disposition'] = f'attachment; filename="conversaciones_{timezone.now().strftime("%Y%m%d")}.csv"'
     return response
+
+
+@api_view(['GET'])
+@authentication_classes([TokenAuthentication])
+@permission_classes([IsAuthenticated, IsAdminUser])
+def agent_stats(request):
+    """Per-agent statistics for admin view."""
+    from django.db.models import Count
+    import redis as sync_redis
+
+    days = int(request.query_params.get('days', 30))
+    since = timezone.now() - timedelta(days=days)
+
+    agents = User.objects.filter(is_staff=False).exclude(username='bot').select_related('profile__group', 'presence')
+
+    msg_counts = dict(
+        Message.objects.filter(
+            sender__in=agents, direction='outbound', created_at__gte=since,
+        ).values('sender_id').annotate(cnt=Count('id')).values_list('sender_id', 'cnt')
+    )
+
+    conv_counts = dict(
+        ConversationTake.objects.filter(
+            created_by__in=agents, created_at__gte=since,
+        ).values('created_by_id').annotate(cnt=Count('conversation_id', distinct=True)).values_list('created_by_id', 'cnt')
+    )
+
+    presences = {}
+    try:
+        r = sync_redis.from_url(settings.REDIS_URL, decode_responses=True)
+        for key in r.scan_iter('agent:presence:*'):
+            uid = key.split(':')[-1]
+            try:
+                uid_int = int(uid)
+                presences[uid_int] = r.get(key) or 'offline'
+            except ValueError:
+                pass
+        r.close()
+    except Exception:
+        pass
+
+    results = []
+    for agent in agents:
+        uid = agent.id
+        online_status = presences.get(uid)
+        if not online_status:
+            try:
+                online_status = agent.presence.status
+            except Exception:
+                online_status = 'offline'
+
+        results.append({
+            'id': uid,
+            'username': agent.username,
+            'first_name': agent.first_name,
+            'last_name': agent.last_name,
+            'group': agent.profile.group.name if hasattr(agent, 'profile') and agent.profile and agent.profile.group else None,
+            'online': online_status in ('online', 'away'),
+            'status': online_status,
+            'messages_sent': msg_counts.get(uid, 0),
+            'conversations_handled': conv_counts.get(uid, 0),
+        })
+
+    return Response({'results': results, 'days': days})

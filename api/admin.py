@@ -8,7 +8,7 @@ from django.urls import path
 from django.conf import settings
 from django.contrib import messages
 from django.http import HttpResponseNotAllowed
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, UserProfile, BotExemptContact, Call
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, CityGroup, UserProfile, BotExemptContact, Call
 
 import json
 import urllib.request
@@ -48,6 +48,13 @@ class ConversationTakeAdmin(admin.ModelAdmin):
     list_display = ['conversation', 'created_by', 'duration_minutes', 'expires_at']
     list_filter = ['created_at']
     search_fields = ['conversation__contact_name', 'created_by__username']
+
+
+@admin.register(ConversationUserPin)
+class ConversationUserPinAdmin(admin.ModelAdmin):
+    list_display = ['user', 'conversation', 'pinned_at']
+    list_filter = ['pinned_at']
+    search_fields = ['user__username', 'conversation__contact_name']
 
 
 @admin.register(StickerAsset)

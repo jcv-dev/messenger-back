@@ -229,15 +229,33 @@ class ConversationNote(models.Model):
         ordering = ['-created_at']
 
 
+class ConversationUserPin(models.Model):
+    """User-specific pin for a conversation, separate from group-wide is_pinned."""
+
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='user_pins')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='pinned_conversations')
+    pinned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('conversation', 'user')]
+        ordering = ['-pinned_at']
+        indexes = [
+            models.Index(fields=['user', 'conversation']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.username} pinned {self.conversation.contact_name}"
+
+
 class ConversationTake(models.Model):
     """Active claims for a conversation."""
 
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='takes')
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='taken_conversations')
-    duration_minutes = models.PositiveIntegerField(default=30)
+    duration_minutes = models.PositiveIntegerField(default=10)
     expires_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
-    
+
     def __str__(self):
         return f"Taken - {self.conversation.contact_name}"
 
@@ -245,7 +263,7 @@ class ConversationTake(models.Model):
         return timezone.now() > self.expires_at
 
     @classmethod
-    def create_take(cls, conversation, created_by=None, duration_minutes=30):
+    def create_take(cls, conversation, created_by=None, duration_minutes=10):
         take = cls(
             conversation=conversation,
             created_by=created_by,

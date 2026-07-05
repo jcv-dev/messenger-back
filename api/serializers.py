@@ -234,6 +234,8 @@ class ConversationSerializer(serializers.ModelSerializer):
     active_tags = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
     group = CityGroupSerializer(read_only=True)
+    is_pinned_by_me = serializers.SerializerMethodField()
+    pinned_by_me_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -242,8 +244,21 @@ class ConversationSerializer(serializers.ModelSerializer):
             'last_message_at', 'status', 'resolved_by_bot', 'tags', 'active_tags', 'notes',
             'active_notes', 'active_take', 'unread_count', 'group',
             'is_pinned', 'pinned_at',
+            'is_pinned_by_me', 'pinned_by_me_at',
             'created_at', 'updated_at'
         ]
+
+    def get_is_pinned_by_me(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return False
+        return obj._has_user_pin if hasattr(obj, '_has_user_pin') else False
+
+    def get_pinned_by_me_at(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return None
+        return getattr(obj, '_user_pin_at', None)
 
     def get_unread_count(self, obj):
         if hasattr(obj, '_unread_count') and obj._unread_count is not None:
@@ -277,6 +292,8 @@ class ConversationListSerializer(serializers.ModelSerializer):
     last_message_sender = serializers.SerializerMethodField()
     last_message_direction = serializers.SerializerMethodField()
     group = CityGroupSerializer(read_only=True)
+    is_pinned_by_me = serializers.SerializerMethodField()
+    pinned_by_me_at = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
@@ -285,7 +302,20 @@ class ConversationListSerializer(serializers.ModelSerializer):
             'last_message_at', 'status', 'resolved_by_bot', 'active_tags', 'active_take', 'unread_count', 'created_at',
             'last_message_sender', 'last_message_direction', 'group',
             'is_pinned', 'pinned_at',
+            'is_pinned_by_me', 'pinned_by_me_at',
         ]
+
+    def get_is_pinned_by_me(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return False
+        return obj._has_user_pin if hasattr(obj, '_has_user_pin') else False
+
+    def get_pinned_by_me_at(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return None
+        return getattr(obj, '_user_pin_at', None)
 
     def get_active_take(self, obj):
         now = timezone.now()
@@ -340,7 +370,7 @@ class CreateConversationNoteSerializer(serializers.Serializer):
 
 
 class TakeConversationSerializer(serializers.Serializer):
-    duration_minutes = serializers.IntegerField(required=False, default=30, min_value=1)
+    duration_minutes = serializers.IntegerField(required=False, default=10, min_value=1)
 
 
 class InitiateConversationSerializer(serializers.Serializer):

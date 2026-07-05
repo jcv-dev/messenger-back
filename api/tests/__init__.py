@@ -3,7 +3,7 @@ from unittest.mock import patch, MagicMock
 from urllib.parse import quote
 
 from django.db import IntegrityError
-from django.test import SimpleTestCase, override_settings
+from django.test import TestCase, SimpleTestCase, override_settings
 from django.conf import settings
 from django.urls import resolve, reverse
 from django.contrib.auth.models import User
@@ -14,7 +14,7 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, AgentPresence, PushSubscription, AuditLog, CannedResponse
+from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, AgentPresence, PushSubscription, AuditLog, CannedResponse
 from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
@@ -2609,7 +2609,7 @@ class SerializerTests(APITestCase):
 # ── Conversation Pin ───────────────────────────────────────────────────────
 
 class ConversationPinTests(APITestCase):
-    """Test pin/unpin conversations."""
+    """Test pin/unpin conversations — both group and personal pins."""
 
     def setUp(self):
         self.user = User.objects.create_user(username='pinuser', password='testpass123')
@@ -2622,22 +2622,41 @@ class ConversationPinTests(APITestCase):
             contact_phone='15550000111', group=self.group,
         )
 
-    def test_toggle_pin_sets_pin(self):
-        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+    def test_group_pin_sets_pin(self):
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'group'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.conv.refresh_from_db()
         self.assertTrue(self.conv.is_pinned)
         self.assertIsNotNone(self.conv.pinned_at)
 
-    def test_toggle_pin_unsets_pin(self):
+    def test_group_pin_unsets_pin(self):
         self.conv.is_pinned = True
         self.conv.pinned_at = timezone.now()
         self.conv.save(update_fields=['is_pinned', 'pinned_at'])
-        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'group'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.conv.refresh_from_db()
         self.assertFalse(self.conv.is_pinned)
         self.assertIsNone(self.conv.pinned_at)
+
+    def test_personal_pin_creates_user_pin(self):
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'personal'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(ConversationUserPin.objects.filter(conversation=self.conv, user=self.user).exists())
+
+    def test_personal_pin_removes_on_second_toggle(self):
+        self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'personal'})
+        self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'personal'})
+        self.assertFalse(ConversationUserPin.objects.filter(conversation=self.conv, user=self.user).exists())
+
+    def test_personal_pin_returns_is_pinned_by_me(self):
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'personal'})
+        self.assertTrue(response.data.get('is_pinned_by_me'))
+
+    def test_personal_pin_does_not_affect_is_pinned(self):
+        self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'personal'})
+        self.conv.refresh_from_db()
+        self.assertFalse(self.conv.is_pinned)
 
     def test_pinned_sorted_first(self):
         conv2 = Conversation.objects.create(
@@ -2662,11 +2681,19 @@ class ConversationPinTests(APITestCase):
         response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_toggle_pin_returns_updated(self):
-        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/')
+    def test_group_pin_returns_updated(self):
+        response = self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'group'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn('is_pinned', response.data)
         self.assertTrue(response.data['is_pinned'])
+
+    def test_list_includes_is_pinned_by_me(self):
+        self.client.post(f'/api/conversations/{self.conv.id}/toggle_pin/', {'type': 'personal'})
+        response = self.client.get('/api/conversations/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        if len(response.data) > 0:
+            self.assertIn('is_pinned_by_me', response.data[0])
+            self.assertTrue(response.data[0]['is_pinned_by_me'])
 
 
 # ── Audit Log ──────────────────────────────────────────────────────────────
@@ -2754,7 +2781,7 @@ class AuditLogAPITests(APITestCase):
 
     def test_take_creates_audit_entry(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
-        self.client.post(f'/api/conversations/{self.conv.id}/take_conversation/', {'duration_minutes': 30})
+        self.client.post(f'/api/conversations/{self.conv.id}/take_conversation/', {'duration_minutes': 10})
         self.assertTrue(AuditLog.objects.filter(action='take', conversation=self.conv).exists())
 
     def test_release_creates_audit_entry(self):
