@@ -1359,8 +1359,11 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         search_query = SearchQuery(q, config='spanish', search_type='websearch')
         vector = SearchVector('content', weight='A', config='spanish')
 
-        qs = Message.objects.select_related('conversation').filter(
-            search_vector__search=search_query
+        qs = Message.objects.select_related('conversation').annotate(
+            fts_rank=SearchRank(vector, search_query),
+            trigram_sim=TrigramSimilarity('content', q),
+        ).filter(
+            Q(search_vector__search=search_query) | Q(trigram_sim__gt=0.15)
         )
 
         if not user.is_staff:
@@ -1378,21 +1381,22 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
             ).exclude(created_by=user).exclude(created_by__username='bot')
             qs = qs.annotate(_msg_other_take=Exists(other_takes)).filter(_msg_other_take=False)
 
-        qs = qs.annotate(
-            rank=SearchRank(vector, search_query),
-        ).order_by('-rank')[:limit]
+        qs = qs.order_by('-fts_rank', '-trigram_sim')[:limit]
 
         results = []
         for msg in qs:
             contact_name = msg.conversation.custom_name or msg.conversation.contact_name
             snippet = msg.content[:200] if msg.content else ''
+            rank_val = float(
+                msg.fts_rank or 0
+            ) + float(msg.trigram_sim or 0) * 0.5
             results.append({
                 'message_id': msg.id,
                 'conversation_id': msg.conversation_id,
                 'contact_name': contact_name,
                 'snippet': snippet,
                 'created_at': msg.created_at,
-                'rank': float(msg.rank) if hasattr(msg, 'rank') else 0.0,
+                'rank': round(rank_val, 4),
             })
 
         return Response({
@@ -2155,7 +2159,18 @@ def _publish_call_event(call, event_type):
             'call': _serialize_call_for_sse(call),
         }
         group_id = call.conversation.group_id if call.conversation_id else None
-        publish(payload, group_id=group_id)
+        if not group_id:
+            default_group = get_default_group()
+            if default_group:
+                group_id = default_group.id
+        from api.realtime import GROUP_CHANNEL_PREFIX, REDIS_CHANNEL
+        from api.redis_client import get_sync_redis
+        r = get_sync_redis()
+        data = json.dumps(payload, default=str)
+        if group_id:
+            r.publish(f"{GROUP_CHANNEL_PREFIX}:{group_id}", data)
+        else:
+            r.publish(REDIS_CHANNEL, data)
     except Exception:
         logger.exception("Failed to publish call SSE event type=%s", event_type)
 
