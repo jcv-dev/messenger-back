@@ -737,7 +737,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     _has_other_human_take=Exists(other_human_takes)
                 ).filter(
                     Q(_has_other_human_take=False)
-                    | Q(is_pinned=True)
                     | Q(_has_user_pin=True)
                 )
 
