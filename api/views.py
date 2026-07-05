@@ -2159,12 +2159,6 @@ def _publish_call_event(call, event_type):
             'call': _serialize_call_for_sse(call),
         }
         group_id = call.conversation.group_id if call.conversation_id else None
-        if not group_id:
-            default_group = get_default_group()
-            if default_group:
-                call.conversation.group = default_group
-                call.conversation.save(update_fields=['group'])
-                group_id = default_group.id
         from api.realtime import publish
         publish(payload, group_id=group_id)
     except Exception:
