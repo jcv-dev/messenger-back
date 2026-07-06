@@ -2436,6 +2436,7 @@ class BotConfigAPITests(APITestCase):
         response = self.client.patch(
             f'/api/bot-config/{cfg.id}/update_value/',
             {'value': False},
+            format='json',
             HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
         )
         self.assertEqual(response.status_code, 200)
