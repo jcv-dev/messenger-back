@@ -65,6 +65,92 @@ def get_default_group():
 _send_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix='wa-send')
 _download_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='wa-dl')
 
+_sweeper_started = False
+_sweeper_lock = threading.Lock()
+
+
+def _start_sweeper():
+    global _sweeper_started
+    with _sweeper_lock:
+        if _sweeper_started:
+            return
+        _sweeper_started = True
+    t = threading.Thread(target=_sweeper_loop, daemon=True, name='msg-sweeper')
+    t.start()
+
+
+def _sweeper_loop():
+    while True:
+        try:
+            _process_pending_messages()
+        except Exception:
+            logger.exception("Message sweeper error")
+        time.sleep(5)
+
+
+def _process_pending_messages():
+    from api.bot.config import get_send_delay_seconds
+    if get_send_delay_seconds() == 0:
+        return
+    now = timezone.now().isoformat()
+    pending = list(Message.objects.filter(
+        metadata__status='pending',
+        metadata__scheduled_for__lte=now,
+    ).select_related('conversation', 'context_message')[:20])
+    for msg in pending:
+        with transaction.atomic():
+            locked = Message.objects.select_for_update(skip_locked=True).filter(
+                id=msg.id, metadata__status='pending'
+            ).first()
+            if locked is None:
+                continue
+            locked.metadata['status'] = 'sending'
+            locked.save(update_fields=['metadata'])
+            _send_pool.submit(
+                send_whatsapp_outbound,
+                locked.message_type, locked.content,
+                locked.conversation.contact_phone,
+                locked.id, locked.conversation_id,
+                context_wamid=locked.context_message.whatsapp_message_id if locked.context_message else None,
+            )
+
+
+def _schedule_delayed_send(message_id):
+    from api.bot.config import get_send_delay_seconds
+    delay = get_send_delay_seconds()
+    if delay == 0:
+        msg = Message.objects.get(id=message_id)
+        _send_pool.submit(
+            send_whatsapp_outbound,
+            msg.message_type, msg.content,
+            msg.conversation.contact_phone,
+            msg.id, msg.conversation_id,
+            context_wamid=msg.context_message.whatsapp_message_id if msg.context_message else None,
+        )
+        return
+    _start_sweeper()
+    threading.Timer(delay, _delayed_send, args=[message_id]).start()
+
+
+def _delayed_send(message_id):
+    try:
+        with transaction.atomic():
+            msg = Message.objects.select_for_update().get(id=message_id)
+            if msg.metadata.get('status') != 'pending':
+                return
+            msg.metadata['status'] = 'sending'
+            msg.save(update_fields=['metadata'])
+    except Message.DoesNotExist:
+        return
+    _send_pool.submit(
+        send_whatsapp_outbound,
+        msg.message_type, msg.content,
+        msg.conversation.contact_phone,
+        msg.id, msg.conversation_id,
+        context_wamid=msg.context_message.whatsapp_message_id if msg.context_message else None,
+    )
+
+
 import uuid
 import os
 import mimetypes
@@ -505,8 +591,10 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                     resp_data = json.loads(resp_body)
                     wamid = resp_data.get('messages', [{}])[0].get('id', '')
                     if wamid:
-                        Message.objects.filter(id=message_id).update(whatsapp_message_id=wamid)
-                        logger.info('Updated message %d with wamid %s', message_id, wamid)
+                        sent_msg = Message.objects.get(id=message_id)
+                        sent_msg.whatsapp_message_id = wamid
+                        sent_msg.metadata['status'] = 'sent'
+                        sent_msg.save(update_fields=['whatsapp_message_id', 'metadata'])
                     if conversation_id:
                         try:
                             conv = Conversation.objects.get(id=conversation_id)
@@ -531,6 +619,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                 meta = failed_msg.metadata or {}
                 meta['send_error'] = err_data.get('message', body[:200]) or body[:200]
                 meta['send_error_code'] = err_data.get('code', e.code)
+                meta['status'] = 'failed'
                 failed_msg.metadata = meta
                 failed_msg.save(update_fields=['metadata'])
                 if conversation_id:
@@ -545,6 +634,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                 failed_msg = Message.objects.get(id=message_id)
                 meta = failed_msg.metadata or {}
                 meta['send_error'] = 'Network error sending message'
+                meta['status'] = 'failed'
                 failed_msg.metadata = meta
                 failed_msg.save(update_fields=['metadata'])
                 if conversation_id:
@@ -1052,7 +1142,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
             before = request.query_params.get('before')
             limit = min(int(request.query_params.get('limit', 50)), 200)
 
-            queryset = conversation.messages.select_related('context_message').all()
+            queryset = conversation.messages.select_related('context_message').filter(
+                Q(metadata__status__isnull=True) | ~Q(metadata__status='cancelled')
+            )
 
             if before:
                 try:
@@ -1160,12 +1252,12 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation.save()
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
-                context_wamid = context_msg.whatsapp_message_id if context_msg else None
-                transaction.on_commit(lambda: _send_pool.submit(
-                    send_whatsapp_outbound,
-                    message_type, content, conversation.contact_phone, message.id, conversation.id,
-                    context_wamid=context_wamid,
-                ))
+                from api.bot.config import get_send_delay_seconds
+                if get_send_delay_seconds() > 0:
+                    message.metadata['status'] = 'pending'
+                    message.metadata['scheduled_for'] = (timezone.now() + timedelta(seconds=get_send_delay_seconds())).isoformat()
+                    message.save(update_fields=['metadata'])
+                transaction.on_commit(lambda mid=message.id: _schedule_delayed_send(mid))
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 set_first_response(conversation, request.user)
@@ -1416,11 +1508,12 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.last_message_at = timezone.now()
         conversation.save()
 
-        transaction.on_commit(lambda: _send_pool.submit(
-            send_whatsapp_outbound,
-            'template', payload, conversation.contact_phone,
-            message.id, conversation.id,
-        ))
+        from api.bot.config import get_send_delay_seconds
+        if get_send_delay_seconds() > 0:
+            message.metadata['status'] = 'pending'
+            message.metadata['scheduled_for'] = (timezone.now() + timedelta(seconds=get_send_delay_seconds())).isoformat()
+            message.save(update_fields=['metadata'])
+        transaction.on_commit(lambda mid=message.id: _schedule_delayed_send(mid))
 
         publish_conversation_update(conversation)
         return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
@@ -1433,7 +1526,9 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = Message.objects.select_related('conversation', 'context_message').all()
+        qs = Message.objects.select_related('conversation', 'context_message').filter(
+            Q(metadata__status__isnull=True) | ~Q(metadata__status='cancelled')
+        )
 
         if user.is_authenticated and not user.is_staff:
             from django.utils import timezone as tz
@@ -1517,6 +1612,18 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
             'total': len(results),
             'has_more': False,
         })
+
+    @action(detail=True, methods=['patch'])
+    def cancel(self, request, pk=None):
+        message = self.get_object()
+        if message.direction != 'outbound':
+            return Response({'detail': 'Only outbound messages can be cancelled'}, status=status.HTTP_400_BAD_REQUEST)
+        if message.metadata.get('status') != 'pending':
+            return Response({'detail': 'Message is no longer cancellable'}, status=status.HTTP_409_CONFLICT)
+        message.metadata['status'] = 'cancelled'
+        message.save(update_fields=['metadata'])
+        publish_conversation_update(message.conversation, MessageSerializer(message).data)
+        return Response({'detail': 'Message cancelled'})
 
 
 from rest_framework.pagination import PageNumberPagination

@@ -104,6 +104,10 @@ def get_tools_cache_ttl():
     return int(get_config('tools_cache_ttl', settings.BOT_TOOLS_CACHE_TTL))
 
 
+def get_send_delay_seconds():
+    return int(get_config('send_delay_seconds', 10))
+
+
 def get_max_user_message_length():
     return int(get_config('max_user_message_length', settings.BOT_MAX_USER_MESSAGE_LENGTH))
 

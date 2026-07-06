@@ -536,3 +536,26 @@ class GroupedHoursTextTests(SimpleTestCase):
         from api.bot.config import get_grouped_hours_text
         result = get_grouped_hours_text()
         self.assertEqual(result, "")
+
+
+class SendDelaySecondsTests(SimpleTestCase):
+    def setUp(self):
+        _clear()
+
+    @patch("api.models.BotConfig")
+    def test_default_delay_10_seconds(self, mock_model):
+        mock_model.objects.all().values_list.return_value = []
+        from api.bot.config import get_send_delay_seconds
+        self.assertEqual(get_send_delay_seconds(), 10)
+
+    @patch("api.models.BotConfig")
+    def test_returns_db_value(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("send_delay_seconds", 30)]
+        from api.bot.config import get_send_delay_seconds
+        self.assertEqual(get_send_delay_seconds(), 30)
+
+    @patch("api.models.BotConfig")
+    def test_zero_disables_delay(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("send_delay_seconds", 0)]
+        from api.bot.config import get_send_delay_seconds
+        self.assertEqual(get_send_delay_seconds(), 0)
