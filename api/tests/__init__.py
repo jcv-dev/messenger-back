@@ -2351,6 +2351,24 @@ class BotConfigAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, 405)
 
+    def test_bot_enabled_can_be_toggled_via_api(self):
+        cfg = self.config_model.objects.create(
+            key='bot_enabled', value=True, description='Global bot toggle',
+        )
+        response = self.client.patch(
+            f'/api/bot-config/{cfg.id}/update_value/',
+            {'value': False},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()['value'], False)
+
+        response = self.client.get(
+            f'/api/bot-config/{cfg.id}/',
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertIs(response.json()['value'], False)
+
 
 # ── WhatsApp Template Tests ─────────────────────────────────────────────
 

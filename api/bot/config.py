@@ -60,6 +60,15 @@ def get_outside_hours_reply():
     )
 
 
+def is_bot_enabled():
+    env_val = os.environ.get("BOT_ENABLED", "").lower()
+    if env_val in ("0", "false", "no"):
+        return False
+    if env_val in ("1", "true", "yes"):
+        return True
+    return bool(get_config('bot_enabled', True))
+
+
 def get_state_machine_enabled():
     env_val = os.environ.get("BOT_STATE_MACHINE", "")
     if env_val in ("1", "true", "yes"):

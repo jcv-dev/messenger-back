@@ -30,7 +30,7 @@ from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session, extract_state_from_turn
 from .llm import handle_with_llm
 from .router import try_route_message
-from .config import is_within_operating_hours, get_outside_hours_reply, get_state_machine_enabled, get_max_user_message_length, get_grouped_hours_text, get_testing_warning_enabled
+from .config import is_within_operating_hours, get_outside_hours_reply, get_state_machine_enabled, get_max_user_message_length, get_grouped_hours_text, get_testing_warning_enabled, is_bot_enabled
 
 logger = logging.getLogger("api.bot")
 
@@ -256,6 +256,10 @@ async def handle_inbound(event: dict):
             logger.debug("Dropping duplicate event for conv=%s (already processing)", conversation_id)
             return
         incr_metric("locks.acquired")
+
+        # --- Bot enabled guard ---
+        if not await sync_to_async(is_bot_enabled)():
+            return
 
         # --- Human take guard ---
         if await sync_to_async(has_active_human_take)(conversation_id):
