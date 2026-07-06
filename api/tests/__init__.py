@@ -543,6 +543,71 @@ class MessageViewSetTests(APITestCase):
         conv_data = next(c for c in response.data['results'] if c['id'] == self.conversation.id)
         self.assertEqual(conv_data['last_message_direction'], 'outbound')
 
+    def test_create_outbound_message_has_pending_status(self):
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Pending message'},
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['metadata']['status'], 'pending')
+        self.assertIn('scheduled_for', response.data['metadata'])
+
+    def test_create_outbound_message_with_zero_delay_skips_pending(self):
+        from api.models import BotConfig
+        BotConfig.objects.update_or_create(key='send_delay_seconds', defaults={'value': 0})
+        from api.bot.config import _clear_cache
+        _clear_cache()
+        try:
+            response = self.client.post(
+                f'/api/conversations/{self.conversation.id}/messages/',
+                {'direction': 'outbound', 'message_type': 'text', 'content': 'Instant message'},
+            )
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+            self.assertNotEqual(response.data['metadata'].get('status'), 'pending')
+        finally:
+            BotConfig.objects.filter(key='send_delay_seconds').delete()
+            _clear_cache()
+
+    def test_cancel_pending_message(self):
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Cancelable message'},
+        )
+        msg_id = response.data['id']
+        cancel_resp = self.client.patch(f'/api/messages/{msg_id}/cancel/')
+        self.assertEqual(cancel_resp.status_code, status.HTTP_200_OK)
+        updated = Message.objects.get(id=msg_id)
+        self.assertEqual(updated.metadata['status'], 'cancelled')
+
+    def test_cancel_non_pending_message_returns_409(self):
+        msg = Message.objects.create(
+            conversation=self.conversation, direction='outbound', message_type='text',
+            content='Already sent', sender=self.user,
+            metadata={'status': 'sent'},
+        )
+        cancel_resp = self.client.patch(f'/api/messages/{msg.id}/cancel/')
+        self.assertEqual(cancel_resp.status_code, status.HTTP_409_CONFLICT)
+
+    def test_cancel_inbound_message_returns_400(self):
+        msg = Message.objects.create(
+            conversation=self.conversation, direction='inbound', message_type='text',
+            content='Inbound', sender_name='Test',
+            metadata={'status': 'pending'},
+        )
+        cancel_resp = self.client.patch(f'/api/messages/{msg.id}/cancel/')
+        self.assertEqual(cancel_resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cancelled_message_hidden_from_list(self):
+        msg = Message.objects.create(
+            conversation=self.conversation, direction='outbound', message_type='text',
+            content='Cancelled message', sender=self.user,
+            metadata={'status': 'cancelled'},
+        )
+        response = self.client.get(f'/api/conversations/{self.conversation.id}/messages/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [m['id'] for m in response.data['results']]
+        self.assertNotIn(msg.id, ids)
+
 
 # ── Model logic ─────────────────────────────────────────────────────────────
 
@@ -2363,6 +2428,24 @@ class BotConfigAPITests(APITestCase):
             HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
         )
         self.assertEqual(response.status_code, 405)
+
+    def test_bot_enabled_can_be_toggled_via_api(self):
+        cfg = self.config_model.objects.create(
+            key='bot_enabled', value=True, description='Global bot toggle',
+        )
+        response = self.client.patch(
+            f'/api/bot-config/{cfg.id}/update_value/',
+            {'value': False},
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()['value'], False)
+
+        response = self.client.get(
+            f'/api/bot-config/{cfg.id}/',
+            HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
+        )
+        self.assertIs(response.json()['value'], False)
 
 
 # ── WhatsApp Template Tests ─────────────────────────────────────────────

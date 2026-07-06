@@ -226,6 +226,57 @@ class StateMachineToggleTests(SimpleTestCase):
             self.assertTrue(get_state_machine_enabled())
 
 
+class BotEnabledTests(SimpleTestCase):
+    def setUp(self):
+        _clear()
+
+    @patch("api.models.BotConfig")
+    def test_enabled_by_default(self, mock_model):
+        mock_model.objects.all().values_list.return_value = []
+        from api.bot.config import is_bot_enabled
+        self.assertTrue(is_bot_enabled())
+
+    @patch("api.models.BotConfig")
+    def test_disabled_from_botconfig(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("bot_enabled", False)]
+        from api.bot.config import is_bot_enabled
+        self.assertFalse(is_bot_enabled())
+
+    @patch("api.models.BotConfig")
+    def test_enabled_from_botconfig(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("bot_enabled", True)]
+        from api.bot.config import is_bot_enabled
+        self.assertTrue(is_bot_enabled())
+
+    @patch("api.models.BotConfig")
+    def test_env_var_false_overrides_db_true(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("bot_enabled", True)]
+        with patch.dict("os.environ", {"BOT_ENABLED": "0"}):
+            from api.bot.config import is_bot_enabled
+            self.assertFalse(is_bot_enabled())
+
+    @patch("api.models.BotConfig")
+    def test_env_var_true_overrides_db_false(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("bot_enabled", False)]
+        with patch.dict("os.environ", {"BOT_ENABLED": "1"}):
+            from api.bot.config import is_bot_enabled
+            self.assertTrue(is_bot_enabled())
+
+    @patch("api.models.BotConfig")
+    def test_env_var_no_disables(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("bot_enabled", True)]
+        with patch.dict("os.environ", {"BOT_ENABLED": "no"}):
+            from api.bot.config import is_bot_enabled
+            self.assertFalse(is_bot_enabled())
+
+    @patch("api.models.BotConfig")
+    def test_env_var_false_disables(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("bot_enabled", True)]
+        with patch.dict("os.environ", {"BOT_ENABLED": "false"}):
+            from api.bot.config import is_bot_enabled
+            self.assertFalse(is_bot_enabled())
+
+
 class TypedGetterTests(SimpleTestCase):
     def setUp(self):
         _clear()
@@ -485,3 +536,26 @@ class GroupedHoursTextTests(SimpleTestCase):
         from api.bot.config import get_grouped_hours_text
         result = get_grouped_hours_text()
         self.assertEqual(result, "")
+
+
+class SendDelaySecondsTests(SimpleTestCase):
+    def setUp(self):
+        _clear()
+
+    @patch("api.models.BotConfig")
+    def test_default_delay_10_seconds(self, mock_model):
+        mock_model.objects.all().values_list.return_value = []
+        from api.bot.config import get_send_delay_seconds
+        self.assertEqual(get_send_delay_seconds(), 10)
+
+    @patch("api.models.BotConfig")
+    def test_returns_db_value(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("send_delay_seconds", 30)]
+        from api.bot.config import get_send_delay_seconds
+        self.assertEqual(get_send_delay_seconds(), 30)
+
+    @patch("api.models.BotConfig")
+    def test_zero_disables_delay(self, mock_model):
+        mock_model.objects.all().values_list.return_value = [("send_delay_seconds", 0)]
+        from api.bot.config import get_send_delay_seconds
+        self.assertEqual(get_send_delay_seconds(), 0)

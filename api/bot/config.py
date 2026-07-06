@@ -60,6 +60,15 @@ def get_outside_hours_reply():
     )
 
 
+def is_bot_enabled():
+    env_val = os.environ.get("BOT_ENABLED", "").lower()
+    if env_val in ("0", "false", "no"):
+        return False
+    if env_val in ("1", "true", "yes"):
+        return True
+    return bool(get_config('bot_enabled', True))
+
+
 def get_state_machine_enabled():
     env_val = os.environ.get("BOT_STATE_MACHINE", "")
     if env_val in ("1", "true", "yes"):
@@ -93,6 +102,10 @@ def get_llm_retry_count():
 
 def get_tools_cache_ttl():
     return int(get_config('tools_cache_ttl', settings.BOT_TOOLS_CACHE_TTL))
+
+
+def get_send_delay_seconds():
+    return int(get_config('send_delay_seconds', 10))
 
 
 def get_max_user_message_length():
