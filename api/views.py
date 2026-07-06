@@ -2773,6 +2773,8 @@ def whatsapp_webhook(request):
                         ).first()
                         if ctx_msg:
                             context_message_obj = ctx_msg
+                        else:
+                            logger.info('Context lookup failed: message %s has context.id %s but no matching message in conversation %s', msg_id, ctx_wamid, conversation.id)
 
                 if msg_id:
                     dedup_key = f"wamid_dedup:{msg_id}"

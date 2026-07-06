@@ -1,6 +1,7 @@
 """
 Serializers for WhatsApp Messenger API
 """
+import logging
 import re
 import time
 import urllib.parse
@@ -210,7 +211,8 @@ class MessageSerializer(serializers.ModelSerializer):
                 'media_url': sign_media_url(cm.media_url),
                 'created_at': cm.created_at,
             }
-        except Exception:
+        except Exception as e:
+            logging.getLogger('api').warning('context_message_preview failed for message %s: %s', obj.id, e)
             return None
 
     def get_media_url(self, obj):
