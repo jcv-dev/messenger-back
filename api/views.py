@@ -2945,6 +2945,39 @@ def whatsapp_webhook(request):
                             context_message_obj = ctx_msg
                         else:
                             logger.info('Context lookup failed: message %s has context.id %s but no matching message in conversation %s', msg_id, ctx_wamid, conversation.id)
+                            # Fallback: use context.from to determine the original message's direction
+                            ctx_from = msg['context'].get('from', '')
+                            if ctx_from:
+                                fallback_direction = 'inbound' if ctx_from == wa_id else 'outbound'
+                                fallback_ts = msg.get('timestamp')
+                                if fallback_ts:
+                                    try:
+                                        fallback_dt = datetime.fromtimestamp(int(fallback_ts), tz=dt_timezone.utc)
+                                        ctx_msg = Message.objects.filter(
+                                            conversation=conversation,
+                                            direction=fallback_direction,
+                                            created_at__lt=fallback_dt,
+                                        ).order_by('-created_at').first()
+                                        if ctx_msg:
+                                            logger.info('Context fallback resolved: message %s matched to message %s (direction=%s)', msg_id, ctx_msg.id, fallback_direction)
+                                            context_message_obj = ctx_msg
+                                    except (ValueError, OSError):
+                                        pass
+                            # Last resort: try without direction filter
+                            if not context_message_obj:
+                                fallback_ts = msg.get('timestamp')
+                                if fallback_ts:
+                                    try:
+                                        fallback_dt = datetime.fromtimestamp(int(fallback_ts), tz=dt_timezone.utc)
+                                        ctx_msg = Message.objects.filter(
+                                            conversation=conversation,
+                                            created_at__lt=fallback_dt,
+                                        ).order_by('-created_at').first()
+                                        if ctx_msg:
+                                            logger.info('Context fallback resolved: message %s matched to message %s (no direction)', msg_id, ctx_msg.id)
+                                            context_message_obj = ctx_msg
+                                    except (ValueError, OSError):
+                                        pass
 
                 if msg_id:
                     dedup_key = f"wamid_dedup:{msg_id}"
