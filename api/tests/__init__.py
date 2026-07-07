@@ -1,5 +1,6 @@
 import asyncio
 from unittest.mock import patch, MagicMock
+from django.core.files.uploadedfile import SimpleUploadedFile
 from urllib.parse import quote
 
 from django.db import IntegrityError
@@ -14,7 +15,7 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, AgentPresence, PushSubscription, AuditLog, CannedResponse
+from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, AgentPresence, PushSubscription, AuditLog, CannedResponse, StickerAsset
 from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
@@ -1268,8 +1269,11 @@ class StickerAssetViewSetTests(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(username='stickuser', password='testpass123')
         self.user_token = Token.objects.create(user=self.user)
+        self.admin = User.objects.create_user(username='stickeradmin', password='testpass123', is_staff=True)
+        self.admin_token = Token.objects.create(user=self.admin)
         self.group = get_or_create_tulua_group()
         assign_user_group(self.user, self.group)
+        assign_user_group(self.admin, self.group)
 
     def test_list_requires_auth(self):
         response = self.client.get('/api/stickers/')
@@ -1279,6 +1283,32 @@ class StickerAssetViewSetTests(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
         response = self.client.post('/api/stickers/', {'name': 'test', 'image': ''})
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_create_sticker_with_name(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
+        response = self.client.post('/api/stickers/', {'name': 'Test Sticker', 'image': image})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['name'], 'Test Sticker')
+
+    def test_admin_can_create_sticker_with_blank_name(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
+        response = self.client.post('/api/stickers/', {'name': '', 'image': image})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['name'], '')
+
+    def test_admin_can_create_sticker_without_name_field(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
+        response = self.client.post('/api/stickers/', {'image': image})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['name'], '')
+
+    def test_sticker_str_returns_sin_titulo_when_name_empty(self):
+        image = SimpleUploadedFile("test.png", b"fake", content_type="image/png")
+        sticker = StickerAsset.objects.create(name='', image=image, created_by=self.admin)
+        self.assertEqual(str(sticker), 'Sin título')
 
 
 # ── Auth Throttle ────────────────────────────────────────────────────────────

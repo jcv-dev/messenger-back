@@ -108,7 +108,7 @@ def _process_pending_messages():
             locked.save(update_fields=['metadata'])
             _send_pool.submit(
                 send_whatsapp_outbound,
-                locked.message_type, locked.content,
+                locked.message_type, locked.media_url or locked.content,
                 locked.conversation.contact_phone,
                 locked.id, locked.conversation_id,
                 context_wamid=locked.context_message.whatsapp_message_id if locked.context_message else None,
@@ -122,7 +122,7 @@ def _schedule_delayed_send(message_id):
         msg = Message.objects.get(id=message_id)
         _send_pool.submit(
             send_whatsapp_outbound,
-            msg.message_type, msg.content,
+            msg.message_type, msg.media_url or msg.content,
             msg.conversation.contact_phone,
             msg.id, msg.conversation_id,
             context_wamid=msg.context_message.whatsapp_message_id if msg.context_message else None,
@@ -144,7 +144,7 @@ def _delayed_send(message_id):
         return
     _send_pool.submit(
         send_whatsapp_outbound,
-        msg.message_type, msg.content,
+        msg.message_type, msg.media_url or msg.content,
         msg.conversation.contact_phone,
         msg.id, msg.conversation_id,
         context_wamid=msg.context_message.whatsapp_message_id if msg.context_message else None,

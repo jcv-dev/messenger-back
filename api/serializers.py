@@ -411,6 +411,7 @@ class StickerAssetSerializer(serializers.ModelSerializer):
     class Meta:
         model = StickerAsset
         fields = ['id', 'name', 'image', 'created_by', 'created_at']
+        extra_kwargs = {'name': {'required': False}}
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
