@@ -2,6 +2,7 @@
 Views for WhatsApp Messenger API
 """
 import time
+import base64
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -163,6 +164,27 @@ def _log_audit(actor, conversation, action, detail=''):
         AuditLog.objects.create(actor=actor, conversation=conversation, action=action, detail=detail)
     except Exception:
         logger.exception("Failed to create audit log entry")
+
+def _wamid_msg_sig(wamid_str):
+    """Extract message-identity bytes from a WAMID as a hex signature.
+
+    WhatsApp uses different WAMID namespaces (customer phone vs business WABA)
+    for the same message. The message-identity bytes at the tail of the
+    decoded protobuf are identical across namespaces. Taking the last 25
+    decoded bytes gives a stable signature for matching.
+    """
+    if not wamid_str or not wamid_str.startswith('wamid.'):
+        return None
+    body = wamid_str[len('wamid.'):]
+    padding = len(body) % 4
+    if padding:
+        body += '=' * (4 - padding)
+    try:
+        decoded = base64.b64decode(body)
+        return decoded[-25:].hex()
+    except Exception:
+        return None
+
 
 def publish_conversation_update(conversation, message=None, escalated=False):
     try:
@@ -2945,43 +2967,18 @@ def whatsapp_webhook(request):
                             context_message_obj = ctx_msg
                         else:
                             logger.info('Context lookup failed: message %s has context.id %s but no matching message in conversation %s', msg_id, ctx_wamid, conversation.id)
-                            # Fallback: use context.from to determine the original message's direction
-                            ctx_from = msg['context'].get('from', '')
-                            if ctx_from:
-                                fallback_direction = 'inbound' if ctx_from == wa_id else 'outbound'
-                                fallback_ts = msg.get('timestamp')
-                                if fallback_ts:
-                                    try:
-                                        from datetime import datetime as _fb_dt, timezone as _fb_tz
-                                        fallback_dt = _fb_dt.fromtimestamp(int(fallback_ts), tz=_fb_tz.utc)
-                                        ctx_msg = Message.objects.filter(
-                                            conversation=conversation,
-                                            direction=fallback_direction,
-                                            created_at__lt=fallback_dt,
-                                        ).order_by('-created_at').first()
-                                        if ctx_msg:
-                                            logger.info('Context fallback resolved: message %s matched to message %s (direction=%s)', msg_id, ctx_msg.id, fallback_direction)
-                                            context_message_obj = ctx_msg
-                                    except (ValueError, OSError):
-                                        pass
-                            # Last resort: try without direction filter
-                            if not context_message_obj:
-                                fallback_ts = msg.get('timestamp')
-                                if fallback_ts:
-                                    try:
-                                        from datetime import datetime as _fb_dt, timezone as _fb_tz
-                                        fallback_dt = _fb_dt.fromtimestamp(int(fallback_ts), tz=_fb_tz.utc)
-                                        ctx_msg = Message.objects.filter(
-                                            conversation=conversation,
-                                            created_at__lt=fallback_dt,
-                                        ).order_by('-created_at').first()
-                                        if ctx_msg:
-                                            logger.info('Context fallback resolved: message %s matched to message %s (no direction)', msg_id, ctx_msg.id)
-                                            context_message_obj = ctx_msg
-                                    except (ValueError, OSError):
-                                        pass
+                            ctx_sig = _wamid_msg_sig(ctx_wamid)
+                            if ctx_sig:
+                                ctx_msg = Message.objects.filter(
+                                    conversation=conversation,
+                                    metadata___msg_sig=ctx_sig,
+                                ).first()
+                                if ctx_msg:
+                                    logger.info('Context resolved by WAMID signature: message %s matched to message %s', msg_id, ctx_msg.id)
+                                    context_message_obj = ctx_msg
 
                 if msg_id:
+                    meta['_msg_sig'] = _wamid_msg_sig(msg_id)
                     dedup_key = f"wamid_dedup:{msg_id}"
                     if not cache.add(dedup_key, True, 86400):
                         logger.info('Skipping duplicate message %s (redis cache)', msg_id)
