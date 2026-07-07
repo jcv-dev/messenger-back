@@ -496,7 +496,8 @@ PARAMETER_SOURCE_CHOICES = ['contact_name', 'custom_name', 'contact_phone', 'con
 
 class BulkSendTemplateSerializer(serializers.Serializer):
     template_id = serializers.IntegerField()
-    count = serializers.IntegerField(min_value=1, max_value=100, default=10)
+    count = serializers.IntegerField(min_value=1, max_value=1000, required=False)
+    recipients = serializers.ListField(required=False)
     parameter_sources = serializers.JSONField(required=False, default=dict)
     fixed_values = serializers.JSONField(required=False, default=dict)
 
@@ -508,6 +509,37 @@ class BulkSendTemplateSerializer(serializers.Serializer):
         if template.status != 'APPROVED':
             raise serializers.ValidationError("Template must be APPROVED")
         return value
+
+    def validate_recipients(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Must be a list")
+        if len(value) > 1000:
+            raise serializers.ValidationError("Maximum 1000 recipients")
+        errors = []
+        for i, row in enumerate(value):
+            row_errors = {}
+            if not isinstance(row, dict):
+                row_errors['_'] = 'Must be an object'
+            else:
+                phone = row.get('phone', '')
+                if not phone or not isinstance(phone, str) or not phone.strip():
+                    row_errors['phone'] = 'Phone is required'
+                if 'parameters' in row and not isinstance(row['parameters'], dict):
+                    row_errors['parameters'] = 'Must be an object'
+            if row_errors:
+                errors.append({str(i): row_errors})
+        if errors:
+            raise serializers.ValidationError(errors)
+        return value
+
+    def validate(self, data):
+        has_count = 'count' in data
+        has_recipients = 'recipients' in data and data['recipients']
+        if has_count and has_recipients:
+            raise serializers.ValidationError("Cannot provide both 'count' and 'recipients'")
+        if not has_count and not has_recipients:
+            data['count'] = 10
+        return data
 
     def validate_parameter_sources(self, value):
         for var_name, source in value.items():

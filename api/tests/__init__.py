@@ -2558,6 +2558,53 @@ class WhatsAppTemplateViewSetTests(APITestCase):
         response = self.client.post('/api/templates/bulk_send/', {'template_id': self.template.id, 'count': 5}, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_bulk_send_with_recipients_creates_conversations(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '573001111111', 'parameters': {'nombre': 'Juan'}},
+                {'phone': '573002222222', 'parameters': {'nombre': 'Maria'}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+        self.assertEqual(data['queued'], 2)
+        self.assertEqual(data['created'], 2)
+        self.assertEqual(data['total'], 2)
+        conv1 = Conversation.objects.get(contact_phone='573001111111')
+        self.assertEqual(conv1.contact_name, '573001111111')
+        conv2 = Conversation.objects.get(contact_phone='573002222222')
+        self.assertEqual(conv2.contact_name, '573002222222')
+
+    def test_bulk_send_with_recipients_uses_existing_conversation(self):
+        conv = Conversation.objects.create(
+            contact_phone='573001111111', whatsapp_id='573001111111',
+            contact_name='Existing', group=self.group,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '573001111111', 'parameters': {'nombre': 'Juan'}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+        self.assertEqual(data['queued'], 1)
+        self.assertEqual(data['created'], 0)
+        self.assertEqual(data['total'], 1)
+
+    def test_bulk_send_with_recipients_rejects_empty_phone(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '', 'parameters': {'nombre': 'Juan'}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
 
 class SendTemplateActionTests(APITestCase):
     """Test the send_template action on ConversationViewSet."""
@@ -2743,9 +2790,44 @@ class SerializerTests(APITestCase):
     def test_bulk_send_serializer_max_count(self):
         serializer = BulkSendTemplateSerializer(data={
             'template_id': self.template.id,
-            'count': 999,
+            'count': 1001,
         })
         self.assertFalse(serializer.is_valid())
+
+    def test_bulk_send_serializer_recipients_valid(self):
+        serializer = BulkSendTemplateSerializer(data={
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '573001234567', 'parameters': {'nombre': 'Juan'}},
+                {'phone': '573007654321', 'parameters': {'nombre': 'Maria'}},
+            ],
+        })
+        self.assertTrue(serializer.is_valid())
+        self.assertEqual(len(serializer.validated_data['recipients']), 2)
+
+    def test_bulk_send_serializer_recipients_missing_phone(self):
+        serializer = BulkSendTemplateSerializer(data={
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '', 'parameters': {'nombre': 'Juan'}},
+            ],
+        })
+        self.assertFalse(serializer.is_valid())
+
+    def test_bulk_send_serializer_rejects_both_count_and_recipients(self):
+        serializer = BulkSendTemplateSerializer(data={
+            'template_id': self.template.id,
+            'count': 10,
+            'recipients': [{'phone': '573001234567'}],
+        })
+        self.assertFalse(serializer.is_valid())
+
+    def test_bulk_send_serializer_defaults_to_count_when_neither_given(self):
+        serializer = BulkSendTemplateSerializer(data={
+            'template_id': self.template.id,
+        })
+        self.assertTrue(serializer.is_valid())
+        self.assertEqual(serializer.validated_data['count'], 10)
 
 
 # ── Conversation Pin ───────────────────────────────────────────────────────

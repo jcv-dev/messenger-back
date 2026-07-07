@@ -1855,40 +1855,20 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def bulk_send(self, request):
-        """Send a template to the last N conversations (admin only)."""
+        """Send a template to conversations (admin only).
+        Two modes: 'count' (last N conversations) or 'recipients' (CSV upload).
+        """
         from .serializers import BulkSendTemplateSerializer
         serializer = BulkSendTemplateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         template = WhatsAppTemplate.objects.get(id=serializer.validated_data['template_id'])
-        count = serializer.validated_data['count']
+        recipients = serializer.validated_data.get('recipients')
         parameter_sources = serializer.validated_data.get('parameter_sources', {})
         fixed_values = serializer.validated_data.get('fixed_values', {})
         header_media_id = request.data.get('header_media_id')
 
-        conversations = Conversation.objects.exclude(
-            contact_phone__isnull=True,
-        ).exclude(contact_phone='').order_by('-last_message_at')[:count]
-
-        def _resolve_params(conv):
-            """Resolve template parameters for a given conversation."""
-            resolved = {}
-            for var_name, source in parameter_sources.items():
-                if source == 'contact_name':
-                    resolved[var_name] = conv.contact_name or ''
-                elif source == 'custom_name':
-                    resolved[var_name] = conv.custom_name or conv.contact_name or ''
-                elif source == 'contact_phone':
-                    resolved[var_name] = conv.contact_phone or ''
-                elif source == 'conversation_id':
-                    resolved[var_name] = str(conv.id)
-                elif source == 'fixed':
-                    resolved[var_name] = fixed_values.get(var_name, '')
-            return resolved
-
-        queued = 0
-        for conv in conversations:
-            resolved_params = _resolve_params(conv)
+        def _build_components(resolved_params):
             components = []
             for comp in template.components:
                 comp_type = comp.get('type')
@@ -1924,13 +1904,15 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                             'type': 'button', 'sub_type': 'url',
                             'index': '0', 'parameters': btn_components,
                         })
+            return components
 
+        def _send_to_conversation(conv, resolved_params):
+            components = _build_components(resolved_params)
             payload = {
                 'name': template.name,
                 'language': {'code': template.language},
                 'components': components,
             }
-
             message = Message.objects.create(
                 conversation=conv,
                 direction='outbound',
@@ -1939,18 +1921,77 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                 sender_name='Bot',
                 sender=None,
             )
-
             conv.last_message = f'[{template.name}]'
             conv.last_message_at = timezone.now()
             conv.save(update_fields=['last_message', 'last_message_at'])
-
             transaction.on_commit(lambda c=conv, p=payload, m=message: _send_pool.submit(
                 send_whatsapp_outbound,
                 'template', p, c.contact_phone, m.id, c.id,
             ))
-
             publish_conversation_update(conv)
-            queued += 1
+            return 1
+
+        # ── Recipients (CSV) mode ──
+        if recipients:
+            queued = 0
+            created = 0
+            errors = []
+            for idx, entry in enumerate(recipients):
+                phone = entry.get('phone', '').strip()
+                row_params = entry.get('parameters', {})
+                if not phone:
+                    errors.append({'row': idx, 'phone': phone, 'error': 'Teléfono vacío'})
+                    continue
+                conv, is_new = Conversation.objects.get_or_create(
+                    contact_phone=phone,
+                    defaults={
+                        'whatsapp_id': phone,
+                        'contact_name': phone,
+                        'group': get_default_group(),
+                        'status': 'active',
+                    },
+                )
+                if is_new:
+                    created += 1
+                try:
+                    _send_to_conversation(conv, row_params)
+                    queued += 1
+                except Exception as e:
+                    logger.exception('Error sending CSV row %d to %s', idx, phone)
+                    errors.append({'row': idx, 'phone': phone, 'error': str(e)})
+            return Response({
+                'queued': queued,
+                'created': created,
+                'total': len(recipients),
+                'errors': errors,
+                'template_name': template.name,
+            })
+
+        # ── Count (last N conversations) mode ──
+        count = serializer.validated_data['count']
+        conversations = Conversation.objects.exclude(
+            contact_phone__isnull=True,
+        ).exclude(contact_phone='').order_by('-last_message_at')[:count]
+
+        def _resolve_params(conv):
+            resolved = {}
+            for var_name, source in parameter_sources.items():
+                if source == 'contact_name':
+                    resolved[var_name] = conv.contact_name or ''
+                elif source == 'custom_name':
+                    resolved[var_name] = conv.custom_name or conv.contact_name or ''
+                elif source == 'contact_phone':
+                    resolved[var_name] = conv.contact_phone or ''
+                elif source == 'conversation_id':
+                    resolved[var_name] = str(conv.id)
+                elif source == 'fixed':
+                    resolved[var_name] = fixed_values.get(var_name, '')
+            return resolved
+
+        queued = 0
+        for conv in conversations:
+            resolved_params = _resolve_params(conv)
+            queued += _send_to_conversation(conv, resolved_params)
 
         return Response({
             'queued': queued,
