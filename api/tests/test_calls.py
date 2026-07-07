@@ -772,7 +772,7 @@ class PublishCallEventTests(TestCase):
             contact_phone="573001234567", group=self.group,
         )
 
-    @patch("api.views.publish")
+    @patch("api.realtime.publish")
     def test_publish_call_event_with_take(self, mock_publish):
         user = User.objects.create_user(username="agent2", password="test")
         ConversationTake.objects.create(
@@ -797,7 +797,7 @@ class PublishCallEventTests(TestCase):
             payload["call"]["active_take"]["created_by_id"], user.id
         )
 
-    @patch("api.views.publish")
+    @patch("api.realtime.publish")
     def test_publish_call_event_no_take(self, mock_publish):
         call = Call.objects.create(
             call_id="wacid_pub_2", conversation=self.conversation,
