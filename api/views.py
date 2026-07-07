@@ -2952,7 +2952,8 @@ def whatsapp_webhook(request):
                                 fallback_ts = msg.get('timestamp')
                                 if fallback_ts:
                                     try:
-                                        fallback_dt = datetime.fromtimestamp(int(fallback_ts), tz=dt_timezone.utc)
+                                        from datetime import datetime as _fb_dt, timezone as _fb_tz
+                                        fallback_dt = _fb_dt.fromtimestamp(int(fallback_ts), tz=_fb_tz.utc)
                                         ctx_msg = Message.objects.filter(
                                             conversation=conversation,
                                             direction=fallback_direction,
@@ -2968,7 +2969,8 @@ def whatsapp_webhook(request):
                                 fallback_ts = msg.get('timestamp')
                                 if fallback_ts:
                                     try:
-                                        fallback_dt = datetime.fromtimestamp(int(fallback_ts), tz=dt_timezone.utc)
+                                        from datetime import datetime as _fb_dt, timezone as _fb_tz
+                                        fallback_dt = _fb_dt.fromtimestamp(int(fallback_ts), tz=_fb_tz.utc)
                                         ctx_msg = Message.objects.filter(
                                             conversation=conversation,
                                             created_at__lt=fallback_dt,
