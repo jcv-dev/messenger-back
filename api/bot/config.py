@@ -184,13 +184,12 @@ def is_within_operating_hours() -> bool:
                 return not e.is_closed  # False if inside a break block
         return None  # no entry covers current time
 
-    # Date overrides take priority
+    # Check date overrides; supplement recurring (don't replace it)
     overrides = list(BotSchedule.objects.filter(date=today, is_active=True))
     if overrides:
         result = _check(overrides)
         if result is not None:
             return result
-        return False  # entries exist but none cover current time
 
     # Recurring day-of-week schedule
     schedules = list(BotSchedule.objects.filter(
@@ -324,7 +323,10 @@ def get_grouped_hours_text() -> str:
         date_label = o.date.strftime('%-d/%-m/%Y')
         tag = f" ({o.label})" if o.label else ""
         if o.is_closed:
-            lines.append(f"{date_label}{tag}: Cerrado")
+            if o.close_time:
+                lines.append(f"{date_label}{tag}: Cerrado {_fmt(o.open_time)} a {_fmt(o.close_time)}")
+            else:
+                lines.append(f"{date_label}{tag}: Cerrado desde {_fmt(o.open_time)}")
         elif o.close_time:
             lines.append(f"{date_label}{tag}: {_fmt(o.open_time)} a {_fmt(o.close_time)}")
         else:
