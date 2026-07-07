@@ -544,6 +544,17 @@ class MessageViewSetTests(APITestCase):
         conv_data = next(c for c in response.data['results'] if c['id'] == self.conversation.id)
         self.assertEqual(conv_data['last_message_direction'], 'outbound')
 
+    def test_outbound_message_updates_last_message_at(self):
+        before = timezone.now()
+        self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Time test'},
+        )
+        self.conversation.refresh_from_db()
+        self.assertIsNotNone(self.conversation.last_message_at)
+        self.assertGreaterEqual(self.conversation.last_message_at, before)
+        self.assertEqual(self.conversation.last_message, 'Time test')
+
     def test_create_outbound_message_has_pending_status(self):
         response = self.client.post(
             f'/api/conversations/{self.conversation.id}/messages/',
