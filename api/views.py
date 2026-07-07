@@ -1706,6 +1706,26 @@ class StickerAssetViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return StickerAsset.objects.all()
 
+    @action(detail=False, methods=['post'], parser_classes=[FormParser, MultiPartParser])
+    def bulk_upload(self, request):
+        files = request.FILES.getlist('images')
+        if not files:
+            return Response({'error': 'No se proporcionaron archivos'}, status=status.HTTP_400_BAD_REQUEST)
+
+        name = request.data.get('name', '')
+        stickers = []
+
+        for f in files:
+            sticker = StickerAsset.objects.create(
+                name=name,
+                image=f,
+                created_by=request.user,
+            )
+            stickers.append(sticker)
+
+        serializer = self.get_serializer(stickers, many=True)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
