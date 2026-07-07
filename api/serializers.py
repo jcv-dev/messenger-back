@@ -2,6 +2,7 @@
 Serializers for WhatsApp Messenger API
 """
 import json
+import logging
 import re
 import time
 import urllib.parse
@@ -212,7 +213,8 @@ class MessageSerializer(serializers.ModelSerializer):
                 'media_url': sign_media_url(cm.media_url),
                 'created_at': cm.created_at,
             }
-        except Exception:
+        except Exception as e:
+            logging.getLogger('api').warning('context_message_preview failed for message %s: %s', obj.id, e)
             return None
 
     def get_media_url(self, obj):
@@ -597,7 +599,18 @@ class CallSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Call
-        fields = '__all__'
+        fields = [
+            'id', 'call_id', 'conversation', 'direction', 'status',
+            'from_number', 'to_number', 'recipient_bsuid',
+            'start_time', 'end_time', 'duration_seconds',
+            'biz_opaque_callback_data', 'deeplink_payload', 'cta_payload',
+            'recording_status', 'recording_purpose',
+            'recording_announcement_language', 'recording_audio_id',
+            'recording_audio_url', 'recording_audio_sha256',
+            'recording_audio_mime_type', 'recording_local_path',
+            'sdp_offer', 'sdp_answer', 'error_code', 'error_message',
+            'created_at', 'updated_at', 'contact_name',
+        ]
 
     def get_contact_name(self, obj):
         return obj.conversation.contact_name

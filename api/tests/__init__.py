@@ -309,8 +309,12 @@ class ConversationViewSetTests(APITestCase):
         self.assertEqual(response.data['results'], [])
 
     def test_remove_expired_tags(self):
+        staff = User.objects.create_superuser(username='staff', password='staff123', email='')
+        staff_token = Token.objects.create(user=staff)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {staff_token.key}')
         response = self.client.post('/api/conversations/remove_expired_tags/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
 
     def test_take_conversation(self):
         """Verifying transaction-wrapped take endpoint works."""
@@ -530,6 +534,15 @@ class MessageViewSetTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         msg = Message.objects.get(content='No name sent')
         self.assertEqual(msg.sender, self.user)
+
+    def test_outbound_message_sets_last_message_direction_outbound(self):
+        self.client.post(
+            f'/api/conversations/{self.conversation.id}/messages/',
+            {'direction': 'outbound', 'message_type': 'text', 'content': 'Agent direction test'},
+        )
+        response = self.client.get('/api/conversations/active_conversations/')
+        conv_data = next(c for c in response.data['results'] if c['id'] == self.conversation.id)
+        self.assertEqual(conv_data['last_message_direction'], 'outbound')
 
     def test_create_outbound_message_has_pending_status(self):
         response = self.client.post(
@@ -2453,6 +2466,7 @@ class BotConfigAPITests(APITestCase):
         response = self.client.patch(
             f'/api/bot-config/{cfg.id}/update_value/',
             {'value': False},
+            format='json',
             HTTP_AUTHORIZATION=f'Token {self.admin_token.key}',
         )
         self.assertEqual(response.status_code, 200)
@@ -2531,7 +2545,9 @@ class WhatsAppTemplateViewSetTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 1)
 
-    def test_create_template(self):
+    @patch('api.whatsapp_templates.create_template')
+    def test_create_template(self, mock_create_template):
+        mock_create_template.return_value = {'id': '123', 'status': 'PENDING'}
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
         data = {
             'name': 'new_template',
@@ -2965,7 +2981,7 @@ class AuditLogModelTests(TestCase):
         )
         self.assertEqual(log.actor, self.user)
         self.assertEqual(log.action, 'take')
-        self.assertEqual(log.actor_username, self.user.username)
+        self.assertEqual(log.actor.username, self.user.username)
 
     def test_audit_ordering(self):
         AuditLog.objects.create(actor=self.user, action='take')
@@ -3084,9 +3100,10 @@ class CannedResponseTests(APITestCase):
             title='Global Greeting', content='Hola!', category='saludo',
             group=None, created_by=self.admin,
         )
+        other_group = CityGroup.objects.create(name='Otra', slug='otra')
         CannedResponse.objects.create(
             title='Other City', content='Otro grupo', category='otro',
-            created_by=self.admin,
+            group=other_group, created_by=self.admin,
         )
 
     def test_list_requires_auth(self):
@@ -3142,7 +3159,7 @@ class CannedResponseTests(APITestCase):
 
     def test_update_title_and_content(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
-        cr = CannedResponse.objects.filter(created_by=self.admin).first()
+        cr = CannedResponse.objects.get(title='Welcome', created_by=self.admin)
         response = self.client.patch(f'/api/canned-responses/{cr.id}/', {
             'title': 'Updated Title', 'content': 'Updated content',
         })
@@ -3390,7 +3407,7 @@ class PushSubscriptionTests(APITestCase):
             'endpoint': 'https://example.com/push/abc',
             'keys': {'p256dh': 'test_key', 'auth': 'test_auth'},
             'browser': 'Chrome',
-        })
+        }, format='json')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['status'], 'subscribed')
         self.assertTrue(PushSubscription.objects.filter(user=self.user).exists())
@@ -3403,7 +3420,7 @@ class PushSubscriptionTests(APITestCase):
         response = self.client.post('/api/push-subscribe/', {
             'endpoint': 'https://example.com/push/abc',
             'keys': {'p256dh': 'new_key', 'auth': 'new_auth'},
-        })
+        }, format='json')
         self.assertEqual(response.status_code, 200)
         sub = PushSubscription.objects.get(user=self.user, endpoint='https://example.com/push/abc')
         self.assertEqual(sub.p256dh, 'new_key')
@@ -3412,7 +3429,7 @@ class PushSubscriptionTests(APITestCase):
         response = self.client.post('/api/push-subscribe/', {
             'endpoint': 'https://example.com/push/abc',
             'keys': {},
-        })
+        }, format='json')
         self.assertEqual(response.status_code, 400)
 
     def test_unsubscribe_removes_record(self):
@@ -3431,7 +3448,7 @@ class PushSubscriptionTests(APITestCase):
         response = self.client.post('/api/push-subscribe/', {
             'endpoint': 'https://example.com/push/abc',
             'keys': {'p256dh': 'key', 'auth': 'auth'},
-        })
+        }, format='json')
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
@@ -3604,7 +3621,7 @@ class MessageGroupFilterTests(APITestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token_a.key}')
         response = self.client.get(f'/api/conversations/{self.conv_a.id}/messages/')
         self.assertEqual(response.status_code, 200)
-        ids = [m['id'] for m in response.data]
+        ids = [m['id'] for m in response.data.get('results', [])]
         self.assertGreater(len(ids), 0)
 
     def test_agent_cannot_see_other_group_messages_via_list(self):

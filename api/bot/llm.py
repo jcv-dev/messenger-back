@@ -522,6 +522,9 @@ async def _execute_tool(function_call, conversation, session):
                     last_message=f"📍 {location_payload['name']}"[:255],
                     last_message_at=timezone.now(),
                 ))()
+                conversation.last_message = f"📍 {location_payload['name']}"[:255]
+                conversation.last_message_at = timezone.now()
+                conversation._last_msg_direction = 'outbound'
                 msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
                 await sync_to_async(publish_conversation_update)(conversation, msg_data)
                 _send_pool.submit(
@@ -605,6 +608,9 @@ async def _execute_tool(function_call, conversation, session):
                 last_message=last_msg_text,
                 last_message_at=timezone.now(),
             ))()
+            conversation.last_message = last_msg_text
+            conversation.last_message_at = timezone.now()
+            conversation._last_msg_direction = 'outbound'
             msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
             await sync_to_async(publish_conversation_update)(conversation, msg_data)
 

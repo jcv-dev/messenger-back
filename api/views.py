@@ -1262,6 +1262,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 set_first_response(conversation, request.user)
 
+            conversation._last_msg_direction = direction
             serializer = MessageSerializer(message)
             publish_conversation_update(conversation, serializer.data)
             if direction == 'outbound':
@@ -1378,6 +1379,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation.last_message = f'[{message_type.capitalize()}]'
         conversation.last_message_at = timezone.now()
         conversation.save()
+
+        conversation._last_msg_direction = 'outbound'
 
         if message_type not in ('edit', 'reaction'):
             transaction.on_commit(lambda: _send_pool.submit(
@@ -1507,6 +1510,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.last_message = f'[{template.name}]'
         conversation.last_message_at = timezone.now()
         conversation.save()
+
+        conversation._last_msg_direction = 'outbound'
 
         from api.bot.config import get_send_delay_seconds
         if get_send_delay_seconds() > 0:
@@ -1944,6 +1949,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             conv.last_message = f'[{template.name}]'
             conv.last_message_at = timezone.now()
             conv.save(update_fields=['last_message', 'last_message_at'])
+            conv._last_msg_direction = 'outbound'
             transaction.on_commit(lambda c=conv, p=payload, m=message: _send_pool.submit(
                 send_whatsapp_outbound,
                 'template', p, c.contact_phone, m.id, c.id,
@@ -2934,6 +2940,8 @@ def whatsapp_webhook(request):
                         ).first()
                         if ctx_msg:
                             context_message_obj = ctx_msg
+                        else:
+                            logger.info('Context lookup failed: message %s has context.id %s but no matching message in conversation %s', msg_id, ctx_wamid, conversation.id)
 
                 if msg_id:
                     dedup_key = f"wamid_dedup:{msg_id}"

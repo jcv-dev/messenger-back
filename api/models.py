@@ -605,17 +605,13 @@ def release_agent_take_records(conversation=None, agent=None):
 
 
 def set_first_response(conversation, agent, responded_at=None):
-    """Set first_response_at on the agent's active take record if not already set."""
     from django.utils import timezone
-    record = AgentTakeRecord.objects.filter(
+    AgentTakeRecord.objects.filter(
         conversation=conversation,
         agent=agent,
         released_at__isnull=True,
         first_response_at__isnull=True,
-    ).order_by('taken_at').first()
-    if record:
-        record.first_response_at = responded_at or timezone.now()
-        record.save(update_fields=['first_response_at'])
+    ).update(first_response_at=responded_at or timezone.now())
 
 
 class PushSubscription(models.Model):

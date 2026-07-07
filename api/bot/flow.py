@@ -266,6 +266,9 @@ async def _send_location(conversation, lat: float, lng: float, display_name: str
         last_message=f"📍 {payload['name']}"[:255],
         last_message_at=timezone.now(),
     ))()
+    conversation.last_message = f"📍 {payload['name']}"[:255]
+    conversation.last_message_at = timezone.now()
+    conversation._last_msg_direction = 'outbound'
     msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
     await sync_to_async(publish_conversation_update)(conversation, msg_data)
     _send_pool.submit(
