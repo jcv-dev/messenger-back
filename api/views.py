@@ -1022,6 +1022,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
         unread_messages = conversation.messages.filter(is_read=False, direction='inbound')
         count = unread_messages.update(is_read=True)
         if count > 0:
+            if hasattr(conversation, '_unread_count'):
+                del conversation._unread_count
             publish_conversation_update(conversation)
         return Response({'marked_read': count}, status=status.HTTP_200_OK)
 
@@ -2981,6 +2983,7 @@ def whatsapp_webhook(request):
                     conversation.last_message_at = msg_ts
                     conversation.save()
 
+                conversation._last_msg_direction = 'inbound'
                 elapsed = time.time() - webhook_start
                 logger.info("Webhook msg %s: %.3fs from receipt to SSE publish (last_msg=%s)", message.id, elapsed, last_msg_text)
                 publish_conversation_update(conversation, MessageSerializer(message).data)
