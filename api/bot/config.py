@@ -52,11 +52,52 @@ def get_faq_info_section():
     )
 
 
-def get_outside_hours_reply():
-    return get_config(
+def get_outside_hours_reply(reason: str | None = None):
+    msg = get_config(
         'outside_hours_reply',
         'Gracias por escribirnos. Actualmente estamos fuera de nuestro horario de atención. '
         'Te responderemos en cuanto estemos disponibles. ¡Gracias por tu paciencia!',
+    )
+    if reason:
+        msg = msg.replace(
+            'fuera de nuestro horario de atención.',
+            f'fuera de nuestro horario de atención por: {reason}.',
+        )
+    return msg
+
+
+def get_outside_hours_reason() -> str | None:
+    """Return the label of the break/closure block we're currently inside.
+    
+    Checks date overrides first, then recurring schedules. Returns the label
+    if the current time falls within an ``is_closed`` block that has a label.
+    Returns ``None`` for simple gaps between working blocks (no explicit break).
+    """
+    from zoneinfo import ZoneInfo
+    from api.models import BotSchedule
+
+    bogota = ZoneInfo('America/Bogota')
+    now_bog = timezone.now().astimezone(bogota)
+    today = now_bog.date()
+    current_time = now_bog.time()
+    end_of_day = datetime.time(23, 59, 59)
+
+    def _find_break_label(entries) -> str | None:
+        for e in entries:
+            if e.is_closed and e.label:
+                close = e.close_time or end_of_day
+                if e.open_time <= current_time <= close:
+                    return e.label
+        return None
+
+    label = _find_break_label(
+        BotSchedule.objects.filter(date=today, is_active=True)
+    )
+    if label:
+        return label
+
+    return _find_break_label(
+        BotSchedule.objects.filter(day_of_week=today.weekday(), is_active=True)
     )
 
 
@@ -120,7 +161,12 @@ def get_allowed_url_domains():
 
 
 def is_within_operating_hours() -> bool:
-    """Check if current time (UTC-05) falls within BotSchedule."""
+    """Check if current time (UTC-05) falls within BotSchedule.
+    
+    Each block is evaluated individually. ``is_closed`` blocks are non-working
+    (breaks/closures). Gaps between blocks are also outside hours.
+    Date overrides take priority over recurring schedules.
+    """
     from zoneinfo import ZoneInfo
     from api.models import BotSchedule
 
@@ -128,22 +174,33 @@ def is_within_operating_hours() -> bool:
     now_bog = timezone.now().astimezone(bogota)
     today = now_bog.date()
     current_time = now_bog.time()
+    end_of_day = datetime.time(23, 59, 59)
+
+    def _check(entries) -> bool | None:
+        """Return True (working), False (outside), or None if no entry covers."""
+        for e in entries:
+            close = e.close_time or end_of_day
+            if e.open_time <= current_time <= close:
+                return not e.is_closed  # False if inside a break block
+        return None  # no entry covers current time
 
     # Date overrides take priority
-    override = BotSchedule.objects.filter(date=today, is_active=True).first()
-    if override:
-        if override.close_time is None:
-            return False
-        return override.open_time <= current_time <= override.close_time
+    overrides = list(BotSchedule.objects.filter(date=today, is_active=True))
+    if overrides:
+        result = _check(overrides)
+        if result is not None:
+            return result
+        return False  # entries exist but none cover current time
 
     # Recurring day-of-week schedule
-    schedule = BotSchedule.objects.filter(
+    schedules = list(BotSchedule.objects.filter(
         day_of_week=today.weekday(), is_active=True,
-    ).first()
-    if schedule:
-        if schedule.close_time is None:
-            return False
-        return schedule.open_time <= current_time <= schedule.close_time
+    ))
+    if schedules:
+        result = _check(schedules)
+        if result is not None:
+            return result
+        return False
 
     # No schedule configured — assume open
     return True
@@ -157,7 +214,7 @@ def _bogota_now():
 def get_grouped_hours_text() -> str:
     """Return operating hours as a grouped human-readable string.
 
-    Days sharing the same open/close time are grouped together.
+    Days sharing the same working blocks and break blocks are grouped together.
     Consecutive ranges use "a" ("Lunes a Viernes"); non-consecutive
     lists use commas and "y" ("Lunes, Miércoles y Viernes").
     Future date overrides are listed at the end.
@@ -166,27 +223,53 @@ def get_grouped_hours_text() -> str:
 
     now_bog = _bogota_now()
     today = now_bog.date()
+    end_of_day = datetime.time(23, 59, 59)
 
     DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo y Festivos']
-
-    reg_rows = list(BotSchedule.objects.filter(
-        is_active=True, day_of_week__isnull=False,
-    ).order_by('day_of_week'))
-
-    if not reg_rows:
-        return ""
 
     def _fmt(t):
         return t.strftime('%-I:%M %p')
 
-    # Group by schedule (open/close pair)
-    schedule_map: dict[tuple, list[int]] = {}
-    for r in reg_rows:
-        sk = (r.open_time, r.close_time)
-        schedule_map.setdefault(sk, []).append(r.day_of_week)
+    def _close_text(e):
+        if e.close_time:
+            return _fmt(e.close_time)
+        return 'medianoche'
 
-    for days in schedule_map.values():
-        days.sort()
+    # Build per-day blocks: working_blocks list + break_blocks list
+    entries = list(BotSchedule.objects.filter(
+        is_active=True, day_of_week__isnull=False,
+    ))
+
+    # day -> {working: [(open, close)], breaks: [(open, close, label)]}
+    day_data: dict[int, dict] = {}
+    for e in entries:
+        d = e.day_of_week
+        if d not in day_data:
+            day_data[d] = {'working': [], 'breaks': []}
+        if e.is_closed:
+            day_data[d]['breaks'].append((e.open_time, e.close_time or end_of_day, e.label or ''))
+        else:
+            day_data[d]['working'].append((e.open_time, e.close_time or end_of_day))
+
+    if not day_data:
+        return ""
+
+    # Sort blocks within each day
+    for data in day_data.values():
+        data['working'].sort(key=lambda x: x[0])
+        data['breaks'].sort(key=lambda x: x[0])
+
+    # Build signature: tuple of ((open, close), ...) for working + ((open, close, label), ...) for breaks
+    # Group days with identical signatures
+    signature_map: dict[tuple, list[int]] = {}
+    for d in sorted(day_data):
+        data = day_data[d]
+        # Full-days closed: no working blocks, all breaks → grouped via signature
+        sig = (
+            tuple(data['working']),
+            tuple(data['breaks']),
+        )
+        signature_map.setdefault(sig, []).append(d)
 
     def _day_label(days: list[int]) -> str:
         if days == [0, 1, 2, 3, 4, 5, 6]:
@@ -202,15 +285,37 @@ def get_grouped_hours_text() -> str:
         return ", ".join(labels[:-1]) + f" y {labels[-1]}"
 
     lines = []
-    for (open_time, close_time), days in sorted(
-        schedule_map.items(), key=lambda kv: kv[1][0],
-    ):
+    for sig, days in sorted(signature_map.items(), key=lambda kv: kv[1][0]):
+        working_blocks, break_blocks = sig
         label = _day_label(days)
-        if close_time is None:
-            lines.append(f"{label}: Cerrado")
-        else:
-            lines.append(f"{label}: {_fmt(open_time)} a {_fmt(close_time)}")
 
+        if not working_blocks and break_blocks:
+            # Full-day closure
+            closure_label = break_blocks[0][2] or ''
+            if closure_label:
+                lines.append(f"{label}: Cerrado ({closure_label})")
+            else:
+                lines.append(f"{label}: Cerrado")
+            continue
+
+        # Working blocks
+        working_parts = []
+        for o, c in working_blocks:
+            if c == end_of_day:
+                working_parts.append(f"desde {_fmt(o)}")
+            else:
+                working_parts.append(f"{_fmt(o)} a {_fmt(c)}")
+        lines.append(f"{label}: {', '.join(working_parts)}")
+
+        # Break blocks as sub-lines
+        for o, c, lbl in break_blocks:
+            time_part = f"{_fmt(o)} a {_fmt(c)}" if c != end_of_day else f"desde {_fmt(o)}"
+            if lbl:
+                lines.append(f"  Cerrado {time_part}: {lbl}")
+            else:
+                lines.append(f"  Cerrado {time_part}")
+
+    # Future date overrides
     overrides = BotSchedule.objects.filter(
         is_active=True, date__isnull=False, date__gte=today,
     ).order_by('date')
@@ -218,10 +323,12 @@ def get_grouped_hours_text() -> str:
     for o in overrides:
         date_label = o.date.strftime('%-d/%-m/%Y')
         tag = f" ({o.label})" if o.label else ""
-        if o.close_time:
+        if o.is_closed:
+            lines.append(f"{date_label}{tag}: Cerrado")
+        elif o.close_time:
             lines.append(f"{date_label}{tag}: {_fmt(o.open_time)} a {_fmt(o.close_time)}")
         else:
-            lines.append(f"{date_label}{tag}: Cerrado")
+            lines.append(f"{date_label}{tag}: desde {_fmt(o.open_time)}")
 
     return "\n".join(lines)
 

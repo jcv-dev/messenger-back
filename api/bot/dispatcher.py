@@ -30,7 +30,7 @@ from .metrics import incr as incr_metric
 from .session import get_session, save_session, delete_session, extract_state_from_turn
 from .llm import handle_with_llm
 from .router import try_route_message
-from .config import is_within_operating_hours, get_outside_hours_reply, get_state_machine_enabled, get_max_user_message_length, get_grouped_hours_text, get_testing_warning_enabled, is_bot_enabled
+from .config import is_within_operating_hours, get_outside_hours_reply, get_outside_hours_reason, get_state_machine_enabled, get_max_user_message_length, get_grouped_hours_text, get_testing_warning_enabled, is_bot_enabled
 
 logger = logging.getLogger("api.bot")
 
@@ -295,7 +295,8 @@ async def handle_inbound(event: dict):
                 await r.aclose()
             except Exception:
                 pass
-            reply = await sync_to_async(get_outside_hours_reply)()
+            reason = await sync_to_async(get_outside_hours_reason)()
+            reply = await sync_to_async(get_outside_hours_reply)(reason)
             hours = await sync_to_async(get_grouped_hours_text)()
             if hours:
                 reply = f"{reply}\n\nNuestro horario:\n{hours}"

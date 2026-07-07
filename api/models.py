@@ -382,7 +382,9 @@ class BotSchedule(models.Model):
     open_time = models.TimeField()
     close_time = models.TimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    is_closed = models.BooleanField(default=False, help_text="If True, marks the entire day/date as closed (overrides open/close_time)")
     label = models.CharField(max_length=100, blank=True)
+    is_closed = models.BooleanField(default=False, help_text="If True, this block is non-working (break/closure)")
 
     class Meta:
         ordering = ['day_of_week', 'date']

@@ -465,7 +465,7 @@ class StickerAssetSerializer(serializers.ModelSerializer):
 class BotScheduleSerializer(serializers.ModelSerializer):
     class Meta:
         model = BotSchedule
-        fields = ['id', 'day_of_week', 'date', 'open_time', 'close_time', 'is_active', 'label']
+        fields = ['id', 'day_of_week', 'date', 'open_time', 'close_time', 'is_active', 'is_closed', 'label']
 
 
 class BotConfigSerializer(serializers.ModelSerializer):

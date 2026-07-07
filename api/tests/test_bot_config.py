@@ -70,6 +70,7 @@ class OperatingHoursTests(SimpleTestCase):
 
     def _schedule_row(self, **kw):
         row = MagicMock()
+        row.is_closed = False  # model default
         for k, v in kw.items():
             setattr(row, k, v)
         return row
@@ -77,20 +78,23 @@ class OperatingHoursTests(SimpleTestCase):
     def _mock_filter(self, rows):
         def side_effect(**kwargs):
             mock_qs = MagicMock()
-            if "date" in kwargs:
+
+            def _filtered():
+                result = []
                 for r in rows:
-                    if r.date == kwargs["date"] and getattr(r, 'is_active', True):
-                        mock_qs.first.return_value = r
-                        return mock_qs
-                mock_qs.first.return_value = None
-                return mock_qs
-            if "day_of_week" in kwargs:
-                for r in rows:
-                    if r.day_of_week == kwargs["day_of_week"] and getattr(r, 'is_active', True):
-                        mock_qs.first.return_value = r
-                        return mock_qs
-                mock_qs.first.return_value = None
-                return mock_qs
+                    match = True
+                    for k, v in kwargs.items():
+                        if getattr(r, k, None) != v:
+                            match = False
+                            break
+                    if match:
+                        result.append(r)
+                return result
+
+            filtered = _filtered()
+            mock_qs.__iter__.return_value = iter(filtered)
+            mock_qs.__len__.return_value = len(filtered)
+            mock_qs.first.return_value = filtered[0] if filtered else None
             return mock_qs
         return patch("api.models.BotSchedule.objects.filter", side_effect=side_effect)
 
@@ -123,7 +127,7 @@ class OperatingHoursTests(SimpleTestCase):
         mock_now.return_value = datetime.datetime(2026, 6, 15, 15, 0, tzinfo=datetime.timezone.utc)
         t = datetime.time
         weekly = self._schedule_row(day_of_week=0, open_time=t(8, 0), close_time=t(20, 0), is_active=True)
-        override = self._schedule_row(date=datetime.date(2026, 6, 15), close_time=None, is_active=True)
+        override = self._schedule_row(date=datetime.date(2026, 6, 15), open_time=t(0, 0), close_time=None, is_active=True, is_closed=True)
         with self._mock_filter([weekly, override]):
             from api.bot.config import is_within_operating_hours
             self.assertFalse(is_within_operating_hours())
@@ -134,7 +138,7 @@ class OperatingHoursTests(SimpleTestCase):
         mock_cfg.objects.all().values_list.return_value = []
         mock_now.return_value = datetime.datetime(2026, 6, 15, 15, 0, tzinfo=datetime.timezone.utc)
         t = datetime.time
-        row = self._schedule_row(day_of_week=0, open_time=t(8, 0), close_time=None, is_active=True)
+        row = self._schedule_row(day_of_week=0, open_time=t(8, 0), close_time=None, is_active=True, is_closed=True)
         with self._mock_filter([row]):
             from api.bot.config import is_within_operating_hours
             self.assertFalse(is_within_operating_hours())
@@ -389,7 +393,7 @@ class GroupedHoursTextTests(SimpleTestCase):
     """get_grouped_hours_text() — smart day grouping, future overrides."""
 
     def _row(self, day_of_week=None, date=None, open_time=None,
-             close_time=None, is_active=True, label=""):
+             close_time=None, is_active=True, label="", is_closed=False):
         r = MagicMock()
         r.day_of_week = day_of_week
         r.date = date
@@ -397,6 +401,7 @@ class GroupedHoursTextTests(SimpleTestCase):
         r.close_time = close_time
         r.is_active = is_active
         r.label = label
+        r.is_closed = is_closed
         return r
 
     def _mock_qs(self, rows):
@@ -499,8 +504,8 @@ class GroupedHoursTextTests(SimpleTestCase):
         rows = [
             self._row(day_of_week=0, open_time=t(8, 0), close_time=t(20, 0)),
             self._row(day_of_week=1, open_time=t(8, 0), close_time=t(20, 0)),
-            self._row(day_of_week=2, open_time=None, close_time=None),
-            self._row(day_of_week=3, open_time=None, close_time=None),
+            self._row(day_of_week=2, open_time=None, close_time=None, is_closed=True),
+            self._row(day_of_week=3, open_time=None, close_time=None, is_closed=True),
             self._row(day_of_week=4, open_time=t(8, 0), close_time=t(20, 0)),
             self._row(day_of_week=5, open_time=t(8, 0), close_time=t(20, 0)),
             self._row(day_of_week=6, open_time=t(9, 0), close_time=t(18, 0)),
