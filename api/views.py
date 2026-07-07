@@ -166,17 +166,9 @@ def _log_audit(actor, conversation, action, detail=''):
 
 def publish_conversation_update(conversation, message=None, escalated=False):
     try:
-        conv_data = ConversationListSerializer(conversation).data
-        logger.info(
-            "SSE publish: conv=%s last_message_at=%s last_message=%r has_msg=%s",
-            conversation.id,
-            conv_data.get('last_message_at'),
-            (conv_data.get('last_message') or '')[:80],
-            message is not None,
-        )
         payload = {
             'type': 'conversation.updated',
-            'conversation': conv_data,
+            'conversation': ConversationListSerializer(conversation).data,
         }
         if message is not None:
             payload['message'] = message
@@ -1270,12 +1262,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 set_first_response(conversation, request.user)
 
             conversation.save(update_fields=['last_message', 'last_message_at', 'updated_at'])
-
-            logger.info(
-                "Agent msg: conv=%s last_message_at=%s direction=%s type=%s",
-                conversation.id, conversation.last_message_at.isoformat() if conversation.last_message_at else None,
-                direction, message_type,
-            )
 
             conversation._last_msg_direction = direction
             serializer = MessageSerializer(message)
