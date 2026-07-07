@@ -1,6 +1,7 @@
 """
 Serializers for WhatsApp Messenger API
 """
+import json
 import re
 import time
 import urllib.parse
@@ -184,12 +185,13 @@ class MessageSerializer(serializers.ModelSerializer):
     context_message_id = serializers.SerializerMethodField()
     media_url = serializers.SerializerMethodField()
     sender_detail = serializers.SerializerMethodField()
+    content_display = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
-            'id', 'direction', 'message_type', 'content', 'sender_name', 'sender',
-            'sender_detail',
+            'id', 'direction', 'message_type', 'content', 'content_display',
+            'sender_name', 'sender', 'sender_detail',
             'whatsapp_message_id', 'media_url', 'metadata', 'created_at',
             'is_read', 'context_message_id', 'context_message_preview',
         ]
@@ -224,6 +226,44 @@ class MessageSerializer(serializers.ModelSerializer):
             'first_name': obj.sender.first_name,
             'username': obj.sender.username,
         }
+
+    def get_content_display(self, obj):
+        if obj.message_type != 'template':
+            return None
+        try:
+            payload = json.loads(obj.content)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        name = payload.get('name', '')
+        language = payload.get('language', {}).get('code', 'es')
+        components = payload.get('components', [])
+
+        params = {}
+        for comp in components:
+            if comp.get('type') == 'body':
+                for p in comp.get('parameters', []):
+                    if p.get('type') == 'text':
+                        params[p.get('parameter_name', '')] = p.get('text', '')
+
+        try:
+            template = WhatsAppTemplate.objects.get(name=name, language=language)
+            body_text = ''
+            for comp in template.components:
+                if comp.get('type') == 'body':
+                    body_text = comp.get('text', '')
+                    break
+            if body_text:
+                rendered = re.sub(
+                    r'\{\{(\w+)\}\}',
+                    lambda m: params.get(m.group(1), m.group(0)),
+                    body_text,
+                )
+                return rendered
+        except Exception:
+            pass
+
+        return f'[Plantilla: {name}]'
 
 
 class ConversationSerializer(serializers.ModelSerializer):
