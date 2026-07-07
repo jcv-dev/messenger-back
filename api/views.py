@@ -1257,13 +1257,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
             else:
                 conversation.last_message = f'[{message_type.capitalize()}]'
             conversation.last_message_at = timezone.now()
-            conversation.save()
-
-            logger.info(
-                "Agent msg: conv=%s last_message_at=%s direction=%s type=%s",
-                conversation.id, conversation.last_message_at.isoformat() if conversation.last_message_at else None,
-                direction, message_type,
-            )
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 from api.bot.config import get_send_delay_seconds
@@ -1275,6 +1268,14 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 set_first_response(conversation, request.user)
+
+            conversation.save(update_fields=['last_message', 'last_message_at', 'updated_at'])
+
+            logger.info(
+                "Agent msg: conv=%s last_message_at=%s direction=%s type=%s",
+                conversation.id, conversation.last_message_at.isoformat() if conversation.last_message_at else None,
+                direction, message_type,
+            )
 
             conversation._last_msg_direction = direction
             serializer = MessageSerializer(message)
