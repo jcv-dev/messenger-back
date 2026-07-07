@@ -280,13 +280,13 @@ class ConversationTake(models.Model):
 class StickerAsset(models.Model):
     """Reusable image asset for stickers and quick replies."""
 
-    name = models.CharField(max_length=255)
+    name = models.CharField(max_length=255, blank=True, default='')
     image = models.FileField(upload_to='stickers/%Y/%m/')
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sticker_assets')
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return self.name
+        return self.name or 'Sin título'
 
     class Meta:
         ordering = ['-created_at']
