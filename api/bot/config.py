@@ -292,9 +292,9 @@ def get_grouped_hours_text() -> str:
             # Full-day closure
             closure_label = break_blocks[0][2] or ''
             if closure_label:
-                lines.append(f"{label}: Cerrado ({closure_label})")
+                lines.append(f"{label}: Cerrado todo el día ({closure_label})")
             else:
-                lines.append(f"{label}: Cerrado")
+                lines.append(f"{label}: Cerrado todo el día")
             continue
 
         # Working blocks
@@ -326,7 +326,7 @@ def get_grouped_hours_text() -> str:
             if o.close_time:
                 lines.append(f"{date_label}{tag}: Cerrado {_fmt(o.open_time)} a {_fmt(o.close_time)}")
             else:
-                lines.append(f"{date_label}{tag}: Cerrado desde {_fmt(o.open_time)}")
+                lines.append(f"{date_label}{tag}: Cerrado todo el día")
         elif o.close_time:
             lines.append(f"{date_label}{tag}: {_fmt(o.open_time)} a {_fmt(o.close_time)}")
         else:
