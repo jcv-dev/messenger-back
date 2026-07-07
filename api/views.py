@@ -2973,6 +2973,20 @@ def whatsapp_webhook(request):
                                     conversation=conversation,
                                     metadata___msg_sig=ctx_sig,
                                 ).first()
+                                if not ctx_msg:
+                                    # Backfill: compute signatures on-the-fly for recent messages
+                                    for bf_msg in Message.objects.filter(
+                                        conversation=conversation,
+                                        whatsapp_message_id__isnull=False,
+                                    ).order_by('-created_at')[:50]:
+                                        bf_sig = _wamid_msg_sig(bf_msg.whatsapp_message_id)
+                                        if bf_sig == ctx_sig:
+                                            if not bf_msg.metadata:
+                                                bf_msg.metadata = {}
+                                            bf_msg.metadata['_msg_sig'] = bf_sig
+                                            bf_msg.save(update_fields=['metadata'])
+                                            ctx_msg = bf_msg
+                                            break
                                 if ctx_msg:
                                     logger.info('Context resolved by WAMID signature: message %s matched to message %s', msg_id, ctx_msg.id)
                                     context_message_obj = ctx_msg
