@@ -1307,6 +1307,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
         before = request.query_params.get('before')
         limit = min(int(request.query_params.get('limit', 100)), 500)
 
+        if request.query_params.get('only_unread') == 'true':
+            queryset = queryset.filter(messages__is_read=False, messages__direction='inbound').distinct()
+
         if before:
             queryset = queryset.filter(last_message_at__lt=before)
 

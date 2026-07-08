@@ -1762,6 +1762,48 @@ class ConversationCursorPaginationTests(APITestCase):
         response = self.client.get('/api/conversations/active_conversations/')
         self.assertLessEqual(len(response.data['results']), 100)
 
+    def test_only_unread_filter_returns_only_unread(self):
+        conv_read = Conversation.objects.create(
+            whatsapp_id='read001', contact_name='Read Convo', group=self.group,
+        )
+        Message.objects.create(
+            conversation=conv_read, direction='inbound', message_type='text',
+            content='Read msg', is_read=True,
+        )
+        conv_unread = Conversation.objects.create(
+            whatsapp_id='unread001', contact_name='Unread Convo', group=self.group,
+        )
+        Message.objects.create(
+            conversation=conv_unread, direction='inbound', message_type='text',
+            content='Unread msg', is_read=False,
+        )
+
+        response = self.client.get('/api/conversations/active_conversations/?only_unread=true')
+        conv_ids = [c['id'] for c in response.data['results']]
+        self.assertIn(conv_unread.id, conv_ids)
+        self.assertNotIn(conv_read.id, conv_ids)
+
+    def test_only_unread_filter_returns_all_when_omitted(self):
+        conv_read = Conversation.objects.create(
+            whatsapp_id='read002', contact_name='Read Convo 2', group=self.group,
+        )
+        Message.objects.create(
+            conversation=conv_read, direction='inbound', message_type='text',
+            content='Read msg 2', is_read=True,
+        )
+        conv_unread = Conversation.objects.create(
+            whatsapp_id='unread002', contact_name='Unread Convo 2', group=self.group,
+        )
+        Message.objects.create(
+            conversation=conv_unread, direction='inbound', message_type='text',
+            content='Unread msg 2', is_read=False,
+        )
+
+        response = self.client.get('/api/conversations/active_conversations/')
+        conv_ids = [c['id'] for c in response.data['results']]
+        self.assertIn(conv_unread.id, conv_ids)
+        self.assertIn(conv_read.id, conv_ids)
+
 
 # ── Initiate Conversation ────────────────────────────────────────────────────
 
