@@ -847,8 +847,17 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 _has_other_human_take=Exists(other_human_takes)
             )
 
+            before = qs.count()
+
             # For ALL users: hide group-pinned conversations taken by another human
             qs = qs.filter(~Q(is_pinned=True, _has_other_human_take=True))
+
+            after_group_pin = before - qs.count()
+            if after_group_pin > 0:
+                logger.info(
+                    "VisibilityFilter user=%s action=%s removed_by_group_pin=%d",
+                    user.username, self.action, after_group_pin,
+                )
 
             # For non-staff: also hide non-pinned conversations taken by another human
             if not user.is_staff:
@@ -856,6 +865,14 @@ class ConversationViewSet(viewsets.ModelViewSet):
                     Q(_has_other_human_take=False)
                     | Q(_has_user_pin=True)
                 )
+
+                after_other_take = qs.count()
+                removed = before - after_other_take - after_group_pin
+                if removed > 0:
+                    logger.info(
+                        "VisibilityFilter user=%s action=%s removed_by_other_human_take=%d",
+                        user.username, self.action, removed,
+                    )
 
         qs = qs.order_by(
             '-is_pinned', 'pinned_at', '-_has_user_pin', '-last_message_at', '-created_at'
@@ -1293,6 +1310,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def active_conversations(self, request):
         """Get active conversations with cursor-based pagination"""
+        user = request.user
         queryset = self.get_queryset().filter(status='active').annotate(
             msg_count=Count('messages')
         ).filter(msg_count__gt=0)
@@ -1309,6 +1327,18 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conv_page = conv_page[:limit]
 
         cursor = conv_page[-1].last_message_at.isoformat() if conv_page and has_more else None
+
+        if not user.is_staff:
+            logger.debug(
+                "ActiveConversations user=%s returned=%d total_in_group=%s",
+                user.username, len(conv_page),
+                queryset.model.objects.filter(
+                    group_id=getattr(getattr(user, 'profile', None), 'group_id', None),
+                    status='active'
+                ).annotate(
+                    mc=Count('messages')
+                ).filter(mc__gt=0).count(),
+            )
 
         serializer = ConversationListSerializer(conv_page, many=True)
         return Response({
