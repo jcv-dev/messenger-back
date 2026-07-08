@@ -849,25 +849,14 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
             before = qs.count()
 
-            # For ALL users: hide group-pinned conversations taken by another human
-            qs = qs.filter(~Q(is_pinned=True, _has_other_human_take=True))
-
-            after_group_pin = before - qs.count()
-            if after_group_pin > 0:
-                logger.info(
-                    "VisibilityFilter user=%s action=%s removed_by_group_pin=%d",
-                    user.username, self.action, after_group_pin,
-                )
-
-            # For non-staff: also hide non-pinned conversations taken by another human
+            # For non-staff: hide conversations taken by another human, unless personally pinned
             if not user.is_staff:
                 qs = qs.filter(
                     Q(_has_other_human_take=False)
                     | Q(_has_user_pin=True)
                 )
 
-                after_other_take = qs.count()
-                removed = before - after_other_take - after_group_pin
+                removed = before - qs.count()
                 if removed > 0:
                     logger.info(
                         "VisibilityFilter user=%s action=%s removed_by_other_human_take=%d",
@@ -1474,14 +1463,26 @@ class ConversationViewSet(viewsets.ModelViewSet):
             except Exception:
                 return Response({'results': []})
 
-            # Exclude conversations taken by another human (non-bot, non-self)
+            # Annotate personal pin so it can be referenced in the filter
+            user_pin = ConversationUserPin.objects.filter(
+                conversation=OuterRef('pk'),
+                user=user,
+            )
+            base_qs = base_qs.annotate(
+                _has_user_pin=Exists(user_pin),
+            )
+
+            # Exclude conversations taken by another human (non-bot, non-self),
+            # unless the user personally pinned them
             other_human_takes = ConversationTake.objects.filter(
                 conversation=OuterRef('pk'),
                 expires_at__gt=now,
             ).exclude(created_by=user).exclude(created_by__username='bot')
             base_qs = base_qs.annotate(
                 _has_other_human_take=Exists(other_human_takes)
-            ).filter(_has_other_human_take=False)
+            ).filter(
+                Q(_has_other_human_take=False) | Q(_has_user_pin=True)
+            )
 
         queryset = base_qs.distinct().order_by('-last_message_at', '-created_at').prefetch_related(
             Prefetch('tags', queryset=ConversationTag.objects.select_related('created_by__profile__group').filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now))),
@@ -2187,14 +2188,20 @@ def presence_heartbeat(request):
             defaults={'status': status_value, 'heartbeat_interval': 30},
         )
 
-    # Publish presence update via SSE
+    # Publish presence update via SSE (scoped to user's group for non-staff)
     from .realtime import publish
+    group_id = None
+    if not request.user.is_staff:
+        try:
+            group_id = request.user.profile.group_id
+        except Exception:
+            pass
     publish({
         'type': 'presence.update',
         'user_id': request.user.id,
         'username': request.user.username,
         'status': status_value,
-    })
+    }, group_id=group_id)
 
     return JsonResponse({'status': 'ok'})
 
@@ -3821,6 +3828,15 @@ def export_conversations_csv(request):
                 qs = qs.none()
         except Exception:
             qs = qs.none()
+        # Annotate personal pin so it can be referenced in the filter
+        user_pin = ConversationUserPin.objects.filter(
+            conversation=OuterRef('id'),
+            user=request.user,
+        )
+        qs = qs.annotate(
+            _has_user_pin=Exists(user_pin),
+        )
+
         other_human_takes = ConversationTake.objects.filter(
             conversation=OuterRef('id'),
             expires_at__gt=timezone.now(),
@@ -3829,7 +3845,9 @@ def export_conversations_csv(request):
         )
         qs = qs.annotate(
             _has_other_human_take=Exists(other_human_takes)
-        ).filter(_has_other_human_take=False)
+        ).filter(
+            Q(_has_other_human_take=False) | Q(_has_user_pin=True)
+        )
 
     qs = qs.order_by('-last_message_at')
 

@@ -111,19 +111,21 @@ async def unsubscribe(subscriber_id: str) -> None:
 
 def _build_subscriber_channels(user: Any) -> list[str]:
     """Determine Redis channels this user should subscribe to."""
-    channels = [REDIS_CHANNEL]
+    channels = []
     if (
         user
         and hasattr(user, 'is_authenticated')
         and user.is_authenticated
-        and not user.is_staff
     ):
-        try:
-            profile = user.profile
-            if profile and profile.group_id:
-                channels.append(f"{GROUP_CHANNEL_PREFIX}:{profile.group_id}")
-        except Exception:
-            pass
+        if user.is_staff:
+            channels = [REDIS_CHANNEL]
+        else:
+            try:
+                profile = user.profile
+                if profile and profile.group_id:
+                    channels = [f"{GROUP_CHANNEL_PREFIX}:{profile.group_id}"]
+            except Exception:
+                pass
     return channels
 
 

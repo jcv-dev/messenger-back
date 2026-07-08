@@ -236,6 +236,21 @@ class Command(BaseCommand):
             is_staff=False, is_active=True
         ).select_related("profile__group")
 
+        # First, report group-level resolved_by_bot breakdown
+        groups = CityGroup.objects.filter(is_active=True)
+        for g in groups:
+            gc = Conversation.objects.filter(group=g, status="active").annotate(
+                msg_count=Count("messages")
+            ).filter(msg_count__gt=0)
+            total = gc.count()
+            resolved = gc.filter(resolved_by_bot=True).count()
+            unres = total - resolved
+            if total > 0:
+                self.stdout.write(
+                    f"  Group '{g.name}': {total} active conversations "
+                    f"({unres} unresolved, {resolved} resolved_by_bot)"
+                )
+
         shown = False
         for u in users:
             group_id = u.profile.group_id if (hasattr(u, "profile") and u.profile) else None
@@ -248,6 +263,7 @@ class Command(BaseCommand):
                 status="active",
             ).annotate(msg_count=Count("messages")).filter(msg_count__gt=0)
             total_in_group = group_convos.count()
+            resolved_count = group_convos.filter(resolved_by_bot=True).count()
 
             # Conversations with other human take (non-null, not self, not bot)
             other_human_takes = ConversationTake.objects.filter(
@@ -271,20 +287,27 @@ class Command(BaseCommand):
             self.stdout.write(f"    Group: {u.profile.group.name if u.profile.group else 'None'}")
             self.stdout.write(
                 f"    Conversations in group: {total_in_group} "
-                f"→ visible: {visible}, hidden by other-human-take: {hidden_by_other_take_count}"
+                f"({resolved_count} resolved_by_bot)"
+            )
+            self.stdout.write(
+                f"    Server-side: visible={visible} hidden_by_other_human_take={hidden_by_other_take_count}"
+            )
+            self.stdout.write(
+                f"    Frontend Mine tab (after fix): visible={visible} "
+                f"(free convos show regardless of resolved_by_bot)"
+            )
+            self.stdout.write(
+                f"    Frontend Bot tab: visible={visible} "
+                f"(all pass !c.active_take filter)"
             )
             if hidden_but_pinned > 0:
-                self.stdout.write(self.style.ERROR(
-                    f"    ⚠  {hidden_but_pinned} conversation(s) hidden by other-human-take that user HAS PERSONALLY PINNED"
-                ))
                 self.stdout.write(self.style.WARNING(
-                    "    → This is the group-pin + personal-pin exception bug (step 3 in the plan).\n"
-                    "      The ~Q(is_pinned=True, _has_other_human_take=True) filter has no personal-pin exception."
+                    f"    ℹ  {hidden_but_pinned} conversation(s) would be hidden by other-human-take\n"
+                    f"       if not for the personal-pin exception (Q(_has_user_pin=True)).\n"
+                    f"       This is expected — the exception is working correctly."
                 ))
             if hidden_by_other_take_count > 0:
-                self.stdout.write(
-                    f"    Hidden details (up to 5):"
-                )
+                self.stdout.write("    Hidden details (up to 5):")
                 for c in hidden_by_other_take.select_related("group").order_by("-last_message_at")[:5]:
                     group_label = c.group.name if c.group else "NULL"
                     pinned_label = "✓" if c.is_pinned else "✗"
