@@ -3116,16 +3116,22 @@ async def realtime_events(request):
     except SSEToken.DoesNotExist:
         return HttpResponse(status=401)
 
-    subscriber_id, event_queue, _, _ = await subscribe(user=sse_token.user)
+    subscriber_id, event_queue, check_missed, clear_missed = await subscribe(user=sse_token.user)
 
     async def event_stream():
         try:
             yield 'retry: 3000\n\n'
             while True:
                 try:
+                    if check_missed():
+                        clear_missed()
+                        yield 'event: reload\ndata: {"message": "Se perdieron eventos — recargando datos..."}\n\n'
                     event = await asyncio.wait_for(event_queue.get(), timeout=15)
                     yield f'data: {event}\n\n'
                 except asyncio.TimeoutError:
+                    if check_missed():
+                        clear_missed()
+                        yield 'event: reload\ndata: {"message": "Se perdieron eventos — recargando datos..."}\n\n'
                     yield ': keep-alive\n\n'
         finally:
             await unsubscribe(subscriber_id)
