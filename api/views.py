@@ -893,7 +893,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
             )
 
             tag_serializer = ConversationTagSerializer(tag)
-            conversation.save()
             publish_conversation_update(conversation)
             return Response(tag_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -914,7 +913,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 custom_expiry_minutes=serializer.validated_data.get('custom_expiry_minutes'),
             )
             note_serializer = ConversationNoteSerializer(note)
-            conversation.save()
             publish_conversation_update(conversation)
             return Response(note_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -929,7 +927,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
         try:
             note = ConversationNote.objects.get(id=note_id, conversation=conversation)
             note.delete()
-            conversation.save()
             publish_conversation_update(conversation)
             return Response(status=status.HTTP_204_NO_CONTENT)
         except ConversationNote.DoesNotExist:
@@ -966,7 +963,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
             )
             create_agent_take_record(conversation, request.user, duration_minutes=duration_minutes)
             take_serializer = ConversationTakeSerializer(take)
-            conversation.save()
             # Clear prefetch cache so SSE serializes fresh takes, not stale prefetch
             if hasattr(conversation, '_prefetched_objects_cache'):
                 conversation._prefetched_objects_cache.pop('takes', None)
@@ -996,7 +992,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 get_sync_redis().setex(f"bot:escalated:{conversation.id}", 600, "1")
             except Exception:
                 pass
-        conversation.save()
         if hasattr(conversation, '_prefetched_objects_cache'):
             conversation._prefetched_objects_cache.pop('takes', None)
         publish_conversation_update(conversation)
@@ -1031,7 +1026,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
         except Exception:
             pass
 
-        conversation.save()
         if hasattr(conversation, '_prefetched_objects_cache'):
             conversation._prefetched_objects_cache.pop('takes', None)
         publish_conversation_update(conversation)
@@ -1055,7 +1049,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation = self.get_object()
         custom_name = request.data.get('custom_name', '').strip() or None
         conversation.custom_name = custom_name
-        conversation.save()
+        conversation.save(update_fields=['custom_name', 'updated_at'])
 
         Conversation.objects.filter(whatsapp_id=conversation.whatsapp_id, custom_name__isnull=True).update(
             custom_name=custom_name
@@ -1150,7 +1144,6 @@ class ConversationViewSet(viewsets.ModelViewSet):
         try:
             tag = ConversationTag.objects.get(id=tag_id, conversation=conversation)
             tag.delete()
-            conversation.save()
             publish_conversation_update(conversation)
             return Response(status=status.HTTP_204_NO_CONTENT)
         except ConversationTag.DoesNotExist:
@@ -1288,6 +1281,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation.save(update_fields=['last_message', 'last_message_at', 'updated_at'])
 
             conversation._last_msg_direction = direction
+            if hasattr(conversation, '_prefetched_objects_cache'):
+                conversation._prefetched_objects_cache.pop('takes', None)
             serializer = MessageSerializer(message)
             publish_conversation_update(conversation, serializer.data)
             if direction == 'outbound':
@@ -1370,7 +1365,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 conversation.status = 'active'
             if conversation.resolved_by_bot:
                 conversation.resolved_by_bot = False
-            conversation.save()
+            conversation.save(update_fields=['contact_name', 'contact_phone', 'status', 'resolved_by_bot', 'updated_at'])
 
         message = Message.objects.create(
             conversation=conversation,
@@ -1537,6 +1532,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation.save()
 
         conversation._last_msg_direction = 'outbound'
+        if hasattr(conversation, '_prefetched_objects_cache'):
+            conversation._prefetched_objects_cache.pop('takes', None)
 
         from api.bot.config import get_send_delay_seconds
         if get_send_delay_seconds() > 0:
@@ -2782,7 +2779,7 @@ def whatsapp_webhook(request):
                         conversation.contact_phone = wa_id
                         updated = True
                     if updated:
-                        conversation.save()
+                        conversation.save(update_fields=['contact_name', 'whatsapp_username', 'contact_phone', 'updated_at'])
 
                 if not conversation.custom_name:
                     existing_custom = Conversation.objects.filter(

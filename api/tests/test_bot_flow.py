@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.test import TestCase
 
 from api.bot.flow import (
     WELCOME,
@@ -38,7 +38,7 @@ def _strip_phone(text: str) -> str:
     return _NON_DIGIT.sub("", text) if text else ""
 
 
-class BotFlowTests(SimpleTestCase):
+class BotFlowTests(TestCase):
     """Test the bot state machine handlers with mocked external deps."""
 
     GEO_RESULT = [{"place_id": "ChIJtest123", "display_name": "Calle Test, Tuluá"}]

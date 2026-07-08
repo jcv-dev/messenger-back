@@ -1,11 +1,11 @@
 """Tests for api.bot.guard — input/output sanitization."""
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from api.bot.guard import sanitize_user_input, sanitize_llm_output
 
 
-class SanitizeUserInputTests(SimpleTestCase):
+class SanitizeUserInputTests(TestCase):
     def test_normal_text_passes(self):
         result = sanitize_user_input("Hola, quiero un domicilio")
         self.assertEqual(result, "Hola, quiero un domicilio")
@@ -75,7 +75,7 @@ class SanitizeUserInputTests(SimpleTestCase):
         self.assertEqual(result, "normal line")
 
 
-class SanitizeLlmOutputTests(SimpleTestCase):
+class SanitizeLlmOutputTests(TestCase):
     def test_none_returns_fallback(self):
         result = sanitize_llm_output(None)
         self.assertIn("Lo siento", result)
