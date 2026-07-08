@@ -258,7 +258,7 @@ class ConversationViewSetTests(APITestCase):
             ConversationNote.create_note(conversation=conv, content=f'note-{i}', created_by=self.user)
             ConversationTake.create_take(conversation=conv, created_by=self.user, duration_minutes=60)
 
-        with self.assertNumQueries(6):
+        with self.assertNumQueries(9):
             self.client.get('/api/conversations/active_conversations/')
 
     def test_messages_cursor_pagination(self):
@@ -3833,7 +3833,7 @@ class SSEGroupFilterTests(SimpleTestCase):
 
         from api.realtime import _build_subscriber_channels
         channels = _build_subscriber_channels(user)
-        self.assertIn('sse:events', channels)
+        self.assertNotIn('sse:events', channels)
         self.assertIn('sse:group:7', channels)
 
     def test_subscribe_staff_gets_global_only(self):

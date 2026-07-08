@@ -7,7 +7,7 @@ import os
 import re
 import signal
 import time
-from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from asgiref.sync import sync_to_async
 
@@ -285,7 +285,7 @@ async def handle_inbound(event: dict):
             try:
                 import redis.asyncio as aioredis
                 r = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
-                today = datetime.now().strftime('%Y%m%d')
+                today = timezone.now().astimezone(ZoneInfo('America/Bogota')).strftime('%Y%m%d')
                 replied_key = f"bot:outside_hours_replied:{conversation_id}:{today}"
                 already_replied = await r.get(replied_key)
                 if already_replied:

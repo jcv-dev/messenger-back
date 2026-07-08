@@ -6,10 +6,9 @@ from django.db.models import Q
 from django.contrib.auth.models import User
 from django.utils import timezone
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 from django.db.models.signals import post_save
 from django.dispatch import receiver
-from django.utils import timezone
-from datetime import timedelta
 from django.contrib.postgres.search import SearchVectorField
 from django.contrib.postgres.indexes import GinIndex
 
@@ -31,7 +30,9 @@ def get_expiry_datetime(expiry_type, custom_minutes=None):
     if expiry_type == '5h':
         return now + timedelta(hours=5)
     if expiry_type == 'end_of_day':
-        return (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0)
+        bog_now = now.astimezone(ZoneInfo('America/Bogota'))
+        eod_bog = bog_now.replace(hour=23, minute=59, second=59, microsecond=0)
+        return eod_bog.astimezone(ZoneInfo('UTC'))
     if expiry_type == 'never':
         return None
     if expiry_type == 'custom':

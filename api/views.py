@@ -3902,8 +3902,10 @@ def export_conversations_csv(request):
             buffer.truncate(0)
             buffer.seek(0)
 
+    from zoneinfo import ZoneInfo
+    bog_now = timezone.now().astimezone(ZoneInfo('America/Bogota'))
     response = StreamingHttpResponse(stream(), content_type='text/csv; charset=utf-8')
-    response['Content-Disposition'] = f'attachment; filename="conversaciones_{timezone.now().strftime("%Y%m%d")}.csv"'
+    response['Content-Disposition'] = f'attachment; filename="conversaciones_{bog_now.strftime("%Y%m%d")}.csv"'
     return response
 
 

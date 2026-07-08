@@ -126,6 +126,8 @@ def _build_subscriber_channels(user: Any) -> list[str]:
                     channels = [f"{GROUP_CHANNEL_PREFIX}:{profile.group_id}"]
             except Exception:
                 pass
+    else:
+        channels = [REDIS_CHANNEL]
     return channels
 
 
