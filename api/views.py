@@ -2984,6 +2984,15 @@ def whatsapp_webhook(request):
                         meta = {'interactive_type': itype}
                         last_msg_text = 'Interactive'
 
+                elif msg_type == 'button':
+                    button = msg.get('button', {})
+                    content = button.get('text', '') or button.get('payload', '')
+                    meta = {
+                        'interactive_type': 'button_reply',
+                        'interactive_reply': button,
+                    }
+                    last_msg_text = content or 'Button'
+
                 else:
                     content = msg.get('text', {}).get('body', '') if isinstance(msg.get('text'), dict) else msg.get('text', '')
                     last_msg_text = content or msg_type
