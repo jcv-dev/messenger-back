@@ -1561,27 +1561,22 @@ class StickerAssetViewSetTests(APITestCase):
         response = self.client.get('/api/stickers/')
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_create_requires_admin(self):
+    def test_authenticated_user_can_create_sticker_with_name(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
-        response = self.client.post('/api/stickers/', {'name': 'test', 'image': ''})
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_can_create_sticker_with_name(self):
-        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
         image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
         response = self.client.post('/api/stickers/', {'name': 'Test Sticker', 'image': image})
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['name'], 'Test Sticker')
 
-    def test_admin_can_create_sticker_with_blank_name(self):
-        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+    def test_authenticated_user_can_create_sticker_with_blank_name(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
         image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
         response = self.client.post('/api/stickers/', {'name': '', 'image': image})
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['name'], '')
 
-    def test_admin_can_create_sticker_without_name_field(self):
-        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+    def test_authenticated_user_can_create_sticker_without_name_field(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
         image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
         response = self.client.post('/api/stickers/', {'image': image})
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -1591,6 +1586,124 @@ class StickerAssetViewSetTests(APITestCase):
         image = SimpleUploadedFile("test.png", b"fake", content_type="image/png")
         sticker = StickerAsset.objects.create(name='', image=image, created_by=self.admin)
         self.assertEqual(str(sticker), 'Sin título')
+
+    def test_save_from_message_requires_auth(self):
+        response = self.client.post('/api/stickers/save_from_message/',
+                                     {'message_id': 9999}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_save_from_message_requires_message_id(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.post('/api/stickers/save_from_message/',
+                                     {}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_save_from_message_404_for_nonexistent_message(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.post('/api/stickers/save_from_message/',
+                                     {'message_id': 99999}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_save_from_message_rejects_non_sticker(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        conv = Conversation.objects.create(
+            whatsapp_id='15550009999', contact_name='NonSticker',
+            group=self.group,
+        )
+        msg = Message.objects.create(
+            conversation=conv, direction='inbound',
+            message_type='text', content='hello',
+        )
+        response = self.client.post('/api/stickers/save_from_message/',
+                                     {'message_id': msg.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_save_from_message_creates_sticker(self):
+        import tempfile, os
+        from django.test.utils import override_settings
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with override_settings(MEDIA_ROOT=tmpdir):
+                media_subdir = os.path.join('whatsapp', 'sticker')
+                os.makedirs(os.path.join(tmpdir, media_subdir), exist_ok=True)
+                file_path = os.path.join(tmpdir, media_subdir, 'test_sticker.webp')
+                with open(file_path, 'wb') as f:
+                    f.write(b'fake-sticker-content')
+
+                conv = Conversation.objects.create(
+                    whatsapp_id='15550009998', contact_name='Sticker Src',
+                    group=self.group,
+                )
+                msg = Message.objects.create(
+                    conversation=conv, direction='inbound',
+                    message_type='sticker',
+                    media_url=f'/media/{media_subdir}/test_sticker.webp',
+                )
+
+                self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+                response = self.client.post('/api/stickers/save_from_message/',
+                                             {'message_id': msg.id}, format='json')
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                self.assertIn('id', response.data)
+                self.assertEqual(response.data['created_by']['id'], self.user.id)
+                self.assertTrue(response.data['image'].startswith('/api/media/'))
+
+    def test_save_from_message_rejects_no_media_url(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        conv = Conversation.objects.create(
+            whatsapp_id='15550009997', contact_name='No Media',
+            group=self.group,
+        )
+        msg = Message.objects.create(
+            conversation=conv, direction='inbound',
+            message_type='sticker', media_url='',
+        )
+        response = self.client.post('/api/stickers/save_from_message/',
+                                     {'message_id': msg.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_save_from_message_rejects_unavailable_file(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        conv = Conversation.objects.create(
+            whatsapp_id='15550009996', contact_name='Unavail',
+            group=self.group,
+        )
+        msg = Message.objects.create(
+            conversation=conv, direction='inbound',
+            message_type='sticker',
+            media_url='/media/whatsapp/sticker/nonexistent.webp',
+        )
+        response = self.client.post('/api/stickers/save_from_message/',
+                                     {'message_id': msg.id}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_save_from_message_admin_can_save_any_conversation(self):
+        import tempfile, os
+        from django.test.utils import override_settings
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with override_settings(MEDIA_ROOT=tmpdir):
+                media_subdir = os.path.join('whatsapp', 'sticker')
+                os.makedirs(os.path.join(tmpdir, media_subdir), exist_ok=True)
+                file_path = os.path.join(tmpdir, media_subdir, 'test_admin.webp')
+                with open(file_path, 'wb') as f:
+                    f.write(b'fake-sticker-content')
+
+                # No group assigned to this conversation
+                conv = Conversation.objects.create(
+                    whatsapp_id='15550009995', contact_name='Admin Src',
+                )
+                msg = Message.objects.create(
+                    conversation=conv, direction='inbound',
+                    message_type='sticker',
+                    media_url=f'/media/{media_subdir}/test_admin.webp',
+                )
+
+                self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+                response = self.client.post('/api/stickers/save_from_message/',
+                                             {'message_id': msg.id}, format='json')
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                self.assertIn('id', response.data)
 
 
 # ── Auth Throttle ────────────────────────────────────────────────────────────
@@ -1659,7 +1772,7 @@ class ConversationDestroyAdminTests(APITestCase):
 # ── Admin-Only API Endpoints ─────────────────────────────────────────────────
 
 class AdminOnlyEndpointTests(APITestCase):
-    """Verify User, Sticker, CityGroup write endpoints require admin."""
+    """Verify User, CityGroup write endpoints require admin."""
 
     def setUp(self):
         self.user = User.objects.create_user(username='stafftest', password='testpass123')
@@ -1681,9 +1794,10 @@ class AdminOnlyEndpointTests(APITestCase):
         response = self.client.delete(f'/api/users/{target.id}/')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_non_admin_cannot_create_sticker(self):
-        response = self.client.post('/api/stickers/', {'name': 'test', 'image': ''})
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+    def test_authenticated_user_can_create_sticker(self):
+        image = SimpleUploadedFile("test.png", b"fake-image", content_type="image/png")
+        response = self.client.post('/api/stickers/', {'name': 'test', 'image': image})
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
     def test_non_admin_cannot_create_city_group(self):
         response = self.client.post('/api/city-groups/', {'name': 'NewCity', 'slug': 'newcity'})

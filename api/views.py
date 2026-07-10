@@ -1882,9 +1882,6 @@ class StickerAssetViewSet(viewsets.ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
-        from rest_framework.permissions import IsAdminUser, IsAuthenticated
-        if self.action in ['create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated(), IsAdminUser()]
         return [IsAuthenticated()]
 
     def get_queryset(self):
@@ -1908,6 +1905,47 @@ class StickerAssetViewSet(viewsets.ModelViewSet):
             stickers.append(sticker)
 
         serializer = self.get_serializer(stickers, many=True)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def save_from_message(self, request):
+        message_id = request.data.get('message_id')
+        if not message_id:
+            return Response({'error': 'message_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            message = Message.objects.select_related('conversation').get(id=message_id)
+        except Message.DoesNotExist:
+            return Response({'error': 'Message not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        if not user.is_staff:
+            try:
+                profile = user.profile
+                if not profile or not profile.group_id or message.conversation.group_id != profile.group_id:
+                    return Response({'error': 'Message not found'}, status=status.HTTP_404_NOT_FOUND)
+            except Exception:
+                return Response({'error': 'Message not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if message.message_type != 'sticker':
+            return Response({'error': 'Message is not a sticker'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not message.media_url:
+            return Response({'error': 'No media available for this message'}, status=status.HTTP_400_BAD_REQUEST)
+
+        file_path = _resolve_media_path(message.media_url)
+        if not file_path:
+            return Response({'error': 'Media file not yet downloaded, try again later'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.core.files.base import ContentFile
+        import os
+
+        with open(file_path, 'rb') as f:
+            content = f.read()
+        sticker = StickerAsset(created_by=user)
+        sticker.image.save(os.path.basename(file_path), ContentFile(content), save=True)
+
+        serializer = self.get_serializer(sticker)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     def perform_create(self, serializer):
