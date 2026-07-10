@@ -2620,25 +2620,17 @@ def _handle_call_webhook(call_event, metadata, contacts):
         call.recording_audio_url = audio.get('url')
         call.recording_audio_sha256 = audio.get('sha256')
         call.recording_audio_mime_type = audio.get('mime_type')
-
-        logger.info(
-            "call_recording_available %s: audio_id=%s mime_type=%s sha256=%s url=%s",
-            call_id, audio.get('id'), audio.get('mime_type'), audio.get('sha256'),
-            audio.get('url', '')[:80],
-        )
-
         call.save()
+        logger.info("call_recording_available: metadata saved for call %s", call_id)
         _publish_call_event(call, 'recording_available')
 
         cdn_url = audio.get('url')
         if cdn_url and settings.WHATSAPP_API_TOKEN:
             try:
                 token = settings.WHATSAPP_API_TOKEN
-                logger.info("call_recording_available %s: downloading from CDN...", call_id)
                 req = urllib.request.Request(cdn_url, headers={'Authorization': f'Bearer {token}'})
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     raw = resp.read()
-                file_size = len(raw)
                 ext = '.ogg'
                 filename = f"{uuid.uuid4().hex}{ext}"
                 local_dir = os.path.join(settings.MEDIA_ROOT, 'recordings')
@@ -2648,12 +2640,8 @@ def _handle_call_webhook(call_event, metadata, contacts):
                     f.write(raw)
                 call.recording_local_path = f"{settings.MEDIA_URL}recordings/{filename}"
                 call.save(update_fields=['recording_local_path'])
-                logger.info(
-                    "call_recording_available %s: saved %d bytes to %s",
-                    call_id, file_size, call.recording_local_path,
-                )
             except Exception as e:
-                logger.error("Failed to download call recording %s: %s", call_id, e, exc_info=True)
+                logger.error("Failed to download call recording %s: %s", call_id, e)
 
 
 def _handle_call_status_webhook(status_event, metadata):
@@ -3401,7 +3389,14 @@ def static_map(request):
 # --- Call REST endpoints ---
 
 def _get_recording_config():
-    return {"status": "ENABLED", "purpose": "seguridad y calidad", "announcement_language": "es"}
+    try:
+        from .models import BotConfig
+        cfg = BotConfig.objects.filter(key='call_recording_enabled').first()
+        if cfg and cfg.value:
+            return {"status": "ENABLED", "purpose": "seguridad y calidad", "announcement_language": "es"}
+    except Exception:
+        pass
+    return None
 
 
 @api_view(['POST'])
@@ -3427,15 +3422,14 @@ def call_answer(request):
     try:
         call.sdp_answer = sdp
         call.status = 'connected'
-        call.recording_status = recording.get('status')
-        call.recording_purpose = recording.get('purpose')
-        call.recording_announcement_language = recording.get('announcement_language')
+        if recording:
+            call.recording_status = recording.get('status')
+            call.recording_purpose = recording.get('purpose')
+            call.recording_announcement_language = recording.get('announcement_language')
+            logger.info("call_answer %s: recording ENABLED (config)", call_id)
+        else:
+            logger.info("call_answer %s: recording NOT enabled (config false/missing)", call_id)
         call.save()
-
-        logger.info(
-            "call_answer %s: recording %s (purpose=%s lang=%s)",
-            call_id, recording['status'], recording['purpose'], recording['announcement_language'],
-        )
 
         release_agent_take_records(call.conversation)
         ConversationTake.objects.filter(conversation=call.conversation).delete()
@@ -3450,11 +3444,9 @@ def call_answer(request):
         pre_accept_call(call_id, sdp)
         accept_call(call_id, sdp, recording=recording)
 
-        logger.debug("call_answer %s: accept payload recording=%s", call_id, json.dumps(recording))
-
         _publish_call_event(call, 'connected')
 
-        return JsonResponse({'success': True, 'call_id': call_id, 'recording': recording})
+        return JsonResponse({'success': True, 'call_id': call_id})
     except Exception as e:
         logger.exception("Failed to answer call %s", call_id)
         call.status = 'failed'
@@ -3522,6 +3514,11 @@ def call_initiate(request):
     sdp = request.data.get('sdp')
     recording = _get_recording_config()
 
+    if recording:
+        logger.info("call_initiate: recording ENABLED (config)")
+    else:
+        logger.info("call_initiate: recording NOT enabled (config false/missing)")
+
     if not to_number and not recipient:
         return JsonResponse({'error': 'to or recipient required'}, status=400)
     if not sdp:
@@ -3568,16 +3565,12 @@ def call_initiate(request):
             to_number=to_number or '',
             recipient_bsuid=recipient or '',
             sdp_offer=sdp,
-            recording_status=recording['status'],
-            recording_purpose=recording['purpose'],
-            recording_announcement_language=recording['announcement_language'],
+            recording_status=recording.get('status') if recording else None,
+            recording_purpose=recording.get('purpose') if recording else None,
+            recording_announcement_language=(
+                recording.get('announcement_language') if recording else None
+            ),
         )
-
-        logger.info(
-            "call_initiate %s: recording %s (purpose=%s lang=%s)",
-            call_id, recording['status'], recording['purpose'], recording['announcement_language'],
-        )
-        logger.debug("call_initiate %s: connect payload recording=%s", call_id, json.dumps(recording))
 
         release_agent_take_records(conversation)
         ConversationTake.objects.filter(conversation=conversation).delete()

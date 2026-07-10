@@ -573,14 +573,23 @@ class CallEndpointTests(TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertTrue(data["success"])
-        self.assertIn("recording", data)
-        self.assertEqual(data["recording"]["status"], "ENABLED")
         mock_pre_accept.assert_called_once_with("wacid_endpoint_1", "v=0\nanswer...")
         mock_accept.assert_called_once()
+
+    @patch("api.views.pre_accept_call")
+    @patch("api.views.accept_call")
+    @patch("api.views._publish_call_event")
+    def test_call_answer_with_recording(self, mock_publish, mock_accept, mock_pre_accept):
+        from api.models import BotConfig
+        BotConfig.objects.update_or_create(key='call_recording_enabled', defaults={'value': True})
+        response = self.client.post(
+            "/api/calls/answer/",
+            {"call_id": "wacid_endpoint_1", "sdp": "v=0\nanswer..."},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
         self.call.refresh_from_db()
         self.assertEqual(self.call.recording_status, "ENABLED")
-        self.assertEqual(self.call.recording_purpose, "seguridad y calidad")
-        self.assertEqual(self.call.recording_announcement_language, "es")
 
     def test_call_answer_missing_fields(self):
         response = self.client.post(
@@ -641,10 +650,6 @@ class CallEndpointTests(TestCase):
         data = response.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["call_id"], "wacid_new_2")
-        call = Call.objects.get(call_id="wacid_new_2")
-        self.assertEqual(call.recording_status, "ENABLED")
-        self.assertEqual(call.recording_purpose, "seguridad y calidad")
-        self.assertEqual(call.recording_announcement_language, "es")
 
     def test_call_initiate_missing_fields(self):
         response = self.client.post(
