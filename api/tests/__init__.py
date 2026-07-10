@@ -620,6 +620,216 @@ class MessageViewSetTests(APITestCase):
         ids = [m['id'] for m in response.data['results']]
         self.assertNotIn(msg.id, ids)
 
+    # ── Forward messages ──────────────────────────────────────────────────────
+
+    def _create_target_conversations(self):
+        conv2 = Conversation.objects.create(
+            whatsapp_id='15551111111', contact_name='Forward Target 1',
+            contact_phone='15551111111', group=self.group,
+        )
+        conv3 = Conversation.objects.create(
+            whatsapp_id='15552222222', contact_name='Forward Target 2',
+            contact_phone='15552222222', group=self.group,
+        )
+        return conv2, conv3
+
+    def test_forward_text_message(self):
+        conv2, conv3 = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [conv2.id, conv3.id]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['forwarded'], 2)
+        self.assertIsNone(response.data['errors'])
+
+        for conv in [conv2, conv3]:
+            msg = Message.objects.filter(conversation=conv, is_forwarded=True).first()
+            self.assertIsNotNone(msg, f'No forwarded message in conversation {conv.id}')
+            self.assertTrue(msg.content.startswith('*Reenviado*'))
+            self.assertEqual(msg.message_type, 'text')
+            self.assertEqual(msg.direction, 'outbound')
+            self.assertIn('Test message content', msg.content)
+
+    def test_forward_requires_auth(self):
+        self.client.credentials()
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [1]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_forward_requires_conversation_ids(self):
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/', {}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('conversation_ids', str(response.data['detail']))
+
+    def test_forward_validates_conversation_ids_is_list(self):
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': 'not-a-list'}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_forward_rejects_reaction_type(self):
+        reaction = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='reaction', content='❤️',
+            sender_name='Test',
+            metadata={'message_id': 'wamid.orig', 'emoji': '❤️'},
+        )
+        conv2, _ = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{reaction.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_forward_rejects_interactive_type(self):
+        interactive = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='interactive', content='button_payload',
+            sender_name='Test',
+            metadata={'interactive': {'type': 'button'}},
+        )
+        conv2, _ = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{interactive.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_forward_rejects_template_type(self):
+        tmpl = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='template', content='Template content',
+            sender_name='Test',
+        )
+        conv2, _ = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{tmpl.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_forward_image_message(self):
+        conv2, _ = self._create_target_conversations()
+        img_msg = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='image', content='Original caption',
+            media_url='/media/uploads/images/test.jpg',
+            sender_name='Test',
+        )
+        response = self.client.post(
+            f'/api/messages/{img_msg.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        forwarded = Message.objects.get(conversation=conv2, is_forwarded=True)
+        self.assertTrue(forwarded.content.startswith('*Reenviado*'))
+        self.assertIn('Original caption', forwarded.content)
+        self.assertEqual(forwarded.media_url, '/media/uploads/images/test.jpg')
+        self.assertEqual(forwarded.message_type, 'image')
+
+    def test_forward_location_message(self):
+        conv2, _ = self._create_target_conversations()
+        loc_msg = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='location',
+            content='Tienda (4.711, -74.072)',
+            sender_name='Test',
+            metadata={
+                'location': {
+                    'latitude': 4.711, 'longitude': -74.072,
+                    'name': 'Tienda', 'address': 'Calle 123',
+                }
+            },
+        )
+        response = self.client.post(
+            f'/api/messages/{loc_msg.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        forwarded = Message.objects.get(conversation=conv2, is_forwarded=True)
+        self.assertTrue(forwarded.content.startswith('*Reenviado*'))
+        self.assertEqual(forwarded.message_type, 'location')
+        self.assertIsNotNone(forwarded.metadata.get('location'))
+
+    def test_forward_sets_context_message(self):
+        conv2, _ = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        forwarded = Message.objects.get(conversation=conv2, is_forwarded=True)
+        self.assertEqual(forwarded.context_message_id, self.message.id)
+
+    def test_forward_sets_sender_to_current_user(self):
+        conv2, _ = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        forwarded = Message.objects.get(conversation=conv2, is_forwarded=True)
+        self.assertEqual(forwarded.sender, self.user)
+
+    def test_forward_ignores_conversations_user_cannot_access(self):
+        other_group = CityGroup.objects.create(name='Other', slug='other')
+        conv_no_access = Conversation.objects.create(
+            whatsapp_id='15553333333', contact_name='No Access',
+            contact_phone='15553333333', group=other_group,
+        )
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [conv_no_access.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['forwarded'], 0)
+        self.assertFalse(
+            Message.objects.filter(conversation=conv_no_access).exists()
+        )
+
+    def test_forward_empty_forwarded_when_no_valid_conversations(self):
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [99999]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['forwarded'], 0)
+
+    def test_forward_updates_conversation_last_message(self):
+        conv2, _ = self._create_target_conversations()
+        response = self.client.post(
+            f'/api/messages/{self.message.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        conv2.refresh_from_db()
+        self.assertIsNotNone(conv2.last_message_at)
+        self.assertIn('Reenviado', conv2.last_message)
+
+    def test_forward_document_copies_metadata(self):
+        conv2, _ = self._create_target_conversations()
+        doc_msg = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='document', content='Report.pdf',
+            media_url='/media/uploads/documents/report.pdf',
+            sender_name='Test',
+            metadata={'filename': 'Report.pdf', 'mime_type': 'application/pdf', 'file_size': 12345},
+        )
+        response = self.client.post(
+            f'/api/messages/{doc_msg.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        forwarded = Message.objects.get(conversation=conv2, is_forwarded=True)
+        self.assertEqual(forwarded.message_type, 'document')
+        self.assertEqual(forwarded.metadata.get('filename'), 'Report.pdf')
+        self.assertEqual(forwarded.metadata.get('mime_type'), 'application/pdf')
+
 
 # ── Model logic ─────────────────────────────────────────────────────────────
 

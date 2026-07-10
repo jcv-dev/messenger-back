@@ -1686,6 +1686,119 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         publish_conversation_update(message.conversation, MessageSerializer(message).data)
         return Response({'detail': 'Message cancelled'})
 
+    @action(detail=True, methods=['post'])
+    def forward(self, request, pk=None):
+        """Forward a message to one or more conversations."""
+        original = self.get_object()
+        conversation_ids = request.data.get('conversation_ids', [])
+        if not conversation_ids:
+            return Response({'detail': 'conversation_ids is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(conversation_ids, list):
+            return Response({'detail': 'conversation_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+
+        forwarded_type = original.message_type
+        if forwarded_type in ('reaction', 'edit', 'interactive', 'button', 'template'):
+            return Response({'detail': 'This message type cannot be forwarded'}, status=status.HTTP_400_BAD_REQUEST)
+
+        base_content = f"*Reenviado*\n\n{original.content}" if original.content else "*Reenviado*"
+
+        forwardable_types = ('text', 'image', 'video', 'audio', 'document', 'sticker', 'location')
+        if forwarded_type not in forwardable_types:
+            return Response({'detail': f'Cannot forward message type {forwarded_type}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        conv_qs = Conversation.objects.filter(id__in=conversation_ids)
+        user = request.user
+        if not user.is_staff:
+            from django.utils import timezone as tz
+            now = tz.now()
+            try:
+                profile = user.profile
+                if profile and profile.group_id:
+                    conv_qs = conv_qs.filter(group_id=profile.group_id)
+                else:
+                    return Response({'detail': 'No group access'}, status=status.HTTP_403_FORBIDDEN)
+            except Exception:
+                return Response({'detail': 'No group access'}, status=status.HTTP_403_FORBIDDEN)
+            other_takes = ConversationTake.objects.filter(
+                conversation=OuterRef('id'),
+                expires_at__gt=now,
+            ).exclude(created_by=user).exclude(created_by__username='bot')
+            conv_qs = conv_qs.annotate(
+                _other_take=Exists(other_takes)
+            ).filter(_other_take=False)
+
+        created_messages = []
+        errors = []
+
+        for conv in conv_qs:
+            try:
+                with transaction.atomic():
+                    new_kwargs = {
+                        'conversation': conv,
+                        'direction': 'outbound',
+                        'message_type': forwarded_type,
+                        'sender_name': user.get_full_name() or user.username,
+                        'sender': user,
+                        'is_forwarded': True,
+                        'context_message': original,
+                    }
+
+                    if forwarded_type == 'text':
+                        new_kwargs['content'] = base_content
+                    elif forwarded_type == 'location':
+                        loc = original.metadata.get('location', {}) if original.metadata else {}
+                        new_kwargs['content'] = base_content
+                        new_kwargs['metadata'] = {'location': loc} if loc else {}
+                    else:
+                        new_kwargs['content'] = base_content
+                        if original.media_url:
+                            new_kwargs['media_url'] = original.media_url
+                        if original.metadata:
+                            meta = dict(original.metadata)
+                            new_kwargs['metadata'] = meta
+
+                    new_msg = Message.objects.create(**new_kwargs)
+
+                    conv.last_message = {
+                        'text': base_content[:255],
+                        'image': '[Image]',
+                        'video': '[Video]',
+                        'audio': '[Audio]',
+                        'sticker': '[Sticker]',
+                        'document': '[Document]',
+                        'location': '[Location]',
+                    }.get(forwarded_type, '[Forwarded]')
+                    conv.last_message_at = timezone.now()
+                    conv.save(update_fields=['last_message', 'last_message_at', 'updated_at'])
+
+                    send_content = new_msg.media_url or new_msg.content
+                    if forwarded_type == 'location':
+                        send_content = (original.metadata or {}).get('location', {})
+
+                    _send_pool.submit(
+                        send_whatsapp_outbound,
+                        forwarded_type, send_content,
+                        conv.contact_phone,
+                        new_msg.id, conv.id,
+                    )
+
+                    serializer = MessageSerializer(new_msg)
+                    created_messages.append(serializer.data)
+                    publish_conversation_update(conv, serializer.data)
+
+                    _log_audit(user, conv, 'forward_message',
+                               f'Reenviado desde conversación {original.conversation_id} '
+                               f'(msg {original.id}, type={forwarded_type})')
+            except Exception as e:
+                logger.exception('Error forwarding message %d to conversation %d', original.id, conv.id)
+                errors.append({'conversation_id': conv.id, 'error': str(e)})
+
+        return Response({
+            'forwarded': len(created_messages),
+            'messages': created_messages,
+            'errors': errors if errors else None,
+        })
+
 
 from rest_framework.pagination import PageNumberPagination
 
