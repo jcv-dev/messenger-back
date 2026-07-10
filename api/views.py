@@ -3939,7 +3939,7 @@ def agent_stats(request):
     days = int(request.query_params.get('days', 30))
     since = timezone.now() - timedelta(days=days)
 
-    agents = User.objects.filter(is_staff=False).exclude(username='bot').select_related('profile__group', 'presence')
+    agents = User.objects.exclude(username='bot').select_related('profile__group', 'presence')
 
     msg_counts = dict(
         Message.objects.filter(
