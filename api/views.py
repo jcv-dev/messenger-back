@@ -3015,6 +3015,11 @@ def whatsapp_webhook(request):
                 context_message_obj = None
                 if 'context' in msg:
                     meta['context'] = msg['context']
+                    ctx = msg['context']
+                    if ctx.get('forwarded'):
+                        meta['is_forwarded'] = True
+                        if ctx.get('frequently_forwarded'):
+                            meta['is_frequently_forwarded'] = True
                     ctx_wamid = msg['context'].get('id', '')
                     if ctx_wamid:
                         ctx_msg = Message.objects.filter(
@@ -3070,6 +3075,13 @@ def whatsapp_webhook(request):
                     metadata=meta,
                     context_message=context_message_obj,
                 )
+
+                if meta.get('is_forwarded'):
+                    update_kwargs = {'is_forwarded': True}
+                    if meta.get('is_frequently_forwarded'):
+                        update_kwargs['is_frequently_forwarded'] = True
+                    Message.objects.filter(id=message.id).update(**update_kwargs)
+                    message.refresh_from_db()
 
                 msg_ts = None
                 wa_ts = msg.get('timestamp')

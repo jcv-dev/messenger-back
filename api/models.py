@@ -130,6 +130,8 @@ class Message(models.Model):
     metadata = models.JSONField(null=True, blank=True, default=dict)
     created_at = models.DateTimeField(auto_now_add=True)
     is_read = models.BooleanField(default=False)
+    is_forwarded = models.BooleanField(default=False)
+    is_frequently_forwarded = models.BooleanField(default=False)
     search_vector = SearchVectorField(null=True, blank=True)
     context_message = models.ForeignKey(
         'self', on_delete=models.SET_NULL, null=True, blank=True,
@@ -391,7 +393,7 @@ class BotSchedule(models.Model):
         ordering = ['day_of_week', 'date']
         constraints = [
             models.CheckConstraint(
-                check=(
+                condition=(
                     Q(day_of_week__isnull=False, date__isnull=True) |
                     Q(day_of_week__isnull=True, date__isnull=False)
                 ),

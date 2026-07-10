@@ -1189,6 +1189,54 @@ class WebhookTests(APITestCase):
         self.assertEqual(Message.objects.filter(whatsapp_message_id__isnull=True).count(), 1)
         self.assertEqual(Message.objects.count(), 2)
 
+    def test_webhook_forwarded_message(self):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messages': [{
+                            'from': '15551112222', 'id': 'wamid.fwd1',
+                            'type': 'text', 'text': {'body': 'Forwarded msg'},
+                            'context': {'forwarded': True, 'id': 'wamid.original'},
+                        }],
+                        'contacts': [{'profile': {'name': 'User'}, 'wa_id': '15551112222'}],
+                    }
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        msg = Message.objects.get(whatsapp_message_id='wamid.fwd1')
+        self.assertTrue(msg.is_forwarded)
+        self.assertFalse(msg.is_frequently_forwarded)
+
+    def test_webhook_frequently_forwarded_message(self):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messages': [{
+                            'from': '15551112222', 'id': 'wamid.ffwd1',
+                            'type': 'text', 'text': {'body': 'Frequently forwarded msg'},
+                            'context': {
+                                'forwarded': True,
+                                'frequently_forwarded': True,
+                                'id': 'wamid.original2',
+                            },
+                        }],
+                        'contacts': [{'profile': {'name': 'User'}, 'wa_id': '15551112222'}],
+                    }
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        msg = Message.objects.get(whatsapp_message_id='wamid.ffwd1')
+        self.assertTrue(msg.is_forwarded)
+        self.assertTrue(msg.is_frequently_forwarded)
+
 
 # ── Media Proxy ─────────────────────────────────────────────────────────────
 

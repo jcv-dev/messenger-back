@@ -194,7 +194,8 @@ class MessageSerializer(serializers.ModelSerializer):
             'id', 'direction', 'message_type', 'content', 'content_display',
             'sender_name', 'sender', 'sender_detail',
             'whatsapp_message_id', 'media_url', 'metadata', 'created_at',
-            'is_read', 'context_message_id', 'context_message_preview',
+            'is_read', 'is_forwarded', 'is_frequently_forwarded',
+            'context_message_id', 'context_message_preview',
         ]
 
     def get_context_message_id(self, obj):
