@@ -540,14 +540,19 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                     payload['audio'] = {"id": media_id, "voice": is_voice}
                 else:
                     media_payload = {"id": media_id}
+                    if message_type in ('document', 'image', 'video') and message_id:
+                        try:
+                            msg = Message.objects.get(id=message_id)
+                            if msg.content:
+                                media_payload['caption'] = msg.content
+                        except Message.DoesNotExist:
+                            pass
                     if message_type == 'document' and message_id:
                         try:
                             msg = Message.objects.get(id=message_id)
                             meta = msg.metadata or {}
                             if meta.get('filename'):
                                 media_payload['filename'] = meta['filename']
-                            if msg.content:
-                                media_payload['caption'] = msg.content
                         except Message.DoesNotExist:
                             pass
                     payload[message_type] = media_payload
@@ -579,14 +584,19 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                 else:
                     hostname = parsed.hostname
                 media_payload = {"link": content}
+                if message_type in ('document', 'image', 'video') and message_id:
+                    try:
+                        msg = Message.objects.get(id=message_id)
+                        if msg.content:
+                            media_payload['caption'] = msg.content
+                    except Message.DoesNotExist:
+                        pass
                 if message_type == 'document' and message_id:
                     try:
                         msg = Message.objects.get(id=message_id)
                         meta = msg.metadata or {}
                         if meta.get('filename'):
                             media_payload['filename'] = meta['filename']
-                        if msg.content:
-                            media_payload['caption'] = msg.content
                     except Message.DoesNotExist:
                         pass
                 payload[message_type] = media_payload
