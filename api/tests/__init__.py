@@ -758,6 +758,33 @@ class MessageViewSetTests(APITestCase):
         self.assertEqual(forwarded.message_type, 'location')
         self.assertIsNotNone(forwarded.metadata.get('location'))
 
+    def test_forward_location_message_inbound_format(self):
+        conv2, _ = self._create_target_conversations()
+        loc_msg = Message.objects.create(
+            conversation=self.conversation, direction='inbound',
+            message_type='location',
+            content='Tienda (4.711, -74.072)',
+            sender_name='Test',
+            metadata={
+                'latitude': 4.711, 'longitude': -74.072,
+                'name': 'Tienda', 'address': 'Calle 123',
+            },
+        )
+        response = self.client.post(
+            f'/api/messages/{loc_msg.id}/forward/',
+            {'conversation_ids': [conv2.id]}, format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        forwarded = Message.objects.get(conversation=conv2, is_forwarded=True)
+        self.assertTrue(forwarded.content.startswith('*Reenviado*'))
+        self.assertEqual(forwarded.message_type, 'location')
+        loc = forwarded.metadata.get('location')
+        self.assertIsNotNone(loc)
+        self.assertEqual(loc['latitude'], 4.711)
+        self.assertEqual(loc['longitude'], -74.072)
+        self.assertEqual(loc['name'], 'Tienda')
+        self.assertEqual(loc['address'], 'Calle 123')
+
     def test_forward_sets_context_message(self):
         conv2, _ = self._create_target_conversations()
         response = self.client.post(

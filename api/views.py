@@ -1696,6 +1696,24 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         publish_conversation_update(message.conversation, MessageSerializer(message).data)
         return Response({'detail': 'Message cancelled'})
 
+    @staticmethod
+    def _extract_location_metadata(metadata):
+        if not metadata:
+            return {}
+        loc = metadata.get('location')
+        if loc and 'latitude' in loc and 'longitude' in loc:
+            return loc
+        lat = metadata.get('latitude')
+        lng = metadata.get('longitude')
+        if lat is not None and lng is not None:
+            return {
+                'latitude': lat,
+                'longitude': lng,
+                'name': metadata.get('name', ''),
+                'address': metadata.get('address', ''),
+            }
+        return {}
+
     @action(detail=True, methods=['post'])
     def forward(self, request, pk=None):
         """Forward a message to one or more conversations."""
@@ -1756,7 +1774,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
                     if forwarded_type == 'text':
                         new_kwargs['content'] = base_content
                     elif forwarded_type == 'location':
-                        loc = original.metadata.get('location', {}) if original.metadata else {}
+                        loc = self._extract_location_metadata(original.metadata)
                         new_kwargs['content'] = base_content
                         new_kwargs['metadata'] = {'location': loc} if loc else {}
                     else:
@@ -1783,7 +1801,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
 
                     send_content = new_msg.media_url or new_msg.content
                     if forwarded_type == 'location':
-                        send_content = (original.metadata or {}).get('location', {})
+                        send_content = self._extract_location_metadata(original.metadata)
 
                     _send_pool.submit(
                         send_whatsapp_outbound,
