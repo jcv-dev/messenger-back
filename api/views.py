@@ -749,12 +749,11 @@ def send_whatsapp_call_action(phone_number_id, action, call_id=None, to=None,
     return _call_whatsapp_api(phone_number_id, payload)
 
 
-def pre_accept_call(call_id, sdp_answer, recording=None):
+def pre_accept_call(call_id, sdp_answer):
     phone_number_id = settings.WHATSAPP_PHONE_NUMBER_ID
     session = {"sdp_type": "answer", "sdp": sdp_answer}
     return send_whatsapp_call_action(
         phone_number_id, "pre_accept", call_id=call_id, session=session,
-        recording=recording,
     )
 
 
@@ -3448,15 +3447,11 @@ def call_answer(request):
         )
         create_agent_take_record(call.conversation, request.user, duration_minutes=10)
 
-        pre_resp = pre_accept_call(call_id, sdp, recording=recording)
-        if pre_resp:
-            logger.debug("call_answer %s: pre_accept response=%s", call_id, pre_resp)
+        _publish_call_event(call, 'connected')
 
         accept_resp = accept_call(call_id, sdp, recording=recording)
         if accept_resp:
             logger.debug("call_answer %s: accept response=%s", call_id, accept_resp)
-
-        _publish_call_event(call, 'connected')
 
         return JsonResponse({'success': True, 'call_id': call_id, 'recording': recording})
     except Exception as e:

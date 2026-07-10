@@ -266,12 +266,12 @@ class CallingAPIHelperTests(SimpleTestCase):
         mock_send.return_value = {"success": True}
         mock_settings.WHATSAPP_PHONE_NUMBER_ID = "123"
         from api.views import pre_accept_call
-        pre_accept_call("wacid_1", "v=0\nsdp answer", recording={"status": "ENABLED"})
+        pre_accept_call("wacid_1", "v=0\nsdp answer")
         mock_send.assert_called_once()
         args, kwargs = mock_send.call_args
         self.assertEqual(args[1], "pre_accept")
         self.assertEqual(kwargs.get("session", {}).get("sdp_type"), "answer")
-        self.assertEqual(kwargs.get("recording", {}).get("status"), "ENABLED")
+        self.assertNotIn("recording", kwargs)
 
     @patch("api.views.settings")
     @patch("api.views.send_whatsapp_call_action")
@@ -562,10 +562,9 @@ class CallEndpointTests(TestCase):
         data = response.json()
         self.assertTrue(data["active"])
 
-    @patch("api.views.pre_accept_call")
     @patch("api.views.accept_call")
     @patch("api.views._publish_call_event")
-    def test_call_answer_success(self, mock_publish, mock_accept, mock_pre_accept):
+    def test_call_answer_success(self, mock_publish, mock_accept):
         response = self.client.post(
             "/api/calls/answer/",
             {"call_id": "wacid_endpoint_1", "sdp": "v=0\nanswer..."},
@@ -576,10 +575,6 @@ class CallEndpointTests(TestCase):
         self.assertTrue(data["success"])
         self.assertIn("recording", data)
         self.assertEqual(data["recording"]["status"], "ENABLED")
-        mock_pre_accept.assert_called_once_with(
-            "wacid_endpoint_1", "v=0\nanswer...",
-            recording={"status": "ENABLED", "purpose": "seguridad y calidad", "announcement_language": "es"},
-        )
         mock_accept.assert_called_once_with(
             "wacid_endpoint_1", "v=0\nanswer...",
             recording={"status": "ENABLED", "purpose": "seguridad y calidad", "announcement_language": "es"},
