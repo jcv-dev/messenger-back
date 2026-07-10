@@ -3932,8 +3932,7 @@ def export_conversations_csv(request):
 @permission_classes([IsAuthenticated, IsAdminUser])
 def agent_stats(request):
     """Per-agent statistics for admin view."""
-    from django.db.models import Count, Avg, F
-    from django.db.models.functions import Extract
+    from django.db.models import Count, Avg, F, Func, FloatField
     import redis as sync_redis
 
     days = int(request.query_params.get('days', 30))
@@ -3960,7 +3959,12 @@ def agent_stats(request):
             first_response_at__isnull=False,
         ).values('agent_id').annotate(
             avg_seconds=Avg(
-                Extract(F('first_response_at'), 'epoch') - Extract(F('taken_at'), 'epoch')
+                Func(
+                    F('first_response_at') - F('taken_at'),
+                    function='EXTRACT',
+                    template="EXTRACT(EPOCH FROM %(expressions)s)",
+                    output_field=FloatField(),
+                )
             )
         ).values_list('agent_id', 'avg_seconds')
     )
@@ -4000,7 +4004,7 @@ def agent_stats(request):
             'status': online_status,
             'messages_sent': msg_counts.get(uid, 0),
             'conversations_handled': conv_counts.get(uid, 0),
-            'avg_response_time_seconds': round(avg_rt, 1) if avg_rt else None,
+            'avg_response_time_seconds': round(avg_rt, 1) if avg_rt is not None else None,
         })
 
     return Response({'results': results, 'days': days})

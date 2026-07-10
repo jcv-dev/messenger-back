@@ -101,11 +101,13 @@ DATABASES = {
         'HOST': config('DB_HOST', default=''),
         'PORT': config('DB_PORT', default=''),
         'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', default=0, cast=int),
-        'OPTIONS': {
-            'sslmode': config('DB_SSLMODE', default='prefer'),
-        },
     }
 }
+_db_engine = DATABASES['default']['ENGINE']
+if 'postgresql' in _db_engine or 'postgis' in _db_engine:
+    DATABASES['default']['OPTIONS'] = {
+        'sslmode': config('DB_SSLMODE', default='prefer'),
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
