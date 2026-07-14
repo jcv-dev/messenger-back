@@ -64,6 +64,14 @@ def get_default_group():
         return None
 
 _send_pool = ThreadPoolExecutor(max_workers=32, thread_name_prefix='wa-send')
+
+WHATSAPP_MEDIA_LIMITS = {
+    'image': 5 * 1024 * 1024,
+    'sticker': 500 * 1024,
+    'video': 16 * 1024 * 1024,
+    'audio': 16 * 1024 * 1024,
+    'document': 100 * 1024 * 1024,
+}
 _download_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='wa-dl')
 
 _sweeper_started = False
@@ -387,6 +395,151 @@ def _convert_audio_to_ogg_opus(audio_path, actual_duration=None):
         return None
 
 
+def _compress_image(file_path, max_bytes):
+    try:
+        from PIL import Image
+        img = Image.open(file_path)
+        for quality in (85, 65, 45, 25):
+            fd, tmp = tempfile.mkstemp(suffix='.jpg', prefix='wa_img_')
+            os.close(fd)
+            try:
+                save_img = img.convert('RGB') if img.mode in ('RGBA', 'P', 'LA', 'PA') else img
+                save_img.save(tmp, 'JPEG', quality=quality, optimize=True)
+                if os.path.getsize(tmp) <= max_bytes:
+                    return tmp
+            except Exception:
+                pass
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        for scale in (0.7, 0.5, 0.3):
+            fd, tmp = tempfile.mkstemp(suffix='.jpg', prefix='wa_img_')
+            os.close(fd)
+            try:
+                w, h = img.size
+                resized = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                save_img = resized.convert('RGB') if resized.mode in ('RGBA', 'P', 'LA', 'PA') else resized
+                save_img.save(tmp, 'JPEG', quality=75, optimize=True)
+                if os.path.getsize(tmp) <= max_bytes:
+                    return tmp
+            except Exception:
+                pass
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning("Image compression failed for %s: %s", file_path, e)
+    return None
+
+
+def _compress_video(file_path, max_bytes):
+    try:
+        fd, tmp = tempfile.mkstemp(suffix='.mp4', prefix='wa_vid_')
+        os.close(fd)
+        for crf, scale in [(28, 1.0), (32, 0.7), (36, 0.5)]:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', file_path,
+                    '-c:v', 'libx264', '-preset', 'fast',
+                    '-crf', str(crf),
+                    '-c:a', 'aac', '-b:a', '64k',
+                    '-movflags', '+faststart',
+                ]
+                if scale < 1.0:
+                    cmd.extend(['-vf', f'scale=iw*{scale}:ih*{scale}'])
+                cmd.append(tmp)
+                subprocess.run(cmd, capture_output=True, timeout=120)
+                if os.path.exists(tmp) and os.path.getsize(tmp) <= max_bytes:
+                    return tmp
+            except Exception:
+                pass
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    except Exception as e:
+        logger.warning("Video compression failed for %s: %s", file_path, e)
+    return None
+
+
+def _compress_audio(file_path, max_bytes):
+    try:
+        pcm_cmd = [
+            'ffmpeg', '-y',
+            '-i', file_path,
+            '-f', 's16le', '-ac', '1', '-ar', '48000',
+            '-',
+        ]
+        pcm = subprocess.run(pcm_cmd, capture_output=True, timeout=30)
+        if pcm.returncode != 0:
+            logger.warning("Audio PCM decode failed for compression")
+            return None
+        for bitrate in (24, 16, 12):
+            fd, tmp = tempfile.mkstemp(suffix='.ogg', prefix='wa_audio_')
+            os.close(fd)
+            try:
+                ogg_cmd = [
+                    'ffmpeg', '-y',
+                    '-f', 's16le', '-ar', '48000', '-ac', '1',
+                    '-i', '-',
+                    '-c:a', 'libopus', '-b:a', f'{bitrate}k',
+                    '-application', 'voip',
+                    '-frame_duration', '60',
+                    '-vn',
+                    tmp,
+                ]
+                result = subprocess.run(ogg_cmd, input=pcm.stdout, capture_output=True, timeout=30)
+                if result.returncode == 0 and os.path.getsize(tmp) <= max_bytes:
+                    return tmp
+            except Exception:
+                pass
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    except Exception as e:
+        logger.warning("Audio compression failed for %s: %s", file_path, e)
+    return None
+
+
+def _ensure_media_under_limit(file_path, message_type):
+    limit = WHATSAPP_MEDIA_LIMITS.get(message_type)
+    if limit is None:
+        return file_path, None
+    if os.path.getsize(file_path) <= limit:
+        return file_path, None
+    logger.info(
+        "Media %s (%d bytes) exceeds WhatsApp limit (%d bytes), compressing...",
+        message_type, os.path.getsize(file_path), limit,
+    )
+    if message_type in ('image', 'sticker'):
+        compressed = _compress_image(file_path, limit)
+    elif message_type == 'video':
+        compressed = _compress_video(file_path, limit)
+    elif message_type == 'audio':
+        compressed = _compress_audio(file_path, limit)
+    else:
+        compressed = None
+    if compressed:
+        try:
+            compressed_size = os.path.getsize(compressed)
+            logger.info("Media %s compressed to %d bytes", message_type, compressed_size)
+        except OSError:
+            pass
+        return compressed, compressed
+    logger.warning(
+        "Media %s (%d bytes) exceeds limit and compression failed",
+        message_type, os.path.getsize(file_path),
+    )
+    return None, None
+
+
 def download_whatsapp_media(media_value, token, media_type):
     if not media_value or not token:
         return None
@@ -492,6 +645,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
             media_id = None
 
             file_path = _resolve_media_path(content)
+            temp_files = []
             if file_path:
                 upload_path = file_path
                 converted_path = None
@@ -513,18 +667,31 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                         converted_path = _convert_audio_to_ogg_opus(file_path, actual_duration=actual_duration)
                         if converted_path:
                             upload_path = converted_path
-                acquire_rate_capacity(phone_number_id)
+                            temp_files.append(converted_path)
+                
+                upload_path, compressed_path = _ensure_media_under_limit(upload_path, message_type)
+                if compressed_path:
+                    temp_files.append(compressed_path)
+                
                 try:
-                    media_id = upload_media_to_whatsapp(upload_path, phone_number_id, token)
-                except urllib.error.HTTPError as e:
-                    err_body = e.read().decode() if hasattr(e, 'read') else ''
-                    logger.warning("Media upload to WhatsApp failed: HTTP %s %s", e.code, err_body[:200])
-                except Exception:
-                    logger.warning("Media upload to WhatsApp failed (network/config error)")
-                finally:
-                    if converted_path:
+                    if upload_path:
+                        acquire_rate_capacity(phone_number_id)
                         try:
-                            os.remove(converted_path)
+                            media_id = upload_media_to_whatsapp(upload_path, phone_number_id, token)
+                        except urllib.error.HTTPError as e:
+                            err_body = e.read().decode() if hasattr(e, 'read') else ''
+                            logger.warning("Media upload to WhatsApp failed: HTTP %s %s", e.code, err_body[:200])
+                        except Exception:
+                            logger.warning("Media upload to WhatsApp failed (network/config error)")
+                    else:
+                        logger.warning(
+                            "Media upload skipped for %s: file exceeds WhatsApp limit and compression failed",
+                            message_type,
+                        )
+                finally:
+                    for tmp in temp_files:
+                        try:
+                            os.remove(tmp)
                         except OSError:
                             pass
 
