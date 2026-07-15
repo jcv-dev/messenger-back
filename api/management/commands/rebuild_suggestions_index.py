@@ -1,4 +1,6 @@
 """Rebuild the MessageSuggestion index from existing outbound text messages."""
+from collections import defaultdict
+
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.db.models import Q
@@ -25,7 +27,7 @@ class Command(BaseCommand):
             message_type='text',
         ).exclude(
             Q(content__isnull=True) | Q(content=''),
-        ).select_related('conversation', 'sender')
+        )
 
         if days:
             cutoff = timezone.now() - timezone.timedelta(days=days)
@@ -37,18 +39,24 @@ class Command(BaseCommand):
             return
 
         self.stdout.write(f'Indexing {total} messages...')
-        indexed = 0
-        skipped = 0
 
+        conv_ids = set(
+            qs.values_list('conversation_id', flat=True).distinct()
+        )
+
+        self.stdout.write(f'  Fetching tags for {len(conv_ids)} conversations...')
+        tags_by_conv = defaultdict(set)
+        for tag in ConversationTag.objects.filter(
+            conversation_id__in=conv_ids,
+        ).filter(
+            Q(expires_at__gt=timezone.now()) | Q(expires_at__isnull=True),
+        ).values('conversation_id', 'tag_name'):
+            tags_by_conv[tag['conversation_id']].add(tag['tag_name'])
+
+        indexed = 0
         batch = []
-        for msg in qs.iterator(chunk_size=500):
-            tags = list(
-                ConversationTag.objects.filter(
-                    conversation=msg.conversation,
-                ).filter(
-                    Q(expires_at__gt=timezone.now()) | Q(expires_at__isnull=True),
-                ).values_list('tag_name', flat=True)
-            )
+        for msg in qs.only('content', 'conversation_id', 'sender_id'):
+            tags = list(tags_by_conv.get(msg.conversation_id, []))
             batch.append((msg.content, tags, msg.sender_id))
             indexed += 1
 
@@ -63,5 +71,5 @@ class Command(BaseCommand):
                 index_message(content, tags, sender_id)
 
         self.stdout.write(self.style.SUCCESS(
-            f'Indexed {indexed} messages (skipped {skipped} duplicates)'
+            f'Indexed {indexed} messages'
         ))
