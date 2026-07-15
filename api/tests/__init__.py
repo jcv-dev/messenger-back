@@ -4585,3 +4585,94 @@ class TemplateExclusionSendTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['queued'], 0)
         self.assertEqual(response.data['skipped'], 1)
+
+
+class StopButtonWebhookHandlerTests(APITestCase):
+    """Test that clicking the stop button on a template creates exclusion + confirmation message."""
+
+    def setUp(self):
+        self.conversation = Conversation.objects.create(
+            whatsapp_id='573001234567',
+            contact_name='Test',
+            contact_phone='573001234567',
+        )
+
+    def test_stop_button_creates_exclusion_and_confirmation(self):
+        from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'contacts': [{'wa_id': '573001234567', 'profile': {'name': 'Test'}}],
+                        'messages': [{
+                            'from': '573001234567', 'id': 'wamid.stop1',
+                            'type': 'button',
+                            'button': {'text': STOP_TEMPLATE_BUTTON_TEXT, 'payload': STOP_TEMPLATE_BUTTON_TEXT},
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+
+        exclusion = TemplateExclusion.objects.filter(contact_phone='573001234567').first()
+        self.assertIsNotNone(exclusion)
+        self.assertEqual(exclusion.source, 'stop_button')
+
+        confirm_msg = Message.objects.filter(conversation=self.conversation, direction='outbound', message_type='text').first()
+        self.assertIsNotNone(confirm_msg)
+        self.assertIn('removido', confirm_msg.content)
+
+    def test_stop_button_non_matching_text_ignored(self):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'contacts': [{'wa_id': '573001234567', 'profile': {'name': 'Test'}}],
+                        'messages': [{
+                            'from': '573001234567', 'id': 'wamid.stop2',
+                            'type': 'button',
+                            'button': {'text': 'Some other button', 'payload': 'some_other'},
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+
+        self.assertFalse(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())
+
+    def test_stop_button_idempotent_no_duplicate_message(self):
+        from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT
+        TemplateExclusion.objects.create(contact_phone='573001234567', source='stop_button')
+
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'contacts': [{'wa_id': '573001234567', 'profile': {'name': 'Test'}}],
+                        'messages': [{
+                            'from': '573001234567', 'id': 'wamid.stop3',
+                            'type': 'button',
+                            'button': {'text': STOP_TEMPLATE_BUTTON_TEXT, 'payload': STOP_TEMPLATE_BUTTON_TEXT},
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        outbound_msgs = Message.objects.filter(direction='outbound')
+        self.assertEqual(outbound_msgs.count(), 0)
+        self.assertEqual(TemplateExclusion.objects.filter(contact_phone='573001234567').count(), 1)

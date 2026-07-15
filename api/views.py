@@ -3513,6 +3513,10 @@ def whatsapp_webhook(request):
 
                 conversation._last_msg_direction = 'inbound'
 
+                elapsed = time.time() - webhook_start
+                logger.info("Webhook msg %s: %.3fs from receipt to SSE publish (last_msg=%s)", message.id, elapsed, last_msg_text)
+                publish_conversation_update(conversation, MessageSerializer(message).data)
+
                 if msg_type == 'button' and last_msg_text:
                     from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT, STOP_TEMPLATE_CONFIRMATION_TEXT
                     if last_msg_text.strip() == STOP_TEMPLATE_BUTTON_TEXT:
@@ -3530,12 +3534,18 @@ def whatsapp_webhook(request):
                                     action='toggle_status',
                                     detail=f"Auto-excluido de plantillas vía botón: {wa_id}",
                                 )
-                            send_whatsapp_outbound('text', STOP_TEMPLATE_CONFIRMATION_TEXT, wa_id)
-                            message._stop_processed = True
-
-                elapsed = time.time() - webhook_start
-                logger.info("Webhook msg %s: %.3fs from receipt to SSE publish (last_msg=%s)", message.id, elapsed, last_msg_text)
-                publish_conversation_update(conversation, MessageSerializer(message).data)
+                            confirm_msg = Message.objects.create(
+                                conversation=conversation,
+                                direction='outbound',
+                                message_type='text',
+                                content=STOP_TEMPLATE_CONFIRMATION_TEXT,
+                                sender_name='Bot',
+                            )
+                            conversation.last_message = STOP_TEMPLATE_CONFIRMATION_TEXT
+                            conversation.last_message_at = timezone.now()
+                            conversation.save(update_fields=['last_message', 'last_message_at'])
+                            send_whatsapp_outbound('text', STOP_TEMPLATE_CONFIRMATION_TEXT, wa_id, message_id=confirm_msg.id)
+                            publish_conversation_update(conversation, MessageSerializer(confirm_msg).data)
 
                 if raw_media and media_type_for_download:
                     _download_pool.submit(download_media_async, message.id, raw_media, media_type_for_download)
