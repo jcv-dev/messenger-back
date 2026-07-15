@@ -2298,7 +2298,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], parser_classes=[FormParser, MultiPartParser])
     def upload_media(self, request):
-        """Upload an image to Meta for use as a template header."""
+        """Upload an image to Meta's phone-number media endpoint for use when SENDING"""
         uploaded_file = request.FILES.get('file')
         if not uploaded_file:
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2323,6 +2323,40 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             media_id = upload_media_to_whatsapp(tmp_path, phone_number_id, token)
             if media_id:
                 return Response({'media_id': media_id, 'handle': media_id})
+            return Response({'error': 'Error al subir la imagen a Meta'}, status=500)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @action(detail=False, methods=['post'], parser_classes=[FormParser, MultiPartParser])
+    def upload_template_header(self, request):
+        """Upload an image to Meta's business account for use as a template CREATION header handle."""
+        from . import whatsapp_templates
+        uploaded_file = request.FILES.get('file')
+        if not uploaded_file:
+            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        ext = os.path.splitext(uploaded_file.name)[1].lower()
+        if ext not in ('.jpg', '.jpeg', '.png'):
+            return Response({'error': 'Solo se permiten imágenes JPG o PNG'}, status=400)
+
+        if uploaded_file.size > 5 * 1024 * 1024:
+            return Response({'error': 'La imagen no debe superar los 5 MB'}, status=400)
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            for chunk in uploaded_file.chunks():
+                tmp.write(chunk)
+            tmp_path = tmp.name
+
+        try:
+            handle = whatsapp_templates.upload_template_media(tmp_path)
+            if handle:
+                return Response({'handle': handle})
             return Response({'error': 'Error al subir la imagen a Meta'}, status=500)
         except Exception as e:
             return Response({'error': str(e)}, status=500)
