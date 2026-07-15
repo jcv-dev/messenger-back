@@ -352,6 +352,26 @@ class CannedResponse(models.Model):
         verbose_name_plural = "Canned Responses"
 
 
+class MessageSuggestion(models.Model):
+    """Persistent store of agent-sent messages for autocomplete suggestions.
+    Lives independently from the Message table (which is cleaned every 7 days)."""
+
+    text = models.TextField(unique=True)
+    tags = models.JSONField(default=list)
+    agent = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='message_suggestions')
+    usage_count = models.PositiveIntegerField(default=1)
+    last_used = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-last_used']
+        verbose_name = "Message Suggestion"
+        verbose_name_plural = "Message Suggestions"
+        indexes = [
+            GinIndex(fields=['text'], name='msg_suggestion_text_gin_idx', opclasses=['gin_trgm_ops']),
+        ]
+
+
 class BotExemptContact(models.Model):
     """Phone numbers pre-registered as not handled by the bot."""
     contact_phone = models.CharField(max_length=50, unique=True)

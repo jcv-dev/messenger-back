@@ -1268,6 +1268,17 @@ class ConversationViewSet(viewsets.ModelViewSet):
             if direction == 'outbound':
                 _log_audit(request.user, conversation, 'send_message', content[:200])
 
+                if message_type == 'text' and content:
+                    from .suggestions import index_message
+                    convo_tags = list(
+                        ConversationTag.objects.filter(
+                            conversation=conversation,
+                        ).filter(
+                            Q(expires_at__gt=timezone.now()) | Q(expires_at__isnull=True),
+                        ).values_list('tag_name', flat=True)
+                    )
+                    index_message(content, convo_tags, request.user.id)
+
             return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'])
@@ -1617,6 +1628,30 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
             'total': len(results),
             'has_more': False,
         })
+
+    @action(detail=False, methods=['post'])
+    def suggestions(self, request):
+        from .suggestions import search as suggestion_search
+
+        conversation_id = request.data.get('conversation_id')
+        partial_text = (request.data.get('partial_text') or '').strip()
+
+        if not partial_text or len(partial_text) < 2:
+            return Response({'suggestion': None, 'alternatives': []})
+
+        tags = []
+        if conversation_id:
+            tags = list(
+                ConversationTag.objects.filter(
+                    conversation_id=conversation_id,
+                    expires_at__gt=timezone.now(),
+                ).values_list('tag_name', flat=True)
+            )
+
+        result = suggestion_search(partial_text, tags)
+        if result is None:
+            return Response({'suggestion': None, 'alternatives': []})
+        return Response(result)
 
     @action(detail=True, methods=['patch'])
     def cancel(self, request, pk=None):
