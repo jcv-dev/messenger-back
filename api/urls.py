@@ -3,7 +3,7 @@ URL configuration for API
 """
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import ConversationViewSet, MessageViewSet, UserViewSet, CityGroupViewSet, StickerAssetViewSet, BotExemptContactViewSet, BotScheduleViewSet, BotConfigViewSet, WhatsAppTemplateViewSet, AuditLogViewSet, CannedResponseViewSet, media_proxy, serve_media, static_map, issue_sse_token, call_answer, call_reject, call_terminate, call_initiate, call_list, call_active, call_turn_config, call_settings, call_recordings, presence_heartbeat, presence_list, push_subscribe, push_unsubscribe, export_conversations_csv, agent_stats
+from .views import ConversationViewSet, MessageViewSet, UserViewSet, CityGroupViewSet, StickerAssetViewSet, BotExemptContactViewSet, BotScheduleViewSet, BotConfigViewSet, WhatsAppTemplateViewSet, TemplateExclusionViewSet, AuditLogViewSet, CannedResponseViewSet, media_proxy, serve_media, static_map, issue_sse_token, call_answer, call_reject, call_terminate, call_initiate, call_list, call_active, call_turn_config, call_settings, call_recordings, presence_heartbeat, presence_list, push_subscribe, push_unsubscribe, export_conversations_csv, agent_stats
 
 router = DefaultRouter()
 router.register(r'conversations', ConversationViewSet, basename='conversation')
@@ -15,6 +15,7 @@ router.register(r'bot-exempt', BotExemptContactViewSet, basename='bot-exempt')
 router.register(r'bot-schedule', BotScheduleViewSet, basename='bot-schedule')
 router.register(r'bot-config', BotConfigViewSet, basename='bot-config')
 router.register(r'templates', WhatsAppTemplateViewSet, basename='template')
+router.register(r'template-exclusions', TemplateExclusionViewSet, basename='template-exclusion')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
 router.register(r'canned-responses', CannedResponseViewSet, basename='canned-response')
 

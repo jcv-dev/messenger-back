@@ -27,7 +27,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from uuid import uuid4
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription, AgentTakeRecord, create_agent_take_record, release_agent_take_records, set_first_response
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, SSEToken, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, TemplateExclusion, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription, AgentTakeRecord, create_agent_take_record, release_agent_take_records, set_first_response
 from .serializers import (
     ConversationSerializer, CityGroupSerializer,
     ConversationListSerializer, MessageSerializer, ConversationTagSerializer,
@@ -38,7 +38,7 @@ from .serializers import (
     UserSerializer, StickerAssetSerializer, BotExemptContactSerializer,
     WhatsAppTemplateSerializer, CallSerializer, AuditLogSerializer,
     CannedResponseSerializer, AgentPresenceSerializer,
-    PushSubscriptionSerializer, MessageSearchSerializer,
+    TemplateExclusionSerializer, PushSubscriptionSerializer, MessageSearchSerializer,
     media_signer, sign_media_url,
 )
 from .redis_client import get_sync_redis
@@ -1700,6 +1700,9 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if not conversation.contact_phone:
             return Response({'error': 'No contact phone'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if TemplateExclusion.objects.filter(contact_phone=conversation.contact_phone).exists():
+            return Response({'status': 'skipped', 'reason': 'El contacto solicitó no recibir más plantillas'})
+
         # Build components with parameter substitution
         components = []
         for comp in template.components:
@@ -2095,6 +2098,20 @@ class BotExemptContactViewSet(viewsets.ModelViewSet):
         instance.delete()
 
 
+class TemplateExclusionViewSet(viewsets.ModelViewSet):
+    """Manage template exclusion list. Write operations require admin."""
+    queryset = TemplateExclusion.objects.select_related('created_by').all()
+    serializer_class = TemplateExclusionSerializer
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            return [IsAuthenticated(), IsAdminUser()]
+        return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
 class StickerAssetViewSet(viewsets.ModelViewSet):
     """Store and serve reusable sticker images."""
 
@@ -2398,12 +2415,17 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
         if recipients:
             queued = 0
             created = 0
+            skipped = 0
             errors = []
+            excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True))
             for idx, entry in enumerate(recipients):
                 phone = entry.get('phone', '').strip()
                 row_params = entry.get('parameters', {})
                 if not phone:
                     errors.append({'row': idx, 'phone': phone, 'error': 'Teléfono vacío'})
+                    continue
+                if phone in excluded_phones:
+                    skipped += 1
                     continue
                 conv, is_new = Conversation.objects.get_or_create(
                     contact_phone=phone,
@@ -2425,6 +2447,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             return Response({
                 'queued': queued,
                 'created': created,
+                'skipped': skipped,
                 'total': len(recipients),
                 'errors': errors,
                 'template_name': template.name,
@@ -2451,13 +2474,19 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                     resolved[var_name] = fixed_values.get(var_name, '')
             return resolved
 
+        excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True))
         queued = 0
+        skipped = 0
         for conv in conversations:
+            if conv.contact_phone in excluded_phones:
+                skipped += 1
+                continue
             resolved_params = _resolve_params(conv)
             queued += _send_to_conversation(conv, resolved_params)
 
         return Response({
             'queued': queued,
+            'skipped': skipped,
             'template_name': template.name,
             'total': len(conversations),
         })
@@ -2806,6 +2835,8 @@ def _handle_template_components_webhook(value: dict):
             new_components.append({'type': 'buttons', 'buttons': buttons})
 
     if new_components and new_components != template.components:
+        from .serializers import _ensure_stop_button
+        new_components = _ensure_stop_button(new_components)
         template.components = new_components
         template.template_id = template_id or template.template_id
         template.save(update_fields=['components', 'template_id'])
@@ -3481,6 +3512,27 @@ def whatsapp_webhook(request):
                     conversation.save()
 
                 conversation._last_msg_direction = 'inbound'
+
+                if msg_type == 'button' and last_msg_text:
+                    from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT, STOP_TEMPLATE_CONFIRMATION_TEXT
+                    if last_msg_text.strip() == STOP_TEMPLATE_BUTTON_TEXT:
+                        _, created = TemplateExclusion.objects.get_or_create(
+                            contact_phone=wa_id,
+                            defaults={'contact_name': contact_name, 'source': 'stop_button'},
+                        )
+                        if created:
+                            logger.info("Template exclusion added for %s via stop button", wa_id)
+                            audit_actor = User.objects.filter(username='bot').first() or User.objects.filter(is_staff=True).first()
+                            if audit_actor:
+                                AuditLog.objects.create(
+                                    actor=audit_actor,
+                                    conversation=conversation,
+                                    action='toggle_status',
+                                    detail=f"Auto-excluido de plantillas vía botón: {wa_id}",
+                                )
+                            send_whatsapp_outbound('text', STOP_TEMPLATE_CONFIRMATION_TEXT, wa_id)
+                            message._stop_processed = True
+
                 elapsed = time.time() - webhook_start
                 logger.info("Webhook msg %s: %.3fs from receipt to SSE publish (last_msg=%s)", message.id, elapsed, last_msg_text)
                 publish_conversation_update(conversation, MessageSerializer(message).data)

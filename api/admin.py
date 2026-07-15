@@ -8,7 +8,7 @@ from django.urls import path
 from django.conf import settings
 from django.contrib import messages
 from django.http import HttpResponseNotAllowed
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, CityGroup, UserProfile, BotExemptContact, Call
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, CityGroup, UserProfile, BotExemptContact, TemplateExclusion, Call
 
 import json
 import urllib.request
@@ -80,6 +80,13 @@ class UserProfileAdmin(admin.ModelAdmin):
 class BotExemptContactAdmin(admin.ModelAdmin):
     list_display = ['contact_phone', 'contact_name', 'created_by', 'created_at']
     search_fields = ['contact_phone', 'contact_name']
+
+
+@admin.register(TemplateExclusion)
+class TemplateExclusionAdmin(admin.ModelAdmin):
+    list_display = ['contact_phone', 'contact_name', 'source', 'created_at']
+    search_fields = ['contact_phone', 'contact_name']
+    list_filter = ['source']
 
 
 @admin.register(Call)

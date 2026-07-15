@@ -15,11 +15,12 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, AgentPresence, PushSubscription, AuditLog, CannedResponse, StickerAsset
+from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, TemplateExclusion, AgentPresence, PushSubscription, AuditLog, CannedResponse, StickerAsset
 from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
     WhatsAppTemplateSerializer, SendTemplateSerializer, BulkSendTemplateSerializer,
+    TemplateExclusionSerializer, _ensure_stop_button,
 )
 from api.views import ConversationViewSet, MessageViewSet, WhatsAppTemplateViewSet
 
@@ -4341,3 +4342,246 @@ class SetGroupTests(APITestCase):
         response = self.client.post(f'/api/conversations/{conv_b.id}/set_group/',
                                     {'group_id': self.group_a.id})
         self.assertEqual(response.status_code, 404)
+
+
+class StopButtonTests(APITestCase):
+    """Test the _ensure_stop_button function and serializer integration."""
+
+    def test_ensure_stop_button_adds_to_empty(self):
+        result = _ensure_stop_button([])
+        buttons_comp = next(c for c in result if c.get('type') == 'buttons')
+        self.assertEqual(len(buttons_comp['buttons']), 1)
+        self.assertEqual(buttons_comp['buttons'][0]['text'], 'No recibir más promos')
+
+    def test_ensure_stop_button_appends_as_last(self):
+        components = [{'type': 'buttons', 'buttons': [
+            {'type': 'quick_reply', 'text': 'Ver más'},
+        ]}]
+        result = _ensure_stop_button(components)
+        buttons = result[0]['buttons']
+        self.assertEqual(len(buttons), 2)
+        self.assertEqual(buttons[0]['text'], 'Ver más')
+        self.assertEqual(buttons[1]['text'], 'No recibir más promos')
+
+    def test_ensure_stop_button_idempotent(self):
+        components = [{'type': 'buttons', 'buttons': [
+            {'type': 'quick_reply', 'text': 'Ver más'},
+            {'type': 'quick_reply', 'text': 'No recibir más promos'},
+        ]}]
+        result = _ensure_stop_button(components)
+        self.assertEqual(len(result[0]['buttons']), 2)
+
+    def test_validate_components_adds_stop_button(self):
+        data = {'name': 'stop_test', 'language': 'es', 'category': 'MARKETING',
+                'components': [{'type': 'body', 'text': 'Hola'}]}
+        serializer = WhatsAppTemplateSerializer(data=data)
+        self.assertTrue(serializer.is_valid(), msg=serializer.errors)
+        comps = serializer.validated_data['components']
+        buttons_comp = next((c for c in comps if c['type'] == 'buttons'), None)
+        self.assertIsNotNone(buttons_comp)
+        self.assertEqual(buttons_comp['buttons'][-1]['text'], 'No recibir más promos')
+
+    @patch('api.whatsapp_templates.create_template')
+    def test_perform_create_adds_stop_button(self, mock_create):
+        mock_create.return_value = {'id': '999', 'status': 'PENDING'}
+        admin = User.objects.create_user(username='stop_admin', password='pass', is_staff=True)
+        token = Token.objects.create(user=admin)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        response = self.client.post('/api/templates/', {
+            'name': 'stop_template', 'language': 'es', 'category': 'MARKETING',
+            'components': [{'type': 'body', 'text': 'Bienvenido'}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        template = WhatsAppTemplate.objects.get(id=response.data['id'])
+        buttons_comp = next((c for c in template.components if c['type'] == 'buttons'), None)
+        self.assertIsNotNone(buttons_comp)
+        self.assertEqual(buttons_comp['buttons'][-1]['text'], 'No recibir más promos')
+
+    def test_components_webhook_adds_stop_button(self):
+        from api.views import _handle_template_components_webhook
+        template = WhatsAppTemplate.objects.create(
+            name='wh_btn_test', language='es', category='MARKETING',
+            status='APPROVED', template_id='wh123',
+            components=[{'type': 'body', 'text': 'Hola'}],
+        )
+        _handle_template_components_webhook({
+            'message_template_name': 'wh_btn_test',
+            'message_template_language': 'es',
+            'message_template_id': 'wh123',
+            'message_template_element': 'Hola mundo',
+        })
+        template.refresh_from_db()
+        buttons_comp = next((c for c in template.components if c['type'] == 'buttons'), None)
+        self.assertIsNotNone(buttons_comp)
+        self.assertEqual(buttons_comp['buttons'][-1]['text'], 'No recibir más promos')
+
+    def test_stop_button_is_quick_reply(self):
+        result = _ensure_stop_button([])
+        buttons_comp = next(c for c in result if c.get('type') == 'buttons')
+        self.assertEqual(buttons_comp['buttons'][0]['type'], 'quick_reply')
+
+
+class TemplateExclusionViewSetTests(APITestCase):
+    """Test the TemplateExclusion API endpoints."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username='te_admin', password='pass', is_staff=True)
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.user = User.objects.create_user(username='te_user', password='pass', is_staff=False)
+        self.user_token = Token.objects.create(user=self.user)
+
+        self.exclusion = TemplateExclusion.objects.create(
+            contact_phone='573001234567',
+            contact_name='Test User',
+            source='manual',
+            created_by=self.admin,
+        )
+
+    def test_list_requires_auth(self):
+        self.client.credentials()
+        response = self.client.get('/api/template-exclusions/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_list_non_staff_allowed(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.get('/api/template-exclusions/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_create_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.post('/api/template-exclusions/', {
+            'contact_phone': '573007654321', 'contact_name': 'No Admin',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_create_as_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/template-exclusions/', {
+            'contact_phone': '573007654321', 'contact_name': 'New Excluded',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['contact_phone'], '573007654321')
+        self.assertEqual(response.data['source'], 'manual')
+
+    def test_destroy_requires_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')
+        response = self.client.delete(f'/api/template-exclusions/{self.exclusion.id}/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_destroy_as_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.delete(f'/api/template-exclusions/{self.exclusion.id}/')
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_update_as_admin(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.patch(f'/api/template-exclusions/{self.exclusion.id}/', {
+            'contact_name': 'Updated Name',
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['contact_name'], 'Updated Name')
+
+
+class TemplateExclusionSendTests(APITestCase):
+    """Test that excluded contacts are skipped during send."""
+
+    def setUp(self):
+        self.admin = User.objects.create_user(username='send_admin', password='pass', is_staff=True)
+        self.admin_token = Token.objects.create(user=self.admin)
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.admin, self.group)
+
+        self.conversation = Conversation.objects.create(
+            whatsapp_id='573001234567',
+            contact_name='Excluded',
+            contact_phone='573001234567',
+            group=self.group,
+        )
+
+        self.template = WhatsAppTemplate.objects.create(
+            name='send_test_tmpl', language='es', category='MARKETING',
+            status='APPROVED', template_id='send123',
+            components=[{'type': 'body', 'text': 'Hola {{nombre}}'}],
+        )
+
+        self.exclusion = TemplateExclusion.objects.create(
+            contact_phone='573001234567', contact_name='Excluded',
+            source='stop_button',
+        )
+
+    @patch('api.views.send_whatsapp_outbound')
+    def test_send_template_skips_excluded(self, mock_send):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/send_template/',
+            {'template_id': self.template.id, 'parameters': {'nombre': 'Juan'}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'skipped')
+        mock_send.assert_not_called()
+
+    @patch('api.views.send_whatsapp_outbound')
+    def test_bulk_send_recipients_skips_excluded(self, mock_send):
+        # Add a second conversation that is NOT excluded
+        conv2 = Conversation.objects.create(
+            contact_phone='573009999999', whatsapp_id='573009999999',
+            contact_name='Not Excluded', group=self.group,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '573001234567', 'parameters': {'nombre': 'Skip Me'}},
+                {'phone': '573009999999', 'parameters': {'nombre': 'Send Me'}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['queued'], 1)
+        self.assertEqual(response.data['skipped'], 1)
+
+    @patch('api.views.send_whatsapp_outbound')
+    def test_bulk_send_count_skips_excluded(self, mock_send):
+        conv2 = Conversation.objects.create(
+            contact_phone='573009999999', whatsapp_id='573009999999',
+            contact_name='Not Excluded 2', group=self.group,
+            last_message_at=timezone.now(),
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id, 'count': 5,
+            'parameter_sources': {'nombre': 'fixed'},
+            'fixed_values': {'nombre': 'Test'},
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['queued'], 1)
+        self.assertEqual(response.data['skipped'], 1)
+        self.assertEqual(response.data['total'], 2)
+
+    def test_not_excluded_sends_normally(self):
+        conv = Conversation.objects.create(
+            contact_phone='573009999999', whatsapp_id='573009999999',
+            contact_name='Normal', group=self.group,
+            last_message_at=timezone.now(),
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        TemplateExclusion.objects.filter(contact_phone='573001234567').delete()
+        response = self.client.post(
+            f'/api/conversations/{conv.id}/send_template/',
+            {'template_id': self.template.id, 'parameters': {'nombre': 'Normal'}},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+    @patch('api.views.send_whatsapp_outbound')
+    def test_bulk_send_all_excluded(self, mock_send):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '573001234567', 'parameters': {'nombre': 'Skip'}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['queued'], 0)
+        self.assertEqual(response.data['skipped'], 1)

@@ -10,7 +10,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, TemplateExclusion, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -448,6 +448,15 @@ class BotExemptContactSerializer(serializers.ModelSerializer):
         return cleaned
 
 
+class TemplateExclusionSerializer(serializers.ModelSerializer):
+    created_by_username = serializers.CharField(source='created_by.username', read_only=True)
+
+    class Meta:
+        model = TemplateExclusion
+        fields = ['id', 'contact_phone', 'contact_name', 'source', 'created_by_username', 'created_at']
+        read_only_fields = ['id', 'source', 'created_by_username', 'created_at']
+
+
 class StickerAssetSerializer(serializers.ModelSerializer):
     created_by = UserSerializer(read_only=True)
 
@@ -475,6 +484,20 @@ class BotConfigSerializer(serializers.ModelSerializer):
         fields = ['id', 'key', 'value', 'description', 'updated_at']
 
 
+def _ensure_stop_button(components):
+    from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT
+    stop_btn = {'type': 'quick_reply', 'text': STOP_TEMPLATE_BUTTON_TEXT}
+    buttons_comp = next((c for c in components if c.get('type') == 'buttons'), None)
+    if buttons_comp:
+        existing = buttons_comp.get('buttons', [])
+        if existing and existing[-1].get('text') == STOP_TEMPLATE_BUTTON_TEXT:
+            return components
+        buttons_comp['buttons'] = existing + [stop_btn]
+    else:
+        components.append({'type': 'buttons', 'buttons': [stop_btn]})
+    return components
+
+
 class WhatsAppTemplateSerializer(serializers.ModelSerializer):
     class Meta:
         model = WhatsAppTemplate
@@ -499,7 +522,7 @@ class WhatsAppTemplateSerializer(serializers.ModelSerializer):
                             raise serializers.ValidationError(
                                 f"El parámetro '{{{{{var}}}}}' necesita un valor de ejemplo."
                             )
-        return value
+        return _ensure_stop_button(value)
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

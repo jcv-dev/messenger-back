@@ -554,6 +554,27 @@ class WhatsAppTemplate(models.Model):
         return f"{self.name} ({self.language}) — {self.status}"
 
 
+class TemplateExclusion(models.Model):
+    SOURCE_CHOICES = [
+        ('manual', 'Manual'),
+        ('stop_button', 'Stop Button'),
+    ]
+
+    contact_phone = models.CharField(max_length=50, unique=True)
+    contact_name = models.CharField(max_length=255, blank=True)
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='manual')
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Template Exclusion"
+        verbose_name_plural = "Template Exclusions"
+
+    def __str__(self):
+        return f"{self.contact_phone} — {self.source}"
+
+
 class AgentPresence(models.Model):
     """Tracks agent online/away/offline status with heartbeat interval."""
     STATUS_CHOICES = [
