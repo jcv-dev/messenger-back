@@ -208,18 +208,17 @@ def get_template(template_id: str) -> dict | None:
 
 
 def upload_template_media(file_path: str) -> str | None:
-    """Upload an image via Meta's Resumable Upload API for use as a template header.
+    """Upload an image for use as a template header.
 
-    Creates an upload session on the business account (``/{business_id}/uploads``)
-    then transfers the file data to obtain a media asset handle (``h``)
-    suitable for use as ``header_handle`` in template creation.
+    Uploads to the phone-number media endpoint and returns the media ``id``
+    to be used as ``header_handle`` in template creation.
 
     Returns the handle string, or ``None`` on failure.
     """
-    business_id = _business_id()
+    phone_number_id = _phone_number_id()
     token = settings.WHATSAPP_API_TOKEN
-    if not business_id or not token:
-        logger.error("WHATSAPP_BUSINESS_ACCOUNT_ID or WHATSAPP_API_TOKEN not configured")
+    if not phone_number_id or not token:
+        logger.error("WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_API_TOKEN not configured")
         return None
 
     mime_type, _ = mimetypes.guess_type(file_path)
@@ -230,63 +229,57 @@ def upload_template_media(file_path: str) -> str | None:
         file_data = f.read()
 
     filename = os.path.basename(file_path)
-    file_length = len(file_data)
 
-    auth_header = {"Authorization": f"Bearer {token}"}
+    boundary = uuid.uuid4().hex
 
-    # Step 1 — create an upload session on the business account
-    session_url = (
-        f"{_GRAPH_BASE}/{business_id}/uploads"
-        f"?file_length={file_length}"
-        f"&file_type={mime_type}"
-        f"&file_name={filename}"
+    file_part_headers = (
+        f"Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: {mime_type}\r\n"
     )
 
-    acquire_rate_capacity(_phone_number_id())
-    try:
-        req = urllib.request.Request(session_url, data=b"", headers=auth_header, method="POST")
-        with urllib.request.urlopen(req) as resp:
-            session_data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode() if hasattr(e, "read") else ""
-        logger.error("Meta upload_template_media session HTTP %s: %s", e.code, err_body[:500])
-        return None
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"messaging_product\"\r\n\r\n"
+        f"whatsapp\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"type\"\r\n\r\n"
+        f"{mime_type}\r\n"
+        f"--{boundary}\r\n"
+        f"{file_part_headers}\r\n"
+    ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
 
-    logger.info("Meta upload_template_media session response: %s", session_data)
-
-    session_id = session_data.get("id")
-    if not session_id:
-        logger.error("Meta upload_template_media: no session id in response: %s", session_data)
-        return None
-
-    # Step 2 — upload the file binary to the session
-    upload_url = f"{_GRAPH_BASE}/{session_id}"
-    upload_headers = {
+    headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": mime_type,
-        "Content-Length": str(file_length),
-        "Offset": "0",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
     }
 
+    url = f"{_GRAPH_BASE}/{phone_number_id}/media"
+
     acquire_rate_capacity(_phone_number_id())
     try:
-        req = urllib.request.Request(upload_url, data=file_data, headers=upload_headers, method="POST")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode() if hasattr(e, "read") else ""
-        logger.error("Meta upload_template_media upload HTTP %s: %s", e.code, err_body[:500])
+        logger.error("Meta upload_template_media HTTP %s: %s", e.code, err_body[:500])
         return None
     except Exception:
-        logger.exception("Meta upload_template_media upload network error")
+        logger.exception("Meta upload_template_media network error")
         return None
 
-    logger.info("Meta upload_template_media upload response: %s", result)
+    logger.info("Meta upload_template_media response: %s", data)
 
-    handle = result.get("h") or result.get("id")
+    handle = (
+        data.get("h")
+        or data.get("handle")
+        or data.get("header_handle")
+        or data.get("media_handle")
+        or data.get("id")
+    )
     if handle:
         logger.info("Template media uploaded: handle=%s", handle)
         return handle
 
-    logger.error("Meta upload_template_media: no handle in upload response: %s", result)
+    logger.error("Meta upload_template_media: no handle in response: %s", data)
     return None
