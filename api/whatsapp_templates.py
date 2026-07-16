@@ -22,7 +22,7 @@ from .rate_limiter import acquire as acquire_rate_capacity
 
 logger = logging.getLogger("api.whatsapp_templates")
 
-_GRAPH_API_VERSION = "v23.0"
+_GRAPH_API_VERSION = "v25.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
 
 
