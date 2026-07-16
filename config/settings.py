@@ -169,6 +169,7 @@ CSRF_TRUSTED_ORIGINS = [h.strip() for h in _raw_csrf.split(',') if h.strip()]
 
 # WhatsApp API Configuration (placeholder)
 WHATSAPP_BUSINESS_ACCOUNT_ID = config('WHATSAPP_BUSINESS_ACCOUNT_ID', default='')
+WHATSAPP_APP_ID = config('WHATSAPP_APP_ID', default='')
 WHATSAPP_API_TOKEN = config('WHATSAPP_API_TOKEN', default='')
 WHATSAPP_PHONE_NUMBER = config('WHATSAPP_PHONE_NUMBER', default='')
 WHATSAPP_PHONE_NUMBER_ID = config('WHATSAPP_PHONE_NUMBER_ID', default='')
