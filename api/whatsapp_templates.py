@@ -210,16 +210,16 @@ def get_template(template_id: str) -> dict | None:
 def upload_template_media(file_path: str) -> str | None:
     """Upload an image via Meta's Resumable Upload API for use as a template header.
 
-    Creates an upload session on the business account (``/{business_id}/uploads``)
+    Creates an upload session on the phone number (``/{phone_number_id}/uploads``)
     then transfers the file data to obtain a media asset handle (``h``)
     suitable for use as ``header_handle`` in template creation.
 
     Returns the handle string, or ``None`` on failure.
     """
-    business_id = _business_id()
+    phone_number_id = _phone_number_id()
     token = settings.WHATSAPP_API_TOKEN
-    if not business_id or not token:
-        logger.error("WHATSAPP_BUSINESS_ACCOUNT_ID or WHATSAPP_API_TOKEN not configured")
+    if not phone_number_id or not token:
+        logger.error("WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_API_TOKEN not configured")
         return None
 
     mime_type, _ = mimetypes.guess_type(file_path)
@@ -234,9 +234,9 @@ def upload_template_media(file_path: str) -> str | None:
 
     auth_header = {"Authorization": f"Bearer {token}"}
 
-    # Step 1 — create an upload session on the business account
+    # Step 1 — create an upload session on the phone number
     session_url = (
-        f"{_GRAPH_BASE}/{business_id}/uploads"
+        f"{_GRAPH_BASE}/{phone_number_id}/uploads"
         f"?file_length={file_length}"
         f"&file_type={mime_type}"
         f"&file_name={filename}"
