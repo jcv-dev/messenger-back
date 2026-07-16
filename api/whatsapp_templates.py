@@ -205,22 +205,21 @@ def get_template(template_id: str) -> dict | None:
 
 
 def upload_template_media(file_path: str) -> str | None:
-    """Upload an image to Meta's business account for use as a template header.
+    """Upload an image for use as a template header.
 
-    Unlike ``upload_media_to_whatsapp`` (which uploads to the phone-number
-    media endpoint for sending messages), this uploads to the **business
-    account** media endpoint and returns a handle (``h``) that can be used
-    as ``header_handle`` in template creation.
+    Uploads to the phone-number media endpoint (same as sending images)
+    and returns the media ``id`` that can be used as ``header_handle`` in
+    template creation.
 
     Returns the handle string, or ``None`` on failure.
     """
-    business_id = _business_id()
+    phone_number_id = _phone_number_id()
     token = settings.WHATSAPP_API_TOKEN
-    if not business_id or not token:
-        logger.error("WHATSAPP_BUSINESS_ACCOUNT_ID or WHATSAPP_API_TOKEN not configured")
+    if not phone_number_id or not token:
+        logger.error("WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_API_TOKEN not configured")
         return None
 
-    url = f"{_GRAPH_BASE}/{business_id}/media"
+    url = f"{_GRAPH_BASE}/{phone_number_id}/media"
     boundary = uuid.uuid4().hex
 
     mime_type, _ = mimetypes.guess_type(file_path)
