@@ -2489,9 +2489,6 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
 
         # ── Count (last N conversations) mode ──
         count = serializer.validated_data['count']
-        conversations = Conversation.objects.exclude(
-            contact_phone__isnull=True,
-        ).exclude(contact_phone='').order_by('-last_message_at')[:count]
 
         def _resolve_params(conv):
             resolved = {}
@@ -2509,20 +2506,35 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             return resolved
 
         excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True))
+
+        base_qs = Conversation.objects.exclude(
+            contact_phone__isnull=True,
+        ).exclude(contact_phone='').order_by('-last_message_at')
+
         queued = 0
         skipped = 0
-        for conv in conversations:
-            if conv.contact_phone in excluded_phones:
-                skipped += 1
-                continue
-            resolved_params = _resolve_params(conv)
-            queued += _send_to_conversation(conv, resolved_params)
+        offset = 0
+        batch_size = max(count * 2, 100)
+
+        while queued < count:
+            batch = list(base_qs[offset:offset + batch_size])
+            if not batch:
+                break
+            for conv in batch:
+                if conv.contact_phone in excluded_phones:
+                    skipped += 1
+                    continue
+                resolved_params = _resolve_params(conv)
+                queued += _send_to_conversation(conv, resolved_params)
+                if queued >= count:
+                    break
+            offset += batch_size
 
         return Response({
             'queued': queued,
             'skipped': skipped,
             'template_name': template.name,
-            'total': len(conversations),
+            'total': queued + skipped,
         })
 
     @action(detail=False, methods=['get'])
