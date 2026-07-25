@@ -588,9 +588,6 @@ class BulkSendTemplateSerializer(serializers.Serializer):
             if not isinstance(row, dict):
                 row_errors['_'] = 'Must be an object'
             else:
-                phone = row.get('phone', '')
-                if not phone or not isinstance(phone, str) or not phone.strip():
-                    row_errors['phone'] = 'Phone is required'
                 if 'parameters' in row and not isinstance(row['parameters'], dict):
                     row_errors['parameters'] = 'Must be an object'
             if row_errors:

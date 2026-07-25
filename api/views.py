@@ -2445,6 +2445,17 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             publish_conversation_update(conv)
             return 1
 
+        def _normalize_phone(raw):
+            cleaned = raw.strip()
+            if cleaned.startswith('+'):
+                cleaned = cleaned[1:]
+            cleaned = ''.join(c for c in cleaned if c.isdigit())
+            if cleaned.startswith('57') and len(cleaned) == 12:
+                return cleaned
+            if len(cleaned) == 10:
+                return '57' + cleaned
+            return None
+
         # ── Recipients (CSV) mode ──
         if recipients:
             queued = 0
@@ -2453,10 +2464,14 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             errors = []
             excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True))
             for idx, entry in enumerate(recipients):
-                phone = entry.get('phone', '').strip()
+                raw_phone = entry.get('phone', '').strip()
                 row_params = entry.get('parameters', {})
+                if not raw_phone:
+                    errors.append({'row': idx, 'phone': raw_phone, 'error': 'Teléfono vacío'})
+                    continue
+                phone = _normalize_phone(raw_phone)
                 if not phone:
-                    errors.append({'row': idx, 'phone': phone, 'error': 'Teléfono vacío'})
+                    errors.append({'row': idx, 'phone': raw_phone, 'error': 'Formato de teléfono inválido'})
                     continue
                 if phone in excluded_phones:
                     skipped += 1
