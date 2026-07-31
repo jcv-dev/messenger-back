@@ -580,8 +580,6 @@ class BulkSendTemplateSerializer(serializers.Serializer):
     def validate_recipients(self, value):
         if not isinstance(value, list):
             raise serializers.ValidationError("Must be a list")
-        if len(value) > 1000:
-            raise serializers.ValidationError("Maximum 1000 recipients")
         errors = []
         for i, row in enumerate(value):
             row_errors = {}
