@@ -3164,6 +3164,7 @@ class WhatsAppTemplateViewSetTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['errors']), 1)
         self.assertIn('vacío', response.data['errors'][0]['error'])
+        self.assertEqual(response.data['invalid'], 1)
 
     def test_bulk_send_normalizes_10_digit_phone(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
@@ -3204,6 +3205,30 @@ class WhatsAppTemplateViewSetTests(APITestCase):
         self.assertEqual(response.data['queued'], 1)
         self.assertEqual(len(response.data['errors']), 1)
         self.assertIn('inválido', response.data['errors'][0]['error'])
+        self.assertEqual(response.data['invalid'], 1)
+
+    def test_bulk_send_counts_invalid_excluded_and_queued(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        TemplateExclusion.objects.create(
+            contact_phone='573009999999', contact_name='Excluded',
+            source='stop_button',
+        )
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': self.template.id,
+            'recipients': [
+                {'phone': '', 'parameters': {}},
+                {'phone': '12345', 'parameters': {}},
+                {'phone': '573009999999', 'parameters': {}},
+                {'phone': '573001234567', 'parameters': {'nombre': 'Juan'}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+        self.assertEqual(data['queued'], 1)
+        self.assertEqual(data['skipped'], 1)
+        self.assertEqual(data['invalid'], 2)
+        self.assertEqual(data['total'], 4)
+        self.assertEqual(len(data['errors']), 2)
 
     def test_bulk_send_skips_phone_without_57_and_not_10_digits(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
@@ -3217,6 +3242,7 @@ class WhatsAppTemplateViewSetTests(APITestCase):
         self.assertEqual(response.data['queued'], 0)
         self.assertEqual(len(response.data['errors']), 1)
         self.assertIn('inválido', response.data['errors'][0]['error'])
+        self.assertEqual(response.data['invalid'], 1)
 
 
 class SendTemplateActionTests(APITestCase):

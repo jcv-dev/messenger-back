@@ -2492,16 +2492,19 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             queued = 0
             created = 0
             skipped = 0
+            invalid = 0
             errors = []
             excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True)) if is_marketing else set()
             for idx, entry in enumerate(recipients):
                 raw_phone = entry.get('phone', '').strip()
                 row_params = entry.get('parameters', {})
                 if not raw_phone:
+                    invalid += 1
                     errors.append({'row': idx, 'phone': raw_phone, 'error': 'Teléfono vacío'})
                     continue
                 phone = _normalize_phone(raw_phone)
                 if not phone:
+                    invalid += 1
                     errors.append({'row': idx, 'phone': raw_phone, 'error': 'Formato de teléfono inválido'})
                     continue
                 if phone in excluded_phones:
@@ -2523,11 +2526,13 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                     queued += 1
                 except Exception as e:
                     logger.exception('Error sending CSV row %d to %s', idx, phone)
+                    invalid += 1
                     errors.append({'row': idx, 'phone': phone, 'error': str(e)})
             return Response({
                 'queued': queued,
                 'created': created,
                 'skipped': skipped,
+                'invalid': invalid,
                 'total': len(recipients),
                 'errors': errors,
                 'template_name': template.name,
