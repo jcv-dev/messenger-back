@@ -1015,7 +1015,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 qs = qs.none()
 
         # Annotate other-human-take for ALL users for list views
-        if user.is_authenticated and self.action in ('list', 'active_conversations'):
+        if user.is_authenticated and self.action in ('list', 'active_conversations', 'mark_all_read'):
             other_human_takes = ConversationTake.objects.filter(
                 conversation=OuterRef('pk'),
                 expires_at__gt=now,
@@ -1225,6 +1225,36 @@ class ConversationViewSet(viewsets.ModelViewSet):
                 del conversation._unread_count
             publish_conversation_update(conversation)
         return Response({'marked_read': count}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'])
+    def mark_all_read(self, request):
+        """Mark unread inbound messages as read for the given conversation ids,
+        or for every conversation visible to the current user when none are given."""
+        conversation_ids = request.data.get('conversation_ids') or []
+        if conversation_ids:
+            qs = self.get_queryset().filter(id__in=conversation_ids)
+        else:
+            qs = self.get_queryset()
+        conversations = list(qs)
+
+        marked_read = 0
+        affected = []
+        for conversation in conversations:
+            unread_messages = Message.objects.filter(
+                conversation=conversation, is_read=False, direction='inbound'
+            )
+            count = unread_messages.update(is_read=True)
+            marked_read += count
+            if count > 0:
+                if hasattr(conversation, '_unread_count'):
+                    del conversation._unread_count
+                affected.append(conversation.id)
+                publish_conversation_update(conversation)
+
+        return Response(
+            {'marked_read': marked_read, 'conversations': affected},
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=['post'])
     def set_custom_name(self, request, pk=None):

@@ -299,6 +299,65 @@ class ConversationViewSetTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['marked_read'], 3)
 
+    def test_mark_all_read(self):
+        self.conversation2 = Conversation.objects.create(
+            whatsapp_id='15559876543', contact_name='Second Contact',
+            contact_phone='15559876543', group=self.group,
+        )
+        for i in range(2):
+            Message.objects.create(
+                conversation=self.conversation2, direction='inbound',
+                message_type='text', content=f'Msg {i}', sender_name='Second Contact',
+            )
+        response = self.client.post('/api/conversations/mark_all_read/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['marked_read'], 5)
+        self.assertEqual(set(response.data['conversations']), {
+            self.conversation.id, self.conversation2.id,
+        })
+        self.assertFalse(Message.objects.filter(is_read=False, direction='inbound').exists())
+
+    def test_mark_all_read_with_ids(self):
+        self.conversation2 = Conversation.objects.create(
+            whatsapp_id='15559876543', contact_name='Second Contact',
+            contact_phone='15559876543', group=self.group,
+        )
+        for i in range(2):
+            Message.objects.create(
+                conversation=self.conversation2, direction='inbound',
+                message_type='text', content=f'Msg {i}', sender_name='Second Contact',
+            )
+        response = self.client.post(
+            '/api/conversations/mark_all_read/',
+            {'conversation_ids': [self.conversation2.id]},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['marked_read'], 2)
+        self.assertEqual(response.data['conversations'], [self.conversation2.id])
+        self.assertTrue(Message.objects.filter(conversation=self.conversation, is_read=False).exists())
+
+    def test_mark_all_read_hides_other_human_takes(self):
+        other_user = User.objects.create_user(username='otheruser', password='testpass123')
+        assign_user_group(other_user, self.group)
+        self.conversation2 = Conversation.objects.create(
+            whatsapp_id='15559876543', contact_name='Second Contact',
+            contact_phone='15559876543', group=self.group,
+        )
+        for i in range(2):
+            Message.objects.create(
+                conversation=self.conversation2, direction='inbound',
+                message_type='text', content=f'Msg {i}', sender_name='Second Contact',
+            )
+        ConversationTake.create_take(
+            conversation=self.conversation2, created_by=other_user, duration_minutes=60,
+        )
+        response = self.client.post('/api/conversations/mark_all_read/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['marked_read'], 3)
+        self.assertEqual(response.data['conversations'], [self.conversation.id])
+        self.assertTrue(Message.objects.filter(conversation=self.conversation2, is_read=False).exists())
+
     def test_search_by_name(self):
         response = self.client.get('/api/conversations/search/', {'q': 'Test Contact'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
