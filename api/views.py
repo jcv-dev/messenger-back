@@ -3635,7 +3635,7 @@ def whatsapp_webhook(request):
                     from api.bot.constants import (
                         STOP_TEMPLATE_BUTTON_TEXT, STOP_TEMPLATE_CONFIRMATION_TEXT,
                         REACTIVATE_BUTTON_TEXT, REACTIVATE_BUTTON_ID,
-                        REACTIVATE_CONFIRMATION_TEXT,
+                        REACTIVATE_PROMPT_TEXT, REACTIVATE_CONFIRMATION_TEXT,
                     )
                     if last_msg_text.strip() == STOP_TEMPLATE_BUTTON_TEXT:
                         _, created = TemplateExclusion.objects.get_or_create(
@@ -3667,7 +3667,7 @@ def whatsapp_webhook(request):
                             reactivate_payload = {
                                 'type': 'button',
                                 'body': {
-                                    'text': '¿Quieres volver a recibir nuestras promociones? Toca el botón o responde "REACTIVAR PROMOS".'
+                                    'text': REACTIVATE_PROMPT_TEXT,
                                 },
                                 'action': {
                                     'buttons': [{
@@ -3680,9 +3680,13 @@ def whatsapp_webhook(request):
                                 conversation=conversation,
                                 direction='outbound',
                                 message_type='interactive',
-                                content=json.dumps(reactivate_payload),
+                                content=REACTIVATE_PROMPT_TEXT,
                                 sender_name='Bot',
+                                metadata={'interactive': reactivate_payload},
                             )
+                            conversation.last_message = REACTIVATE_PROMPT_TEXT
+                            conversation.last_message_at = timezone.now()
+                            conversation.save(update_fields=['last_message', 'last_message_at'])
                             send_whatsapp_outbound('interactive', reactivate_payload, wa_id, message_id=react_msg.id)
                             publish_conversation_update(conversation, MessageSerializer(react_msg).data)
                     elif last_msg_text.strip() == REACTIVATE_BUTTON_TEXT:

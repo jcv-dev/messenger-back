@@ -4820,7 +4820,7 @@ class StopButtonWebhookHandlerTests(APITestCase):
         )
 
     def test_stop_button_creates_exclusion_and_confirmation(self):
-        from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT
+        from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT, REACTIVATE_PROMPT_TEXT
         payload = {
             'entry': [{
                 'changes': [{
@@ -4851,8 +4851,13 @@ class StopButtonWebhookHandlerTests(APITestCase):
 
         interactive = Message.objects.filter(direction='outbound', message_type='interactive').first()
         self.assertIsNotNone(interactive)
-        title = json.loads(interactive.content)['action']['buttons'][0]['reply']['title']
+        self.assertIn('interactive', interactive.metadata)
+        self.assertEqual(interactive.content, REACTIVATE_PROMPT_TEXT)
+        self.assertEqual(interactive.content, interactive.metadata['interactive']['body']['text'])
+        title = interactive.metadata['interactive']['action']['buttons'][0]['reply']['title']
         self.assertLessEqual(len(title), 20, f'Interactive button title too long: {title!r}')
+        self.conversation.refresh_from_db()
+        self.assertEqual(self.conversation.last_message, REACTIVATE_PROMPT_TEXT)
 
     def test_stop_button_non_matching_text_ignored(self):
         payload = {

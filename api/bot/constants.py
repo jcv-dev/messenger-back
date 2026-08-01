@@ -20,6 +20,11 @@ STOP_TEMPLATE_CONFIRMATION_TEXT = (
 REACTIVATE_BUTTON_TEXT = "Reactivar promos"
 REACTIVATE_BUTTON_ID = "reactivate_promos"
 
+REACTIVATE_PROMPT_TEXT = (
+    '¿Quieres volver a recibir nuestras promociones? '
+    'Toca el botón o responde "REACTIVAR PROMOS".'
+)
+
 REACTIVATE_KEYWORD = "REACTIVAR PROMOS"
 
 REACTIVATE_CONFIRMATION_TEXT = (
