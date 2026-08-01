@@ -13,5 +13,16 @@ WELCOME_REPLY = (
 STOP_TEMPLATE_BUTTON_TEXT = "No recibir más promos"
 
 STOP_TEMPLATE_CONFIRMATION_TEXT = (
-    "Has sido removido de nuestra lista de difusión. No recibirás más mensajes promocionales."
+    "Has sido removido de nuestra lista de promociones. No recibirás más mensajes promocionales.\n\n"
+    "Si cambias de opinión, responde \"REACTIVAR PROMOS\" y volverás a recibir nuestras ofertas."
+)
+
+REACTIVATE_BUTTON_TEXT = "Volver a recibir promos"
+REACTIVATE_BUTTON_ID = "reactivate_promos"
+
+REACTIVATE_KEYWORD = "REACTIVAR PROMOS"
+
+REACTIVATE_CONFIRMATION_TEXT = (
+    "¡Listo! Has sido reactivado en nuestra lista de difusión. "
+    "Volverás a recibir nuestras promociones."
 )

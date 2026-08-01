@@ -1730,8 +1730,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if not conversation.contact_phone:
             return Response({'error': 'No contact phone'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if TemplateExclusion.objects.filter(contact_phone=conversation.contact_phone).exists():
-            return Response({'status': 'skipped', 'reason': 'El contacto solicitó no recibir más plantillas'})
+        if template.category == 'MARKETING' and TemplateExclusion.objects.filter(contact_phone=conversation.contact_phone).exists():
+            return Response({'status': 'skipped', 'reason': 'El contacto solicitó no recibir más promos'})
 
         # Build components with parameter substitution
         components = []
@@ -2410,6 +2410,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
         parameter_sources = serializer.validated_data.get('parameter_sources', {})
         fixed_values = serializer.validated_data.get('fixed_values', {})
         header_media_id = request.data.get('header_media_id')
+        is_marketing = template.category == 'MARKETING'
 
         def _build_components(resolved_params):
             components = []
@@ -2492,7 +2493,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             created = 0
             skipped = 0
             errors = []
-            excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True))
+            excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True)) if is_marketing else set()
             for idx, entry in enumerate(recipients):
                 raw_phone = entry.get('phone', '').strip()
                 row_params = entry.get('parameters', {})
@@ -2550,7 +2551,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                     resolved[var_name] = fixed_values.get(var_name, '')
             return resolved
 
-        excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True))
+        excluded_phones = set(TemplateExclusion.objects.values_list('contact_phone', flat=True)) if is_marketing else set()
 
         base_qs = Conversation.objects.exclude(
             contact_phone__isnull=True,
@@ -2927,7 +2928,8 @@ def _handle_template_components_webhook(value: dict):
 
     if new_components and new_components != template.components:
         from .serializers import _ensure_stop_button
-        new_components = _ensure_stop_button(new_components)
+        if template.category == 'MARKETING':
+            new_components = _ensure_stop_button(new_components)
         template.components = new_components
         template.template_id = template_id or template.template_id
         template.save(update_fields=['components', 'template_id'])
@@ -3197,6 +3199,22 @@ def _handle_call_status_webhook(status_event, metadata):
 
 
 # Webhook endpoint for WhatsApp (verification + incoming messages)
+def _remove_template_exclusion(wa_id, conversation, contact_name, via):
+    """Remove a contact from the template exclusion list and log it."""
+    deleted, _ = TemplateExclusion.objects.filter(contact_phone=wa_id).delete()
+    if deleted:
+        logger.info("Template exclusion removed for %s %s", wa_id, via)
+        audit_actor = User.objects.filter(username='bot').first() or User.objects.filter(is_staff=True).first()
+        if audit_actor:
+            AuditLog.objects.create(
+                actor=audit_actor,
+                conversation=conversation,
+                action='toggle_status',
+                detail=f"Reactivado en plantillas {via}: {wa_id}",
+            )
+    return deleted
+
+
 @csrf_exempt
 def whatsapp_webhook(request):
     # Verification (GET)
@@ -3608,8 +3626,12 @@ def whatsapp_webhook(request):
                 logger.info("Webhook msg %s: %.3fs from receipt to SSE publish (last_msg=%s)", message.id, elapsed, last_msg_text)
                 publish_conversation_update(conversation, MessageSerializer(message).data)
 
-                if msg_type == 'button' and last_msg_text:
-                    from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT, STOP_TEMPLATE_CONFIRMATION_TEXT
+                if msg_type in ('button', 'interactive') and last_msg_text:
+                    from api.bot.constants import (
+                        STOP_TEMPLATE_BUTTON_TEXT, STOP_TEMPLATE_CONFIRMATION_TEXT,
+                        REACTIVATE_BUTTON_TEXT, REACTIVATE_BUTTON_ID,
+                        REACTIVATE_CONFIRMATION_TEXT,
+                    )
                     if last_msg_text.strip() == STOP_TEMPLATE_BUTTON_TEXT:
                         _, created = TemplateExclusion.objects.get_or_create(
                             contact_phone=wa_id,
@@ -3637,6 +3659,56 @@ def whatsapp_webhook(request):
                             conversation.save(update_fields=['last_message', 'last_message_at'])
                             send_whatsapp_outbound('text', STOP_TEMPLATE_CONFIRMATION_TEXT, wa_id, message_id=confirm_msg.id)
                             publish_conversation_update(conversation, MessageSerializer(confirm_msg).data)
+                            reactivate_payload = {
+                                'type': 'button',
+                                'body': {
+                                    'text': '¿Quieres volver a recibir nuestras promociones? Toca el botón o responde "REACTIVAR PROMOS".'
+                                },
+                                'action': {
+                                    'buttons': [{
+                                        'type': 'reply',
+                                        'reply': {'id': REACTIVATE_BUTTON_ID, 'title': REACTIVATE_BUTTON_TEXT},
+                                    }],
+                                },
+                            }
+                            react_msg = Message.objects.create(
+                                conversation=conversation,
+                                direction='outbound',
+                                message_type='interactive',
+                                content=json.dumps(reactivate_payload),
+                                sender_name='Bot',
+                            )
+                            send_whatsapp_outbound('interactive', reactivate_payload, wa_id, message_id=react_msg.id)
+                            publish_conversation_update(conversation, MessageSerializer(react_msg).data)
+                    elif last_msg_text.strip() == REACTIVATE_BUTTON_TEXT:
+                        _remove_template_exclusion(wa_id, conversation, contact_name, 'via reactivate button')
+                        react_confirm = Message.objects.create(
+                            conversation=conversation,
+                            direction='outbound',
+                            message_type='text',
+                            content=REACTIVATE_CONFIRMATION_TEXT,
+                            sender_name='Bot',
+                        )
+                        conversation.last_message = REACTIVATE_CONFIRMATION_TEXT
+                        conversation.last_message_at = timezone.now()
+                        conversation.save(update_fields=['last_message', 'last_message_at'])
+                        send_whatsapp_outbound('text', REACTIVATE_CONFIRMATION_TEXT, wa_id, message_id=react_confirm.id)
+                        publish_conversation_update(conversation, MessageSerializer(react_confirm).data)
+                elif msg_type == 'text' and content and ' '.join(content.strip().upper().split()) == 'REACTIVAR PROMOS':
+                    from api.bot.constants import REACTIVATE_CONFIRMATION_TEXT
+                    _remove_template_exclusion(wa_id, conversation, contact_name, 'via keyword')
+                    react_confirm = Message.objects.create(
+                        conversation=conversation,
+                        direction='outbound',
+                        message_type='text',
+                        content=REACTIVATE_CONFIRMATION_TEXT,
+                        sender_name='Bot',
+                    )
+                    conversation.last_message = REACTIVATE_CONFIRMATION_TEXT
+                    conversation.last_message_at = timezone.now()
+                    conversation.save(update_fields=['last_message', 'last_message_at'])
+                    send_whatsapp_outbound('text', REACTIVATE_CONFIRMATION_TEXT, wa_id, message_id=react_confirm.id)
+                    publish_conversation_update(conversation, MessageSerializer(react_confirm).data)
 
                 if raw_media and media_type_for_download:
                     _download_pool.submit(download_media_async, message.id, raw_media, media_type_for_download)

@@ -4495,6 +4495,25 @@ class StopButtonTests(APITestCase):
         self.assertIsNotNone(buttons_comp)
         self.assertEqual(buttons_comp['buttons'][-1]['text'], 'No recibir más promos')
 
+    def test_validate_components_no_stop_button_for_utility(self):
+        data = {'name': 'util_test', 'language': 'es', 'category': 'UTILITY',
+                'components': [{'type': 'body', 'text': 'Hola'}]}
+        serializer = WhatsAppTemplateSerializer(data=data)
+        self.assertTrue(serializer.is_valid(), msg=serializer.errors)
+        comps = serializer.validated_data['components']
+        self.assertFalse(any(c.get('type') == 'buttons' for c in comps))
+
+    def test_validate_components_keeps_existing_buttons_for_utility(self):
+        data = {'name': 'util_btn_test', 'language': 'es', 'category': 'UTILITY',
+                'components': [{'type': 'body', 'text': 'Hola'},
+                               {'type': 'buttons', 'buttons': [{'type': 'quick_reply', 'text': 'OK'}]}]}
+        serializer = WhatsAppTemplateSerializer(data=data)
+        self.assertTrue(serializer.is_valid(), msg=serializer.errors)
+        comps = serializer.validated_data['components']
+        buttons_comp = next(c for c in comps if c['type'] == 'buttons')
+        self.assertEqual(buttons_comp['buttons'][-1]['text'], 'OK')
+        self.assertNotIn('No recibir más promos', [b['text'] for b in buttons_comp['buttons']])
+
     @patch('api.whatsapp_templates.create_template')
     def test_perform_create_adds_stop_button(self, mock_create):
         mock_create.return_value = {'id': '999', 'status': 'PENDING'}
@@ -4528,6 +4547,22 @@ class StopButtonTests(APITestCase):
         buttons_comp = next((c for c in template.components if c['type'] == 'buttons'), None)
         self.assertIsNotNone(buttons_comp)
         self.assertEqual(buttons_comp['buttons'][-1]['text'], 'No recibir más promos')
+
+    def test_components_webhook_no_stop_button_for_utility(self):
+        from api.views import _handle_template_components_webhook
+        template = WhatsAppTemplate.objects.create(
+            name='wh_util_test', language='es', category='UTILITY',
+            status='APPROVED', template_id='whu123',
+            components=[{'type': 'body', 'text': 'Hola'}],
+        )
+        _handle_template_components_webhook({
+            'message_template_name': 'wh_util_test',
+            'message_template_language': 'es',
+            'message_template_id': 'whu123',
+            'message_template_element': 'Hola mundo',
+        })
+        template.refresh_from_db()
+        self.assertFalse(any(c.get('type') == 'buttons' for c in template.components))
 
     def test_stop_button_is_quick_reply(self):
         result = _ensure_stop_button([])
@@ -4700,6 +4735,46 @@ class TemplateExclusionSendTests(APITestCase):
         self.assertEqual(response.data['queued'], 0)
         self.assertEqual(response.data['skipped'], 1)
 
+    @patch('api.views.send_whatsapp_outbound')
+    def test_send_utility_template_not_blocked_by_exclusion(self, mock_send):
+        util_template = WhatsAppTemplate.objects.create(
+            name='util_delivery', language='es', category='UTILITY',
+            status='APPROVED', template_id='util1',
+            components=[{'type': 'body', 'text': 'Tu pedido va en camino'}],
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(
+            f'/api/conversations/{self.conversation.id}/send_template/',
+            {'template_id': util_template.id},
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            Message.objects.filter(
+                conversation=self.conversation,
+                direction='outbound',
+                message_type='template',
+            ).exists()
+        )
+
+    @patch('api.views.send_whatsapp_outbound')
+    def test_bulk_send_utility_template_not_blocked_by_exclusion(self, mock_send):
+        util_template = WhatsAppTemplate.objects.create(
+            name='util_bulk', language='es', category='UTILITY',
+            status='APPROVED', template_id='util2',
+            components=[{'type': 'body', 'text': 'Tu pedido va en camino'}],
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/bulk_send/', {
+            'template_id': util_template.id,
+            'recipients': [
+                {'phone': '573001234567', 'parameters': {}},
+            ],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['queued'], 1)
+        self.assertEqual(response.data['skipped'], 0)
+
 
 class StopButtonWebhookHandlerTests(APITestCase):
     """Test that clicking the stop button on a template creates exclusion + confirmation message."""
@@ -4790,3 +4865,75 @@ class StopButtonWebhookHandlerTests(APITestCase):
         outbound_msgs = Message.objects.filter(direction='outbound')
         self.assertEqual(outbound_msgs.count(), 0)
         self.assertEqual(TemplateExclusion.objects.filter(contact_phone='573001234567').count(), 1)
+
+    def _post_webhook(self, msg_dict, wamid):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'contacts': [{'wa_id': '573001234567', 'profile': {'name': 'Test'}}],
+                        'messages': [{
+                            'from': '573001234567', 'id': wamid,
+                            **msg_dict,
+                        }],
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            return self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+
+    def test_reactivate_button_removes_exclusion(self):
+        from api.bot.constants import REACTIVATE_BUTTON_TEXT
+        TemplateExclusion.objects.create(contact_phone='573001234567', source='stop_button')
+        response = self._post_webhook({
+            'type': 'interactive',
+            'interactive': {
+                'type': 'button_reply',
+                'button_reply': {'id': 'reactivate_promos', 'title': REACTIVATE_BUTTON_TEXT},
+            },
+        }, 'wamid.react1')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())
+        confirm = Message.objects.filter(direction='outbound', message_type='text').first()
+        self.assertIsNotNone(confirm)
+        self.assertIn('reactivado', confirm.content)
+
+    def test_reactivate_keyword_removes_exclusion(self):
+        TemplateExclusion.objects.create(contact_phone='573001234567', source='stop_button')
+        response = self._post_webhook({
+            'type': 'text',
+            'text': {'body': 'reactivar  promos'},
+        }, 'wamid.react2')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())
+        confirm = Message.objects.filter(direction='outbound', message_type='text').first()
+        self.assertIsNotNone(confirm)
+        self.assertIn('reactivado', confirm.content)
+
+    def test_reactivate_keyword_no_exclusion_is_noop(self):
+        response = self._post_webhook({
+            'type': 'text',
+            'text': {'body': 'REACTIVAR PROMOS'},
+        }, 'wamid.react3')
+        self.assertEqual(response.status_code, 200)
+        outbound = Message.objects.filter(direction='outbound', message_type='text').first()
+        self.assertIsNotNone(outbound)
+        self.assertIn('reactivado', outbound.content)
+
+    def test_stop_then_reactivate_cycle(self):
+        from api.bot.constants import STOP_TEMPLATE_BUTTON_TEXT
+        response = self._post_webhook({
+            'type': 'button',
+            'button': {'text': STOP_TEMPLATE_BUTTON_TEXT, 'payload': STOP_TEMPLATE_BUTTON_TEXT},
+        }, 'wamid.cycle1')
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())
+        response = self._post_webhook({
+            'type': 'text',
+            'text': {'body': 'REACTIVAR PROMOS'},
+        }, 'wamid.cycle2')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())

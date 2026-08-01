@@ -522,7 +522,15 @@ class WhatsAppTemplateSerializer(serializers.ModelSerializer):
                             raise serializers.ValidationError(
                                 f"El parámetro '{{{{{var}}}}}' necesita un valor de ejemplo."
                             )
-        return _ensure_stop_button(value)
+        return value
+
+    def validate(self, attrs):
+        category = attrs.get('category')
+        if category is None and self.instance is not None:
+            category = self.instance.category
+        if category == 'MARKETING' and attrs.get('components') is not None:
+            attrs['components'] = _ensure_stop_button(attrs['components'])
+        return attrs
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

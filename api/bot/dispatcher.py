@@ -20,7 +20,7 @@ from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
 from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
 
-from .constants import WELCOME_REPLY
+from .constants import WELCOME_REPLY, STOP_TEMPLATE_BUTTON_TEXT, REACTIVATE_BUTTON_TEXT
 from .utils import get_bot_user, get_bot_user_async
 from .lock import conversation_lock
 from .guard import sanitize_user_input
@@ -334,6 +334,14 @@ async def handle_inbound(event: dict):
                 button_id = ireply.get("id") or user_text
             elif itype == "button":
                 button_id = user_text
+
+        # --- Template opt-out/reactivate buttons are handled by the webhook — skip bot ---
+        if button_id in (STOP_TEMPLATE_BUTTON_TEXT, REACTIVATE_BUTTON_TEXT):
+            logger.debug("Skipping template opt button for conv=%s", conversation_id)
+            return
+        if not button_id and " ".join(user_text.upper().split()) == "REACTIVAR PROMOS":
+            logger.debug("Skipping template reactivate keyword for conv=%s", conversation_id)
+            return
 
         # --- Inbound rate limit ---
         if not await check_inbound_rate(conversation_id):
