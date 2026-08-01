@@ -4838,7 +4838,8 @@ class StopButtonWebhookHandlerTests(APITestCase):
             }],
         }
         with self.settings(WHATSAPP_APP_SECRET=''):
-            response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
+            with patch('api.views.publish_conversation_update') as mock_publish:
+                response = self.client.post('/webhook/', data=json.dumps(payload), content_type='application/json')
         self.assertEqual(response.status_code, 200)
 
         exclusion = TemplateExclusion.objects.filter(contact_phone='573001234567').first()
@@ -4858,6 +4859,7 @@ class StopButtonWebhookHandlerTests(APITestCase):
         self.assertLessEqual(len(title), 20, f'Interactive button title too long: {title!r}')
         self.conversation.refresh_from_db()
         self.assertEqual(self.conversation.last_message, REACTIVATE_PROMPT_TEXT)
+        self.assertEqual(mock_publish.call_args.args[0]._last_msg_direction, 'outbound')
 
     def test_stop_button_non_matching_text_ignored(self):
         payload = {
@@ -4931,30 +4933,34 @@ class StopButtonWebhookHandlerTests(APITestCase):
     def test_reactivate_button_removes_exclusion(self):
         from api.bot.constants import REACTIVATE_BUTTON_TEXT
         TemplateExclusion.objects.create(contact_phone='573001234567', source='stop_button')
-        response = self._post_webhook({
-            'type': 'interactive',
-            'interactive': {
-                'type': 'button_reply',
-                'button_reply': {'id': 'reactivate_promos', 'title': REACTIVATE_BUTTON_TEXT},
-            },
-        }, 'wamid.react1')
+        with patch('api.views.publish_conversation_update') as mock_publish:
+            response = self._post_webhook({
+                'type': 'interactive',
+                'interactive': {
+                    'type': 'button_reply',
+                    'button_reply': {'id': 'reactivate_promos', 'title': REACTIVATE_BUTTON_TEXT},
+                },
+            }, 'wamid.react1')
         self.assertEqual(response.status_code, 200)
         self.assertFalse(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())
         confirm = Message.objects.filter(direction='outbound', message_type='text').first()
         self.assertIsNotNone(confirm)
         self.assertIn('reactivado', confirm.content)
+        self.assertEqual(mock_publish.call_args.args[0]._last_msg_direction, 'outbound')
 
     def test_reactivate_keyword_removes_exclusion(self):
         TemplateExclusion.objects.create(contact_phone='573001234567', source='stop_button')
-        response = self._post_webhook({
-            'type': 'text',
-            'text': {'body': 'reactivar  promos'},
-        }, 'wamid.react2')
+        with patch('api.views.publish_conversation_update') as mock_publish:
+            response = self._post_webhook({
+                'type': 'text',
+                'text': {'body': 'reactivar  promos'},
+            }, 'wamid.react2')
         self.assertEqual(response.status_code, 200)
         self.assertFalse(TemplateExclusion.objects.filter(contact_phone='573001234567').exists())
         confirm = Message.objects.filter(direction='outbound', message_type='text').first()
         self.assertIsNotNone(confirm)
         self.assertIn('reactivado', confirm.content)
+        self.assertEqual(mock_publish.call_args.args[0]._last_msg_direction, 'outbound')
 
     def test_reactivate_keyword_no_exclusion_is_noop(self):
         response = self._post_webhook({

@@ -3662,6 +3662,7 @@ def whatsapp_webhook(request):
                             conversation.last_message = STOP_TEMPLATE_CONFIRMATION_TEXT
                             conversation.last_message_at = timezone.now()
                             conversation.save(update_fields=['last_message', 'last_message_at'])
+                            conversation._last_msg_direction = 'outbound'
                             send_whatsapp_outbound('text', STOP_TEMPLATE_CONFIRMATION_TEXT, wa_id, message_id=confirm_msg.id)
                             publish_conversation_update(conversation, MessageSerializer(confirm_msg).data)
                             reactivate_payload = {
@@ -3701,6 +3702,7 @@ def whatsapp_webhook(request):
                         conversation.last_message = REACTIVATE_CONFIRMATION_TEXT
                         conversation.last_message_at = timezone.now()
                         conversation.save(update_fields=['last_message', 'last_message_at'])
+                        conversation._last_msg_direction = 'outbound'
                         send_whatsapp_outbound('text', REACTIVATE_CONFIRMATION_TEXT, wa_id, message_id=react_confirm.id)
                         publish_conversation_update(conversation, MessageSerializer(react_confirm).data)
                 elif msg_type == 'text' and content and ' '.join(content.strip().upper().split()) == 'REACTIVAR PROMOS':
@@ -3716,6 +3718,7 @@ def whatsapp_webhook(request):
                     conversation.last_message = REACTIVATE_CONFIRMATION_TEXT
                     conversation.last_message_at = timezone.now()
                     conversation.save(update_fields=['last_message', 'last_message_at'])
+                    conversation._last_msg_direction = 'outbound'
                     send_whatsapp_outbound('text', REACTIVATE_CONFIRMATION_TEXT, wa_id, message_id=react_confirm.id)
                     publish_conversation_update(conversation, MessageSerializer(react_confirm).data)
 
