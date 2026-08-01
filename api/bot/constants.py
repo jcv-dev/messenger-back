@@ -17,7 +17,7 @@ STOP_TEMPLATE_CONFIRMATION_TEXT = (
     "Si cambias de opinión, responde \"REACTIVAR PROMOS\" y volverás a recibir nuestras ofertas."
 )
 
-REACTIVATE_BUTTON_TEXT = "Volver a recibir promos"
+REACTIVATE_BUTTON_TEXT = "Reactivar promos"
 REACTIVATE_BUTTON_ID = "reactivate_promos"
 
 REACTIVATE_KEYWORD = "REACTIVAR PROMOS"

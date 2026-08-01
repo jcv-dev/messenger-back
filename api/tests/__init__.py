@@ -4806,6 +4806,13 @@ class StopButtonWebhookHandlerTests(APITestCase):
     """Test that clicking the stop button on a template creates exclusion + confirmation message."""
 
     def setUp(self):
+        from django.core.cache import cache
+        for wamid in (
+            'wamid.stop1', 'wamid.stop2', 'wamid.stop3',
+            'wamid.react1', 'wamid.react2', 'wamid.react3',
+            'wamid.cycle1', 'wamid.cycle2',
+        ):
+            cache.delete(f'wamid_dedup:{wamid}')
         self.conversation = Conversation.objects.create(
             whatsapp_id='573001234567',
             contact_name='Test',
@@ -4841,6 +4848,11 @@ class StopButtonWebhookHandlerTests(APITestCase):
         confirm_msg = Message.objects.filter(conversation=self.conversation, direction='outbound', message_type='text').first()
         self.assertIsNotNone(confirm_msg)
         self.assertIn('removido', confirm_msg.content)
+
+        interactive = Message.objects.filter(direction='outbound', message_type='interactive').first()
+        self.assertIsNotNone(interactive)
+        title = json.loads(interactive.content)['action']['buttons'][0]['reply']['title']
+        self.assertLessEqual(len(title), 20, f'Interactive button title too long: {title!r}')
 
     def test_stop_button_non_matching_text_ignored(self):
         payload = {
