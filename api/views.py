@@ -327,7 +327,7 @@ def upload_media_to_whatsapp(file_path, phone_number_id, token):
     }
     
     req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-    with urllib.request.urlopen(req) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         res_data = json.loads(response.read().decode())
         return res_data.get('id')
 
@@ -550,14 +550,14 @@ def download_whatsapp_media(media_value, token, media_type):
         else:
             graph_url = f"https://graph.facebook.com/v20.0/{media_value}"
             req = urllib.request.Request(graph_url, headers={'Authorization': f'Bearer {token}'})
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
                 fetch_url = data.get('url', '')
             if not fetch_url:
                 return None
 
         req = urllib.request.Request(fetch_url, headers={'Authorization': f'Bearer {token}'})
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read()
             content_type = response.headers.get('Content-Type', 'application/octet-stream')
 
@@ -610,6 +610,25 @@ def _resolve_media_path(content):
     exists = os.path.exists(file_path)
     logger.debug("_resolve_media_path: path=%s -> file=%s exists=%s", content, file_path, exists)
     return file_path if exists else None
+
+
+def _mark_send_failed(message_id, conversation_id, error_message, error_code=None):
+    if not message_id:
+        return
+    try:
+        failed_msg = Message.objects.get(id=message_id)
+        meta = failed_msg.metadata or {}
+        meta['send_error'] = error_message
+        if error_code is not None:
+            meta['send_error_code'] = error_code
+        meta['status'] = 'failed'
+        failed_msg.metadata = meta
+        failed_msg.save(update_fields=['metadata'])
+        if conversation_id:
+            conv = Conversation.objects.get(id=conversation_id)
+            publish_conversation_update(conv, MessageSerializer(failed_msg).data)
+    except Exception:
+        logger.exception('Failed to update send_error for message %d', message_id)
 
 
 def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None, conversation_id=None, context_wamid=None):
@@ -783,64 +802,72 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
         body = json.dumps(payload).encode('utf-8')
         logger.info('WhatsApp outbound -> %s [%s]', contact_phone, message_type)
         req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             resp_body = response.read().decode()
+            resp_data = {}
+            try:
+                resp_data = json.loads(resp_body) or {}
+            except Exception:
+                logger.warning(
+                    'WhatsApp outbound unparseable response for message %s: %r',
+                    message_id, resp_body[:300],
+                )
+            logger.info(
+                'WhatsApp outbound response -> %s [%s]: %s',
+                contact_phone, message_type, resp_body[:600],
+            )
             if message_id:
-                try:
-                    resp_data = json.loads(resp_body)
-                    wamid = resp_data.get('messages', [{}])[0].get('id', '')
+                err = resp_data.get('error')
+                if err:
+                    logger.error('WhatsApp API error in 200 response: %s', resp_body[:600])
+                    _mark_send_failed(
+                        message_id, conversation_id,
+                        err.get('message') or err.get('type') or 'WhatsApp API error',
+                        err.get('code'),
+                    )
+                else:
+                    wamid = ''
+                    messages = resp_data.get('messages')
+                    if messages and isinstance(messages, list):
+                        wamid = messages[0].get('id', '') or ''
                     if wamid:
                         sent_msg = Message.objects.get(id=message_id)
                         sent_msg.whatsapp_message_id = wamid
                         sent_msg.metadata['status'] = 'sent'
                         sent_msg.save(update_fields=['whatsapp_message_id', 'metadata'])
-                    if conversation_id:
-                        try:
-                            conv = Conversation.objects.get(id=conversation_id)
-                            sent_msg = Message.objects.get(id=message_id)
-                            publish_conversation_update(conv, MessageSerializer(sent_msg).data)
-                        except Exception:
-                            logger.exception('Failed to publish update after wamid for message %d', message_id)
-                except Exception:
-                    logger.exception('Failed to update wamid for message %d', message_id)
+                        if conversation_id:
+                            try:
+                                conv = Conversation.objects.get(id=conversation_id)
+                                sent_msg = Message.objects.get(id=message_id)
+                                publish_conversation_update(conv, MessageSerializer(sent_msg).data)
+                            except Exception:
+                                logger.exception('Failed to publish update after wamid for message %d', message_id)
+                    else:
+                        logger.warning(
+                            'WhatsApp outbound accepted without message id for message %s: %s',
+                            message_id, resp_body[:600],
+                        )
+                        _mark_send_failed(
+                            message_id, conversation_id,
+                            'WhatsApp accepted the request but returned no message id',
+                        )
     except urllib.error.HTTPError as e:
         body = e.read().decode() if hasattr(e, 'read') else ''
         logger.error('WhatsApp API HTTP %s: %s', e.code, body)
-        if message_id:
-            try:
-                err_data = {}
-                try:
-                    parsed = json.loads(body)
-                    err_data = parsed.get('error', {})
-                except Exception:
-                    pass
-                failed_msg = Message.objects.get(id=message_id)
-                meta = failed_msg.metadata or {}
-                meta['send_error'] = err_data.get('message', body[:200]) or body[:200]
-                meta['send_error_code'] = err_data.get('code', e.code)
-                meta['status'] = 'failed'
-                failed_msg.metadata = meta
-                failed_msg.save(update_fields=['metadata'])
-                if conversation_id:
-                    conv = Conversation.objects.get(id=conversation_id)
-                    publish_conversation_update(conv, MessageSerializer(failed_msg).data)
-            except Exception:
-                logger.exception('Failed to update send_error for message %d', message_id)
+        err_data = {}
+        try:
+            parsed = json.loads(body)
+            err_data = parsed.get('error', {})
+        except Exception:
+            pass
+        _mark_send_failed(
+            message_id, conversation_id,
+            err_data.get('message', body[:200]) or body[:200],
+            err_data.get('code', e.code),
+        )
     except Exception:
         logger.exception("Error sending WhatsApp message")
-        if message_id:
-            try:
-                failed_msg = Message.objects.get(id=message_id)
-                meta = failed_msg.metadata or {}
-                meta['send_error'] = 'Network error sending message'
-                meta['status'] = 'failed'
-                failed_msg.metadata = meta
-                failed_msg.save(update_fields=['metadata'])
-                if conversation_id:
-                    conv = Conversation.objects.get(id=conversation_id)
-                    publish_conversation_update(conv, MessageSerializer(failed_msg).data)
-            except Exception:
-                logger.exception('Failed to update send_error for message %d', message_id)
+        _mark_send_failed(message_id, conversation_id, 'Network error sending message')
 
 
 # --- WhatsApp Calling API helpers ---
@@ -887,7 +914,7 @@ def _call_whatsapp_api(phone_number_id, payload):
 
     try:
         req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=30) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as e:
         err_data = _parse_whatsapp_error(e)
@@ -3203,6 +3230,68 @@ def _handle_call_status_webhook(status_event, metadata):
     _publish_call_event(call, event_type_map.get(status_value, 'updated'))
 
 
+def _handle_message_status_webhook(status_event):
+    """Process Meta message delivery statuses (sent/delivered/read/failed)."""
+    wamid = status_event.get('id', '')
+    status_value = status_event.get('status', '')
+    errors = status_event.get('errors', [])
+    recipient = status_event.get('recipient_id', '')
+    logger.info(
+        'WhatsApp message status: id=%s status=%s recipient=%s errors=%s',
+        wamid, status_value, recipient, errors,
+    )
+    if status_value not in ('sent', 'delivered', 'read', 'failed', 'deleted', 'warning'):
+        return
+    if not wamid:
+        return
+
+    msg = (
+        Message.objects.filter(whatsapp_message_id=wamid)
+        .select_related('conversation')
+        .first()
+    )
+    if not msg:
+        logger.warning('WhatsApp message status for unknown wamid: %s %s', wamid, status_value)
+        return
+
+    if recipient and str(recipient) != str(msg.conversation.contact_phone):
+        logger.warning(
+            'Status recipient mismatch: msg=%s wamid=%s status_recipient=%s conv_phone=%s',
+            msg.id, wamid, recipient, msg.conversation.contact_phone,
+        )
+
+    meta = msg.metadata or {}
+    if status_value in ('sent', 'delivered', 'read'):
+        meta['delivery_status'] = status_value
+        ts = status_event.get('timestamp')
+        if ts:
+            try:
+                meta[status_value + '_at'] = datetime.fromtimestamp(int(ts), tz=dt_timezone.utc).isoformat()
+            except (ValueError, OSError, TypeError):
+                pass
+    elif status_value == 'failed':
+        meta['delivery_status'] = 'failed'
+        meta['status'] = 'failed'
+        meta['send_errors'] = errors
+        first = errors[0] if errors else {}
+        meta['send_error'] = first.get('message') or first.get('title') or 'WhatsApp delivery failed'
+        meta['send_error_code'] = first.get('code')
+        ts = status_event.get('timestamp')
+        if ts:
+            try:
+                meta['failed_at'] = datetime.fromtimestamp(int(ts), tz=dt_timezone.utc).isoformat()
+            except (ValueError, OSError, TypeError):
+                pass
+    elif status_value == 'deleted':
+        meta['delivery_status'] = 'deleted'
+    else:
+        meta['delivery_status'] = status_value
+
+    msg.metadata = meta
+    msg.save(update_fields=['metadata'])
+    publish_conversation_update(msg.conversation, MessageSerializer(msg).data)
+
+
 # Webhook endpoint for WhatsApp (verification + incoming messages)
 def _remove_template_exclusion(wa_id, conversation, contact_name, via):
     """Remove a contact from the template exclusion list and log it."""
@@ -3295,6 +3384,7 @@ def whatsapp_webhook(request):
 
             for status_event in statuses:
                 _handle_call_status_webhook(status_event, value.get('metadata', {}))
+                _handle_message_status_webhook(status_event)
                 # Handle typing indicator
                 s = status_event.get('status', '')
                 if s == 'typing':
@@ -4431,7 +4521,7 @@ def call_settings(request):
     if request.method == 'GET':
         req = urllib.request.Request(base_url, headers=headers)
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode())
             calling = data.get('calling', {})
             return JsonResponse(calling)
@@ -4455,7 +4545,7 @@ def call_settings(request):
     body = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(base_url, data=body, headers=headers, method='POST')
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return JsonResponse(json.loads(resp.read().decode()))
     except urllib.error.HTTPError as e:
         err_body = e.read().decode() if hasattr(e, 'read') else ''

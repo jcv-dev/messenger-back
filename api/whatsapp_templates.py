@@ -47,7 +47,7 @@ def _request(method: str, url: str, data: dict | None = None) -> dict:
     headers = _headers()
     body = json.dumps(data).encode("utf-8") if data else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -57,7 +57,7 @@ def _request_ok(method: str, url: str, data: dict | None = None) -> bool:
     body = json.dumps(data).encode("utf-8") if data else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=30):
             return True
     except urllib.error.HTTPError:
         return False
@@ -251,7 +251,7 @@ def upload_template_media(file_path: str) -> str | None:
     acquire_rate_capacity(_phone_number_id())
     try:
         req = urllib.request.Request(session_url, method="POST")
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             session_data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode() if hasattr(e, "read") else ""
@@ -276,7 +276,7 @@ def upload_template_media(file_path: str) -> str | None:
     acquire_rate_capacity(_phone_number_id())
     try:
         req = urllib.request.Request(upload_url, data=file_data, headers=upload_headers, method="POST")
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode() if hasattr(e, "read") else ""

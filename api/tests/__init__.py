@@ -1535,6 +1535,130 @@ class WebhookTests(APITestCase):
         self.assertTrue(msg.is_frequently_forwarded)
 
 
+# ── Message status webhooks ─────────────────────────────────────────────────
+
+class MessageStatusWebhookTests(APITestCase):
+    """Meta delivery statuses (sent/delivered/read/failed) must update the
+    matching outbound message instead of being silently dropped."""
+
+    def setUp(self):
+        self.group = get_or_create_tulua_group()
+        self.conv = Conversation.objects.create(
+            whatsapp_id='15559999111', contact_name='Status Test',
+            contact_phone='15559999111', group=self.group,
+        )
+        self.msg = Message.objects.create(
+            conversation=self.conv,
+            direction='outbound',
+            message_type='text',
+            content='Hola',
+            whatsapp_message_id='wamid.status1',
+            metadata={'status': 'sent'},
+        )
+
+    def _post_statuses(self, statuses):
+        payload = {
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messaging_product': 'whatsapp',
+                        'metadata': {'phone_number_id': '123'},
+                        'statuses': statuses,
+                    },
+                }],
+            }],
+        }
+        with self.settings(WHATSAPP_APP_SECRET=''):
+            return self.client.post(
+                '/webhook/', data=json.dumps(payload), content_type='application/json',
+            )
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_delivered_updates_metadata(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.status1',
+            'status': 'delivered',
+            'timestamp': '1787000000',
+            'recipient_id': '15559999111',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'delivered')
+        self.assertIn('delivered_at', self.msg.metadata)
+        mock_publish.assert_called_once()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_read_updates_metadata(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.status1',
+            'status': 'read',
+            'timestamp': '1787000100',
+            'recipient_id': '15559999111',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'read')
+        self.assertIn('read_at', self.msg.metadata)
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_failed_sets_send_error(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.status1',
+            'status': 'failed',
+            'timestamp': '1787000200',
+            'recipient_id': '15559999111',
+            'errors': [{
+                'code': 131047,
+                'title': 'Re-engagement message',
+                'message': '(#131047) Re-engagement message',
+                'error_data': {'details': 'More than 24 hours have passed since the recipient last replied to the sender number.'},
+            }],
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('status'), 'failed')
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'failed')
+        self.assertEqual(self.msg.metadata.get('send_error_code'), 131047)
+        self.assertIn('Re-engagement', self.msg.metadata.get('send_error', ''))
+        self.assertEqual(self.msg.metadata.get('send_errors')[0]['code'], 131047)
+        mock_publish.assert_called_once()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_unknown_wamid_no_crash(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.never_existed',
+            'status': 'failed',
+            'recipient_id': '15559999111',
+            'errors': [{'code': 131026, 'title': 'Message undeliverable'}],
+        }])
+        self.assertEqual(response.status_code, 200)
+        mock_publish.assert_not_called()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_recipient_mismatch_still_updates(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.status1',
+            'status': 'delivered',
+            'timestamp': '1787000300',
+            'recipient_id': '15550000000',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'delivered')
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_call_webhook_unaffected(self, mock_publish):
+        """A status that belongs to neither a Call nor a Message is ignored."""
+        response = self._post_statuses([{
+            'id': 'call.somecall123',
+            'status': 'RINGING',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertNotIn('delivery_status', self.msg.metadata)
+        mock_publish.assert_not_called()
+
+
 # ── Media Proxy ─────────────────────────────────────────────────────────────
 
 class MediaProxyTests(APITestCase):

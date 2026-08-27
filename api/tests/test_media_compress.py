@@ -1,5 +1,6 @@
 """Tests for media compression and WhatsApp size enforcement."""
 
+import json
 import os
 import tempfile
 import subprocess
@@ -363,3 +364,143 @@ class SendWhatsappOutboundCompressionTests(SimpleTestCase):
         mock_upload.assert_not_called()
         # acquire_rate_capacity still called once for the main POST (not for upload)
         self.assertEqual(mock_rate_limit.call_count, 1)
+
+
+# ── send_whatsapp_outbound response hardening ───────────────────────────────
+
+class SendWhatsappOutboundResponseTests(SimpleTestCase):
+    """Verify 200-with-error and empty-messages responses are not silently
+    swallowed, and that the Graph API call carries a timeout."""
+
+    def _setup(self, mock_msg_get):
+        mock_msg = MagicMock()
+        mock_msg.metadata = {}
+        mock_msg_get.return_value = mock_msg
+        return mock_msg
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
+    def test_success_sets_sent_status(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            'messaging_product': 'whatsapp',
+            'contacts': [{'input': '15551234567', 'wa_id': '15551234567'}],
+            'messages': [{'id': 'wamid.ok123', 'message_status': 'accepted'}],
+        }).encode()
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+        mock_msg = self._setup(mock_msg_get)
+        mock_conv_get.return_value = MagicMock()
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound('text', 'Hola', '15551234567', message_id=1, conversation_id=1)
+
+        self.assertEqual(mock_msg.whatsapp_message_id, 'wamid.ok123')
+        self.assertEqual(mock_msg.metadata['status'], 'sent')
+        mock_msg.save.assert_called_once()
+        mock_publish.assert_called_once()
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
+    def test_200_with_error_marks_failed(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            'error': {
+                'message': '(#131047) Re-engagement message',
+                'code': 131047,
+                'type': 'OAuthException',
+            },
+        }).encode()
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+        mock_msg = self._setup(mock_msg_get)
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound('text', 'Hola', '15551234567', message_id=1, conversation_id=1)
+
+        self.assertEqual(mock_msg.metadata['status'], 'failed')
+        self.assertEqual(mock_msg.metadata['send_error_code'], 131047)
+        self.assertIn('Re-engagement message', mock_msg.metadata['send_error'])
+        mock_publish.assert_called_once()
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
+    def test_200_empty_messages_marks_failed(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            'messaging_product': 'whatsapp',
+            'contacts': [{'input': '15551234567', 'wa_id': '15551234567'}],
+            'messages': [],
+        }).encode()
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+        mock_msg = self._setup(mock_msg_get)
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound('text', 'Hola', '15551234567', message_id=1, conversation_id=1)
+
+        self.assertEqual(mock_msg.metadata['status'], 'failed')
+        self.assertIn('no message id', mock_msg.metadata['send_error'])
+        mock_publish.assert_called_once()
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
+    def test_urlopen_called_with_timeout(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            'messages': [{'id': 'wamid.timeout1'}],
+        }).encode()
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+        self._setup(mock_msg_get)
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound('text', 'Hola', '15551234567', message_id=1, conversation_id=1)
+
+        self.assertEqual(mock_request.urlopen.call_args.kwargs.get('timeout'), 30)
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
+    def test_http_error_marks_failed(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        import urllib.error
+        err = urllib.error.HTTPError(
+            url='', code=400, msg='Bad Request', hdrs={}, fp=MagicMock(),
+        )
+        err.read = MagicMock(return_value=json.dumps({
+            'error': {'message': '(#131047) Re-engagement message', 'code': 131047},
+        }).encode())
+        mock_request.urlopen.side_effect = err
+        mock_msg = self._setup(mock_msg_get)
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound('text', 'Hola', '15551234567', message_id=1, conversation_id=1)
+
+        self.assertEqual(mock_msg.metadata['status'], 'failed')
+        self.assertEqual(mock_msg.metadata['send_error_code'], 131047)
+        mock_publish.assert_called_once()
