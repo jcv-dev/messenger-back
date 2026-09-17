@@ -1,10 +1,10 @@
 import asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from django.core.files.uploadedfile import SimpleUploadedFile
 from urllib.parse import quote
 
 from django.db import IntegrityError
-from django.test import TestCase, SimpleTestCase, override_settings
+from django.test import TestCase, SimpleTestCase, TransactionTestCase, override_settings
 from django.conf import settings
 from django.urls import resolve, reverse
 from django.contrib.auth.models import User
@@ -4551,6 +4551,97 @@ class SSEGroupFilterTests(SimpleTestCase):
         from api.realtime import _build_subscriber_channels
         channels = _build_subscriber_channels(user)
         self.assertEqual(channels, ['sse:events'])
+
+
+class _EmptyAsyncIterator:
+    """Async iterator that yields nothing (keeps the SSE bridge task quiet)."""
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class SSESubscribeChannelsTests(TransactionTestCase):
+    """Regression: `subscribe()` used to resolve `user.profile` with sync ORM
+    code inside the event loop. The resulting SynchronousOnlyOperation was
+    swallowed by a bare ``except Exception: pass``, so every non-staff user
+    subscribed to zero Redis channels: no pending-send timer, no sent status,
+    no live inbound updates — just stale UI until a manual reload.
+    """
+
+    def setUp(self):
+        # asyncio.Lock / subscriber registry are process-wide; each test runs in
+        # its own event loop, so start from a clean state.
+        from api import realtime
+        realtime._lock = asyncio.Lock()
+        realtime._subscribers.clear()
+
+    @staticmethod
+    def _mock_redis():
+        mock_pubsub = MagicMock()
+        mock_pubsub.subscribe = AsyncMock()
+        mock_pubsub.unsubscribe = AsyncMock()
+        mock_pubsub.close = AsyncMock()
+        mock_pubsub.listen = lambda: _EmptyAsyncIterator()
+        mock_redis = MagicMock()
+        mock_redis.pubsub.return_value = mock_pubsub
+        mock_redis.aclose = AsyncMock()
+        return mock_redis, mock_pubsub
+
+    def _subscribe_and_assert(self, user, expected_call):
+        from api import realtime
+
+        async def scenario():
+            mock_redis, mock_pubsub = self._mock_redis()
+            with patch('api.realtime.aioredis.from_url', return_value=mock_redis):
+                subscriber_id, _queue, _check, _clear = await realtime.subscribe(user=user)
+                try:
+                    if expected_call is None:
+                        mock_pubsub.subscribe.assert_not_awaited()
+                    else:
+                        mock_pubsub.subscribe.assert_awaited_once_with(expected_call)
+                finally:
+                    await realtime.unsubscribe(subscriber_id)
+
+        asyncio.run(scenario())
+
+    def test_non_staff_with_group_subscribes_to_group_channel(self):
+        async def setup():
+            group = await CityGroup.objects.acreate(name='SSE Group', slug='sse-group')
+            user = await User.objects.acreate(username='sse-agent')
+            await UserProfile.objects.filter(user=user).aupdate(group=group)
+            # Reload so `user.profile` is not cached on the instance.
+            return group, await User.objects.aget(pk=user.pk)
+
+        group, user = asyncio.run(setup())
+        self._subscribe_and_assert(user, f'sse:group:{group.id}')
+
+    def test_non_staff_without_group_subscribes_to_global(self):
+        async def setup():
+            user = await User.objects.acreate(username='sse-nogroup')
+            return await User.objects.aget(pk=user.pk)
+
+        user = asyncio.run(setup())
+        self._subscribe_and_assert(user, 'sse:events')
+
+    def test_user_without_profile_subscribes_to_nothing(self):
+        async def setup():
+            user = await User.objects.acreate(username='sse-noprofile')
+            await UserProfile.objects.filter(user=user).adelete()
+            return await User.objects.aget(pk=user.pk)
+
+        user = asyncio.run(setup())
+        self._subscribe_and_assert(user, None)
+
+    def test_staff_subscribes_to_global(self):
+        async def setup():
+            user = await User.objects.acreate(username='sse-admin', is_staff=True)
+            return await User.objects.aget(pk=user.pk)
+
+        user = asyncio.run(setup())
+        self._subscribe_and_assert(user, 'sse:events')
 
 
 # ── Set Conversation Group ────────────────────────────────────────────────

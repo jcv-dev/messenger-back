@@ -3849,7 +3849,7 @@ async def realtime_events(request):
         return HttpResponse(status=401)
 
     try:
-        sse_token = await SSEToken.objects.select_related('user').aget(key=sse_token_key)
+        sse_token = await SSEToken.objects.select_related('user', 'user__profile').aget(key=sse_token_key)
         if not sse_token.is_valid():
             return HttpResponse(status=401)
         sse_token.used = True

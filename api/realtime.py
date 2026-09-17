@@ -10,7 +10,9 @@ from itertools import count
 from typing import Any, Callable
 
 import redis.asyncio as aioredis
+from asgiref.sync import sync_to_async
 from django.conf import settings
+from django.core.exceptions import ObjectDoesNotExist
 
 from .redis_client import get_sync_redis, reset_sync_redis
 
@@ -54,8 +56,12 @@ async def subscribe(user: Any = None) -> (
     redis = aioredis.from_url(settings.REDIS_URL, decode_responses=True)
     pubsub = redis.pubsub()
 
-    channels = _build_subscriber_channels(user)
-    await pubsub.subscribe(*channels)
+    # Resolve channels off the event loop: `user.profile` is a lazy DB lookup and
+    # running it here raises SynchronousOnlyOperation (previously swallowed,
+    # which left every non-staff subscriber with an empty channel list).
+    channels = await sync_to_async(_build_subscriber_channels)(user)
+    if channels:
+        await pubsub.subscribe(*channels)
 
     state: dict[str, Any] = {
         "queue": event_queue,
@@ -110,7 +116,12 @@ async def unsubscribe(subscriber_id: str) -> None:
 
 
 def _build_subscriber_channels(user: Any) -> list[str]:
-    """Determine Redis channels this user should subscribe to."""
+    """Determine Redis channels this user should subscribe to.
+
+    IMPORTANT: this reads ``user.profile`` lazily, so it must be called through
+    ``sync_to_async`` from the async SSE view — a direct call runs the ORM
+    inside the event loop and raises ``SynchronousOnlyOperation``.
+    """
     channels = []
     if (
         user
@@ -122,10 +133,24 @@ def _build_subscriber_channels(user: Any) -> list[str]:
         else:
             try:
                 profile = user.profile
+            except ObjectDoesNotExist:
+                # No profile row: the REST layer shows this user nothing.
+                logger.warning(
+                    "SSE: user=%s has no profile; subscribing to no channels",
+                    getattr(user, 'username', None),
+                )
+            except Exception:
+                logger.exception(
+                    "SSE: could not resolve group for user=%s; subscribing to no channels",
+                    getattr(user, 'username', None),
+                )
+            else:
                 if profile and profile.group_id:
                     channels = [f"{GROUP_CHANNEL_PREFIX}:{profile.group_id}"]
-            except Exception:
-                pass
+                else:
+                    # No group => unrestricted visibility (see
+                    # ConversationViewSet.get_queryset), so receive everything.
+                    channels = [REDIS_CHANNEL]
     else:
         channels = [REDIS_CHANNEL]
     return channels
