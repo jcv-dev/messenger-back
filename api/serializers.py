@@ -508,6 +508,9 @@ class WhatsAppTemplateSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'template_id', 'status', 'quality_score',
                             'rejection_reason', 'created_at', 'updated_at']
+        # Replaced by an explicit check in validate() so the duplicate error
+        # is actionable Spanish instead of DRF's default phrasing.
+        validators = []
 
     def validate_components(self, value):
         for comp in value:
@@ -528,6 +531,18 @@ class WhatsAppTemplateSerializer(serializers.ModelSerializer):
         category = attrs.get('category')
         if category is None and self.instance is not None:
             category = self.instance.category
+
+        name = attrs.get('name') or getattr(self.instance, 'name', None)
+        language = attrs.get('language') or getattr(self.instance, 'language', None)
+        if name and language:
+            duplicates = WhatsAppTemplate.objects.filter(name=name, language=language)
+            if self.instance is not None:
+                duplicates = duplicates.exclude(pk=self.instance.pk)
+            if duplicates.exists():
+                raise serializers.ValidationError({
+                    'name': 'Ya existe una plantilla con este nombre e idioma.',
+                })
+
         if category == 'MARKETING' and attrs.get('components') is not None:
             attrs['components'] = _ensure_stop_button(attrs['components'])
         return attrs

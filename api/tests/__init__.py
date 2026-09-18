@@ -1658,6 +1658,132 @@ class MessageStatusWebhookTests(APITestCase):
         self.assertNotIn('delivery_status', self.msg.metadata)
         mock_publish.assert_not_called()
 
+    @patch('api.views.publish_conversation_update')
+    def test_status_sent_sets_timestamp(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.status1',
+            'status': 'sent',
+            'timestamp': '1787000400',
+            'recipient_id': '15559999111',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'sent')
+        self.assertIn('sent_at', self.msg.metadata)
+        mock_publish.assert_called_once()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_out_of_order_sent_ignored_after_read(self, mock_publish):
+        """Meta does not guarantee webhook order; a late `sent` must not downgrade."""
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'read', 'timestamp': '1787000100',
+        }])
+        mock_publish.reset_mock()
+        response = self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'sent', 'timestamp': '1787000050',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'read')
+        mock_publish.assert_not_called()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_delivered_out_of_order_after_read(self, mock_publish):
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'read', 'timestamp': '1787000100',
+        }])
+        mock_publish.reset_mock()
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'delivered', 'timestamp': '1787000090',
+        }])
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'read')
+        mock_publish.assert_not_called()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_played_recorded_after_read(self, mock_publish):
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'read', 'timestamp': '1787000100',
+        }])
+        response = self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'played', 'timestamp': '1787000150',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'played')
+        self.assertIn('played_at', self.msg.metadata)
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_failed_then_delivered_stays_failed(self, mock_publish):
+        """`failed` is terminal: an out-of-order delivery cannot revive it."""
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'failed', 'timestamp': '1787000200',
+            'errors': [{'code': 131026, 'title': 'Message undeliverable'}],
+        }])
+        mock_publish.reset_mock()
+        response = self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'delivered', 'timestamp': '1787000300',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'failed')
+        mock_publish.assert_not_called()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_read_then_failed_keeps_read(self, mock_publish):
+        """A read message can never become failed afterwards."""
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'read', 'timestamp': '1787000100',
+        }])
+        mock_publish.reset_mock()
+        response = self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'failed', 'timestamp': '1787000200',
+            'errors': [{'code': 131026, 'title': 'Message undeliverable'}],
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'read')
+        self.assertNotIn('send_error', self.msg.metadata)
+        mock_publish.assert_not_called()
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_deleted_keeps_delivery_status(self, mock_publish):
+        """Deletion flags the message without erasing how far it got."""
+        self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'delivered', 'timestamp': '1787000000',
+        }])
+        response = self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'deleted', 'timestamp': '1787000500',
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'delivered')
+        self.assertTrue(self.msg.metadata.get('deleted'))
+        self.assertIn('deleted_at', self.msg.metadata)
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_warning_recorded(self, mock_publish):
+        response = self._post_statuses([{
+            'id': 'wamid.status1', 'status': 'warning', 'timestamp': '1787000600',
+            'errors': [{'code': 131049, 'title': 'Healthy ecosystem engagement'}],
+        }])
+        self.assertEqual(response.status_code, 200)
+        self.msg.refresh_from_db()
+        self.assertNotIn('delivery_status', self.msg.metadata)
+        self.assertIn('delivery_warning', self.msg.metadata)
+
+    @patch('api.views.publish_conversation_update')
+    def test_status_duplicate_not_republished(self, mock_publish):
+        payload = [{
+            'id': 'wamid.status1', 'status': 'delivered', 'timestamp': '1787000000',
+        }]
+        self._post_statuses(payload)
+        mock_publish.reset_mock()
+        self._post_statuses(payload)
+        self.msg.refresh_from_db()
+        self.assertEqual(self.msg.metadata.get('delivery_status'), 'delivered')
+        mock_publish.assert_not_called()
+
 
 # ── Media Proxy ─────────────────────────────────────────────────────────────
 
@@ -3195,6 +3321,81 @@ class WhatsAppTemplateViewSetTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['name'], 'new_template')
         self.assertEqual(response.data['status'], 'PENDING')
+
+    @patch('api.whatsapp_templates.create_template')
+    def test_create_surfaces_meta_error_and_persists_nothing(self, mock_create_template):
+        from api.whatsapp_templates import MetaTemplateError
+        mock_create_template.side_effect = MetaTemplateError(
+            'Invalid parameter', 'Button text is too long', status_code=400,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/', {
+            'name': 'rejected_template',
+            'language': 'es',
+            'category': 'MARKETING',
+            'components': [{'type': 'body', 'text': 'Bienvenido'}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Invalid parameter', response.data['detail'])
+        self.assertIn('Button text is too long', response.data['meta_error'])
+        self.assertFalse(
+            WhatsAppTemplate.objects.filter(name='rejected_template').exists(),
+        )
+
+    @patch('api.whatsapp_templates.create_template')
+    def test_create_meta_unreachable_returns_502(self, mock_create_template):
+        from api.whatsapp_templates import MetaTemplateError
+        mock_create_template.side_effect = MetaTemplateError(
+            'No se pudo contactar a Meta.', '', status_code=502,
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/', {
+            'name': 'offline_template',
+            'language': 'es',
+            'category': 'MARKETING',
+            'components': [{'type': 'body', 'text': 'Bienvenido'}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertFalse(
+            WhatsAppTemplate.objects.filter(name='offline_template').exists(),
+        )
+
+    @patch('api.whatsapp_templates.create_template')
+    def test_create_duplicate_name_and_language_rejected(self, mock_create_template):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/', {
+            'name': 'test_template',
+            'language': 'es',
+            'category': 'MARKETING',
+            'components': [{'type': 'body', 'text': 'Bienvenido'}],
+        }, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Ya existe', response.data['name'][0])
+        mock_create_template.assert_not_called()
+        self.assertEqual(WhatsAppTemplate.objects.filter(name='test_template').count(), 1)
+
+    @patch('api.whatsapp_templates.get_template')
+    def test_sync_status_updates_rejection_reason(self, mock_get_template):
+        mock_get_template.return_value = {'status': 'REJECTED', 'rejected_reason': 'Invalid format'}
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post(f'/api/templates/{self.template.id}/sync_status/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.status, 'REJECTED')
+        self.assertEqual(self.template.rejection_reason, 'Invalid format')
+
+    @patch('api.whatsapp_templates.list_templates')
+    def test_sync_all_updates_rejection_reason(self, mock_list_templates):
+        mock_list_templates.return_value = [
+            {'name': 'test_template', 'language': 'es', 'status': 'REJECTED',
+             'rejected_reason': 'Parameters next to each other'},
+        ]
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.admin_token.key}')
+        response = self.client.post('/api/templates/sync_all/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.template.refresh_from_db()
+        self.assertEqual(self.template.status, 'REJECTED')
+        self.assertEqual(self.template.rejection_reason, 'Parameters next to each other')
 
     def test_create_requires_admin(self):
         self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.user_token.key}')

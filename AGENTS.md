@@ -247,6 +247,7 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
 
 - Graph API v20.0. Outbound messages sent via `ThreadPoolExecutor` (32 workers).
 - `send_whatsapp_outbound` supports: `text`, `interactive`, `location`, `sticker`, `image`, `video`, `audio`, `document`.
+- Delivery statuses are **inspect-only**: `_handle_message_status_webhook` records Meta's `sent < delivered < read < played` progression in `Message.metadata` (`delivery_status`, `sent_at`/`delivered_at`/`read_at`/`played_at`, `send_error*`, `deleted`, `delivery_warning`). Out-of-order webhooks never downgrade a status, `failed` is terminal unless the message was already read, duplicate statuses do not re-publish SSE, and nothing is ever sent back to Meta (no read receipts, no typing indicators).
 - Location messages accept `content` as dict: `{longitude, latitude, name, address}`.
 - WhatsApp rate limiter: `api/rate_limiter.py` — Redis sliding window per `phone_number_id`, 70 req/s default. Blocks until capacity available, fails open after 30s.
 

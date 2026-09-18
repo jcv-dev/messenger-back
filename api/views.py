@@ -7,6 +7,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.filters import SearchFilter
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from django.utils import timezone
 from django.contrib.auth.models import User
@@ -2104,6 +2105,8 @@ class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.select_related('profile__group').all().order_by('id')
     serializer_class = UserSerializer
     pagination_class = UserPagination
+    filter_backends = [SearchFilter]
+    search_fields = ['username', 'first_name', 'last_name', 'email']
 
     def get_permissions(self):
         from rest_framework.permissions import IsAdminUser, IsAuthenticated
@@ -2294,26 +2297,41 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
     serializer_class = WhatsAppTemplateSerializer
     permission_classes = [IsAuthenticated, IsAdminUser]
 
-    def perform_create(self, serializer):
+    def create(self, request, *args, **kwargs):
+        """Submit the template to Meta first, then persist it.
+
+        A rejection never leaves a misleading row behind: the parsed Meta
+        error is returned with a 400 (or 502 when Meta is unreachable) and
+        the client keeps its payload to retry.
+        """
         from . import whatsapp_templates
-        template = serializer.save()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
         try:
             result = whatsapp_templates.create_template(
-                name=template.name,
-                language=template.language,
-                category=template.category,
-                components=template.components,
+                name=data['name'],
+                language=data['language'],
+                category=data['category'],
+                components=data['components'],
             )
-            if result:
-                template.template_id = str(result.get('id', ''))
-                template.status = result.get('status', 'PENDING')
-            else:
-                template.status = 'REJECTED'
-                template.rejection_reason = 'Failed to submit to Meta API'
-        except Exception:
-            template.status = 'REJECTED'
-            template.rejection_reason = 'Error submitting to Meta API'
-        template.save()
+        except whatsapp_templates.MetaTemplateError as exc:
+            logger.warning(
+                "Template %r (%s) rejected by Meta: %s %s",
+                data['name'], data['language'], exc.message, exc.details,
+            )
+            return Response(
+                {'detail': exc.message, 'meta_error': exc.details},
+                status=exc.status_code,
+            )
+
+        template = serializer.save(
+            template_id=str(result.get('id', '')),
+            status=result.get('status', 'PENDING'),
+        )
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_destroy(self, instance):
         from . import whatsapp_templates
@@ -2323,31 +2341,36 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def sync_status(self, request, pk=None):
-        """Re-fetch template status from Meta."""
+        """Re-fetch template status and rejection reason from Meta."""
         from . import whatsapp_templates
         template = self.get_object()
         if template.template_id:
             result = whatsapp_templates.get_template(template.template_id)
             if result:
                 template.status = result.get('status', template.status)
-                template.save(update_fields=['status'])
+                template.rejection_reason = result.get('rejected_reason') or ''
+                if result.get('quality_score'):
+                    template.quality_score = result['quality_score']
+                template.save(update_fields=['status', 'rejection_reason', 'quality_score'])
                 return Response(WhatsAppTemplateSerializer(template).data)
             return Response({'error': 'Failed to sync with Meta'}, status=400)
         return Response({'error': 'No template_id to sync'}, status=400)
 
     @action(detail=False, methods=['post'])
     def sync_all(self, request):
-        """Sync status of all templates from Meta."""
+        """Sync status and rejection reason of all templates from Meta."""
         from . import whatsapp_templates
         remote = whatsapp_templates.list_templates()
         updated = 0
         for rt in remote:
             try:
                 template = WhatsAppTemplate.objects.get(name=rt.get('name', ''), language=rt.get('language', 'es'))
-                old = template.status
+                old_status = template.status
+                old_reason = template.rejection_reason
                 template.status = rt.get('status', template.status)
-                if old != template.status:
-                    template.save(update_fields=['status'])
+                template.rejection_reason = rt.get('rejected_reason') or ''
+                if old_status != template.status or old_reason != template.rejection_reason:
+                    template.save(update_fields=['status', 'rejection_reason'])
                     updated += 1
             except WhatsAppTemplate.DoesNotExist:
                 pass
@@ -3230,8 +3253,30 @@ def _handle_call_status_webhook(status_event, metadata):
     _publish_call_event(call, event_type_map.get(status_value, 'updated'))
 
 
+_DELIVERY_STATUS_RANK = {'sent': 1, 'delivered': 2, 'read': 3, 'played': 4}
+_DELIVERY_STATUSES = frozenset(('sent', 'delivered', 'read', 'played'))
+
+
+def _status_timestamp(status_event):
+    ts = status_event.get('timestamp')
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts), tz=dt_timezone.utc).isoformat()
+    except (ValueError, OSError, TypeError):
+        return None
+
+
 def _handle_message_status_webhook(status_event):
-    """Process Meta message delivery statuses (sent/delivered/read/failed)."""
+    """Record Meta message delivery statuses (sent/delivered/read/played/failed).
+
+    Inspect-only: nothing is ever sent back to Meta, so the customer never
+    learns whether the business read their message. Webhook order is not
+    guaranteed (Meta can emit sent/delivered/read out of order), so statuses
+    only move forward: a late `sent` can never downgrade a `read`. `failed`
+    is terminal unless the message was already read. `deleted` and `warning`
+    are recorded without touching the delivery status.
+    """
     wamid = status_event.get('id', '')
     status_value = status_event.get('status', '')
     errors = status_event.get('errors', [])
@@ -3240,9 +3285,9 @@ def _handle_message_status_webhook(status_event):
         'WhatsApp message status: id=%s status=%s recipient=%s errors=%s',
         wamid, status_value, recipient, errors,
     )
-    if status_value not in ('sent', 'delivered', 'read', 'failed', 'deleted', 'warning'):
-        return
     if not wamid:
+        return
+    if status_value not in ('sent', 'delivered', 'read', 'played', 'failed', 'deleted', 'warning'):
         return
 
     msg = (
@@ -3260,32 +3305,50 @@ def _handle_message_status_webhook(status_event):
             msg.id, wamid, recipient, msg.conversation.contact_phone,
         )
 
-    meta = msg.metadata or {}
-    if status_value in ('sent', 'delivered', 'read'):
+    meta = dict(msg.metadata or {})
+    current = meta.get('delivery_status')
+    current_rank = _DELIVERY_STATUS_RANK.get(current, 0)
+
+    if status_value in _DELIVERY_STATUSES:
+        if current == 'failed':
+            logger.info('Ignoring %s for msg=%s: message already failed', status_value, msg.id)
+            return
+        if _DELIVERY_STATUS_RANK[status_value] <= current_rank:
+            logger.info(
+                'Ignoring out-of-order status %s for msg=%s (current=%s)',
+                status_value, msg.id, current,
+            )
+            return
         meta['delivery_status'] = status_value
-        ts = status_event.get('timestamp')
-        if ts:
-            try:
-                meta[status_value + '_at'] = datetime.fromtimestamp(int(ts), tz=dt_timezone.utc).isoformat()
-            except (ValueError, OSError, TypeError):
-                pass
+        stamp = _status_timestamp(status_event)
+        if stamp:
+            meta[status_value + '_at'] = stamp
     elif status_value == 'failed':
+        if current_rank >= _DELIVERY_STATUS_RANK['read']:
+            logger.info('Ignoring failed status for msg=%s: already %s', msg.id, current)
+            return
         meta['delivery_status'] = 'failed'
         meta['status'] = 'failed'
         meta['send_errors'] = errors
         first = errors[0] if errors else {}
         meta['send_error'] = first.get('message') or first.get('title') or 'WhatsApp delivery failed'
         meta['send_error_code'] = first.get('code')
-        ts = status_event.get('timestamp')
-        if ts:
-            try:
-                meta['failed_at'] = datetime.fromtimestamp(int(ts), tz=dt_timezone.utc).isoformat()
-            except (ValueError, OSError, TypeError):
-                pass
+        stamp = _status_timestamp(status_event)
+        if stamp:
+            meta['failed_at'] = stamp
     elif status_value == 'deleted':
-        meta['delivery_status'] = 'deleted'
-    else:
-        meta['delivery_status'] = status_value
+        meta['deleted'] = True
+        stamp = _status_timestamp(status_event)
+        if stamp:
+            meta['deleted_at'] = stamp
+    else:  # warning
+        meta['delivery_warning'] = errors or True
+        stamp = _status_timestamp(status_event)
+        if stamp:
+            meta['warning_at'] = stamp
+
+    if meta == (msg.metadata or {}):
+        return
 
     msg.metadata = meta
     msg.save(update_fields=['metadata'])

@@ -26,6 +26,39 @@ _GRAPH_API_VERSION = "v25.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
 
 
+class MetaTemplateError(Exception):
+    """A template submission Meta rejected, with the parsed error body.
+
+    ``message`` is what Meta said in ``error.message``; ``details`` carries
+    ``error.error_data.details`` (or ``error_user_msg``) when present.
+    ``status_code`` is the HTTP status the API should return: 400 for a
+    rejection Meta can fix with the payload, 502 when Meta is unreachable.
+    """
+
+    def __init__(self, message: str, details: str = "", status_code: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.details = details
+        self.status_code = status_code
+
+
+def _parse_meta_error(body: str) -> tuple[str, str]:
+    """Extract (message, details) from a Meta error response body."""
+    try:
+        payload = json.loads(body)
+        error = payload.get("error") or {}
+        message = error.get("message") or "Meta rechazó la plantilla."
+        error_data = error.get("error_data") or {}
+        details = (
+            error_data.get("details")
+            or error.get("error_user_msg")
+            or ""
+        )
+        return message, details
+    except Exception:
+        return "Meta rechazó la plantilla.", (body or "")[:500]
+
+
 def _headers() -> dict:
     token = settings.WHATSAPP_API_TOKEN
     return {
@@ -121,12 +154,17 @@ def create_template(name: str, language: str, category: str,
     """Submit a new template to Meta for review.
 
     Returns the API response dict (containing ``id`` and ``status``) on
-    success, or ``None`` on failure.
+    success. Raises ``MetaTemplateError`` when Meta rejects the submission
+    or cannot be reached, so the caller can surface the real reason.
     """
     business_id = _business_id()
     if not business_id:
         logger.error("WHATSAPP_BUSINESS_ACCOUNT_ID not configured")
-        return None
+        raise MetaTemplateError(
+            "La cuenta de WhatsApp Business no está configurada.",
+            "Falta WHATSAPP_BUSINESS_ACCOUNT_ID en el servidor.",
+            status_code=502,
+        )
 
     url = f"{_GRAPH_BASE}/{business_id}/message_templates"
     payload = {
@@ -144,10 +182,15 @@ def create_template(name: str, language: str, category: str,
     except urllib.error.HTTPError as e:
         body = e.read().decode() if hasattr(e, "read") else ""
         logger.error("Meta create_template HTTP %s: %s", e.code, body[:500])
-        return None
-    except Exception:
+        message, details = _parse_meta_error(body)
+        raise MetaTemplateError(message, details, status_code=400) from e
+    except Exception as e:
         logger.exception("Meta create_template network error")
-        return None
+        raise MetaTemplateError(
+            "No se pudo contactar a Meta. Intenta de nuevo en unos minutos.",
+            str(e),
+            status_code=502,
+        ) from e
 
 
 def list_templates() -> list[dict]:
