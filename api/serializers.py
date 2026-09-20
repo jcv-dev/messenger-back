@@ -6,11 +6,13 @@ import logging
 import re
 import time
 import urllib.parse
+from decimal import Decimal
+
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.utils import timezone
 from django.core.signing import Signer, BadSignature
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, TemplateExclusion, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, StickerAsset, CityGroup, BotExemptContact, BotSchedule, BotConfig, WhatsAppTemplate, TemplateExclusion, Call, AuditLog, CannedResponse, AgentPresence, PushSubscription, Order, OrderStop
 
 media_signer = Signer(salt='domi-media')
 media_proxy_signer = Signer(salt='domi-media-proxy')
@@ -243,11 +245,17 @@ class MessageSerializer(serializers.ModelSerializer):
         components = payload.get('components', [])
 
         params = {}
+        positional = []
         for comp in components:
             if comp.get('type') == 'body':
                 for p in comp.get('parameters', []):
-                    if p.get('type') == 'text':
-                        params[p.get('parameter_name', '')] = p.get('text', '')
+                    if p.get('type') != 'text':
+                        continue
+                    param_name = p.get('parameter_name')
+                    if param_name:
+                        params[param_name] = p.get('text', '')
+                    else:
+                        positional.append(p.get('text', ''))
 
         try:
             template = WhatsAppTemplate.objects.get(name=name, language=language)
@@ -257,14 +265,24 @@ class MessageSerializer(serializers.ModelSerializer):
                     body_text = comp.get('text', '')
                     break
             if body_text:
-                rendered = re.sub(
-                    r'\{\{(\w+)\}\}',
-                    lambda m: params.get(m.group(1), m.group(0)),
-                    body_text,
-                )
+                def _substitute(match):
+                    token = match.group(1)
+                    if token.isdigit():
+                        index = int(token) - 1
+                        if 0 <= index < len(positional):
+                            return positional[index]
+                        return match.group(0)
+                    return params.get(token, match.group(0))
+
+                rendered = re.sub(r'\{\{(\w+)\}\}', _substitute, body_text)
                 return rendered
         except Exception:
             pass
+
+        if positional and not params:
+            # Template not stored locally: show the ordered values instead of
+            # raw JSON so the agent can still read the message.
+            return ' · '.join(str(value) for value in positional if value)
 
         return f'[Plantilla: {name}]'
 
@@ -288,6 +306,8 @@ class ConversationSerializer(serializers.ModelSerializer):
             'active_notes', 'active_take', 'unread_count', 'group',
             'is_pinned', 'pinned_at',
             'is_pinned_by_me', 'pinned_by_me_at',
+            'ops_client_user_id', 'ops_client_linked_at', 'ops_client_match_source',
+            'ops_client_snapshot',
             'created_at', 'updated_at'
         ]
 
@@ -340,6 +360,7 @@ class ConversationListSerializer(serializers.ModelSerializer):
             'last_message_sender', 'last_message_direction', 'group',
             'is_pinned', 'pinned_at',
             'is_pinned_by_me', 'pinned_by_me_at',
+            'ops_client_user_id', 'ops_client_match_source', 'ops_client_snapshot',
         ]
 
     def get_is_pinned_by_me(self, obj):
@@ -436,8 +457,8 @@ class BotExemptContactSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = BotExemptContact
-        fields = ['id', 'contact_phone', 'contact_name', 'created_by', 'created_at']
-        read_only_fields = ['id', 'created_by', 'created_at']
+        fields = ['id', 'contact_phone', 'contact_name', 'source', 'ops_courier_id', 'created_by', 'created_at']
+        read_only_fields = ['id', 'source', 'ops_courier_id', 'created_by', 'created_at']
 
     def validate_contact_phone(self, value):
         cleaned = re.sub(r'\D', '', value)
@@ -681,3 +702,120 @@ class MessageSearchSerializer(serializers.Serializer):
     snippet = serializers.CharField()
     created_at = serializers.DateTimeField()
     rank = serializers.FloatField()
+
+
+class OrderStopSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderStop
+        fields = [
+            'id', 'stop_no', 'ops_order_number', 'service_type', 'dest_address',
+            'lat', 'lng', 'description', 'observation', 'price', 'status',
+            'canceled_at', 'cancel_reason', 'payload', 'last_synced_at',
+        ]
+        read_only_fields = ['id']
+
+
+class OrderSerializer(serializers.ModelSerializer):
+    stops = OrderStopSerializer(many=True, read_only=True)
+    status_label = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = Order
+        fields = [
+            'id', 'conversation', 'ops_batch_id', 'ops_client_user_id',
+            'client_name', 'origin_address', 'payment_method', 'profile',
+            'tools', 'acompanante', 'total', 'status', 'status_label',
+            'notified_statuses', 'source', 'payload', 'stops',
+            'last_synced_at', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class OrderStopInputSerializer(serializers.Serializer):
+    service_type = serializers.CharField(max_length=40)
+    dest_address = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    description = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    observation = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    lat = serializers.FloatField(required=False, allow_null=True)
+    lng = serializers.FloatField(required=False, allow_null=True)
+    price = serializers.DecimalField(
+        max_digits=12, decimal_places=0, min_value=Decimal('0'), required=False,
+    )
+
+
+class OrderClientInputSerializer(serializers.Serializer):
+    ops_client_user_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    name = serializers.CharField(max_length=120, allow_blank=True, required=False)
+    phone = serializers.CharField(max_length=20, allow_blank=True, required=False)
+    address = serializers.CharField(max_length=500, allow_blank=True, required=False)
+
+
+class ClientDefaultAddressInputSerializer(serializers.Serializer):
+    """``POST /api/orders/clients/{id}/addresses/default/`` request."""
+
+    address = serializers.CharField(min_length=3, max_length=255)
+    lat = serializers.FloatField(required=False, allow_null=True, min_value=-90, max_value=90)
+    lng = serializers.FloatField(required=False, allow_null=True, min_value=-180, max_value=180)
+
+
+class OrderDraftMetaSerializer(serializers.Serializer):
+    """Draft provenance echoed by the order sheet after an AI prefill."""
+
+    from_message_id = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    confidence = serializers.FloatField(required=False, allow_null=True)
+    missing = serializers.ListField(
+        child=serializers.CharField(max_length=200), required=False,
+    )
+    model = serializers.CharField(max_length=80, allow_blank=True, required=False)
+    cached = serializers.BooleanField(required=False)
+
+
+class OrderCreateInputSerializer(serializers.Serializer):
+    client = OrderClientInputSerializer(required=False)
+    origin_address = serializers.CharField(max_length=255)
+    payment_method = serializers.ChoiceField(
+        choices=['efectivo', 'nequi'], default='efectivo',
+    )
+    profile = serializers.ChoiceField(
+        choices=['usuario_final', 'negocio'], default='usuario_final',
+    )
+    tools = serializers.ListField(
+        child=serializers.CharField(max_length=50), required=False,
+    )
+    acompanante = serializers.BooleanField(required=False, default=False)
+    send_confirmation = serializers.BooleanField(required=False, default=True)
+    idempotency_key = serializers.CharField(max_length=64, required=False, allow_blank=True)
+    source = serializers.ChoiceField(choices=['agent', 'llm'], required=False, default='agent')
+    draft = OrderDraftMetaSerializer(required=False)
+    stops = OrderStopInputSerializer(many=True)
+
+
+class OrderDraftInputSerializer(serializers.Serializer):
+    """``POST /api/conversations/{id}/orders/draft/`` request (Phase 6)."""
+
+    from_message_id = serializers.IntegerField(min_value=1)
+
+
+class QuoteStopInputSerializer(serializers.Serializer):
+    service_type = serializers.CharField(max_length=40)
+    dest_address = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    description = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    lat = serializers.FloatField(required=False, allow_null=True)
+    lng = serializers.FloatField(required=False, allow_null=True)
+
+
+class OrderQuoteInputSerializer(serializers.Serializer):
+    origin_address = serializers.CharField(max_length=255, allow_blank=True, required=False)
+    origin_lat = serializers.FloatField(required=False, allow_null=True)
+    origin_lng = serializers.FloatField(required=False, allow_null=True)
+    payment_method = serializers.ChoiceField(
+        choices=['efectivo', 'nequi'], default='efectivo',
+    )
+    profile = serializers.ChoiceField(
+        choices=['usuario_final', 'negocio'], default='usuario_final',
+    )
+    tools = serializers.ListField(
+        child=serializers.CharField(max_length=50), required=False,
+    )
+    acompanante = serializers.BooleanField(required=False, default=False)
+    stops = QuoteStopInputSerializer(many=True)

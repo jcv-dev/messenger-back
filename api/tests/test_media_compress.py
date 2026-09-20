@@ -463,6 +463,62 @@ class SendWhatsappOutboundResponseTests(SimpleTestCase):
     @patch('api.views.Message.objects.get')
     @patch('api.views.publish_conversation_update')
     @patch('api.views.urllib.request')
+    def test_template_payload_is_sent_as_an_object(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        """Message.content stores the template as JSON text; Meta needs an object."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            'messages': [{'id': 'wamid.tpl1'}],
+        }).encode()
+        mock_request.urlopen.return_value.__enter__.return_value = mock_response
+        self._setup(mock_msg_get)
+        template = {
+            'name': 'aviso_en_ruta',
+            'language': {'code': 'es'},
+            'components': [{
+                'type': 'body',
+                'parameters': [{'type': 'text', 'text': '#1234'}],
+            }],
+        }
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound(
+            'template', json.dumps(template), '15551234567',
+            message_id=1, conversation_id=1,
+        )
+
+        sent = json.loads(mock_request.Request.call_args.kwargs['data'].decode())
+        self.assertEqual(sent['type'], 'template')
+        self.assertEqual(sent['template'], template)
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
+    def test_invalid_template_payload_marks_failed(
+        self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
+    ):
+        mock_msg = self._setup(mock_msg_get)
+
+        from api.views import send_whatsapp_outbound
+
+        send_whatsapp_outbound(
+            'template', 'not-json', '15551234567',
+            message_id=1, conversation_id=1,
+        )
+
+        self.assertEqual(mock_msg.metadata['status'], 'failed')
+        self.assertEqual(mock_msg.metadata['send_error_code'], 100)
+        mock_request.urlopen.assert_not_called()
+
+    @patch('api.views.acquire_rate_capacity')
+    @patch('api.views.Conversation.objects.get')
+    @patch('api.views.Message.objects.get')
+    @patch('api.views.publish_conversation_update')
+    @patch('api.views.urllib.request')
     def test_urlopen_called_with_timeout(
         self, mock_request, mock_publish, mock_msg_get, mock_conv_get, mock_acquire,
     ):

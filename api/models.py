@@ -84,6 +84,14 @@ class Conversation(models.Model):
     custom_name = models.CharField(max_length=255, null=True, blank=True)
     last_message = models.TextField(blank=True)
     last_message_at = models.DateTimeField(null=True, blank=True)
+    # ── Ops (Domiitulua) client link ────────────────────────────────────
+    ops_client_user_id = models.IntegerField(null=True, blank=True, db_index=True)
+    ops_client_linked_at = models.DateTimeField(null=True, blank=True)
+    ops_client_match_source = models.CharField(
+        max_length=20, blank=True, default='',
+        choices=[('auto_phone', 'Auto (teléfono)'), ('manual', 'Manual'), ('order', 'Pedido')],
+    )
+    ops_client_snapshot = models.JSONField(default=dict, blank=True)
     group = models.ForeignKey(
         CityGroup, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='conversations',
@@ -317,6 +325,9 @@ class AuditLog(models.Model):
         ('send_message', 'Send Message'),
         ('delete_conversation', 'Delete Conversation'),
         ('toggle_status', 'Toggle Status'),
+        ('link_client', 'Link Client'),
+        ('unlink_client', 'Unlink Client'),
+        ('cancel_order', 'Cancel Order'),
     ]
 
     actor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='audit_logs')
@@ -377,8 +388,15 @@ class MessageSuggestion(models.Model):
 
 class BotExemptContact(models.Model):
     """Phone numbers pre-registered as not handled by the bot."""
+    SOURCE_CHOICES = [
+        ('manual', 'Manual'),
+        ('ops_sync', 'Sincronizado'),
+    ]
+
     contact_phone = models.CharField(max_length=50, unique=True)
     contact_name = models.CharField(max_length=255, blank=True)
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='manual')
+    ops_courier_id = models.IntegerField(null=True, blank=True, db_index=True)
     created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -389,6 +407,102 @@ class BotExemptContact(models.Model):
         ordering = ['-created_at']
         verbose_name = "Bot Exempt Contact"
         verbose_name_plural = "Bot Exempt Contacts"
+
+
+class IntegrationApiKey(models.Model):
+    """API key for server-to-server integrations (ops → Messager).
+
+    Only the SHA-256 hash is stored; the raw key is shown once at creation.
+    """
+    name = models.CharField(max_length=120)
+    key_hash = models.CharField(max_length=64, unique=True)
+    prefix = models.CharField(max_length=12)
+    scopes = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} ({self.prefix}…)"
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Integration API Key"
+        verbose_name_plural = "Integration API Keys"
+
+
+class Order(models.Model):
+    """Local mirror of a Domiitulua pedido (batch of one or more stops)."""
+    STATUS_CHOICES = [
+        ('draft', 'Borrador'), ('pending', 'Enviando'), ('failed', 'Fallido'),
+        ('disponible', 'Buscando domiciliario'), ('asignado', 'Asignado'),
+        ('confirmado', 'Confirmado'), ('en_ruta', 'En camino'),
+        ('entregado', 'Entregado'), ('cancelado', 'Cancelado'),
+    ]
+
+    conversation = models.ForeignKey(Conversation, related_name='orders', on_delete=models.CASCADE)
+    ops_batch_id = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+    ops_client_user_id = models.IntegerField(null=True, blank=True, db_index=True)
+    client_name = models.CharField(max_length=255, blank=True, default='')
+    origin_address = models.TextField(blank=True, default='')
+    payment_method = models.CharField(max_length=20, blank=True, default='')
+    profile = models.CharField(max_length=20, blank=True, default='')
+    tools = models.JSONField(default=list, blank=True)
+    acompanante = models.BooleanField(default=False)
+    total = models.DecimalField(max_digits=12, decimal_places=0, default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft', db_index=True)
+    notified_statuses = models.JSONField(default=list, blank=True)
+    source = models.CharField(max_length=10, default='agent')  # agent | llm
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    payload = models.JSONField(default=dict, blank=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Pedido {self.ops_batch_id or self.pk} ({self.get_status_display()})"
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = "Order"
+        verbose_name_plural = "Orders"
+        indexes = [
+            models.Index(fields=['conversation', 'status'], name='order_conv_status_idx'),
+        ]
+
+
+class OrderStop(models.Model):
+    """Single parada of an Order.
+
+    Multi-stop pedidos are ops ``comandas``: one ops order with N stops and a
+    single ``order_number`` shared by every local stop. Legacy per-stop orders
+    keep their own number.
+    """
+    order = models.ForeignKey(Order, related_name='stops', on_delete=models.CASCADE)
+    stop_no = models.PositiveSmallIntegerField(default=1)
+    ops_order_number = models.BigIntegerField(null=True, blank=True, db_index=True)
+    service_type = models.CharField(max_length=40)
+    dest_address = models.TextField(blank=True, default='')
+    lat = models.FloatField(null=True, blank=True)
+    lng = models.FloatField(null=True, blank=True)
+    description = models.CharField(max_length=500, blank=True, default='')
+    observation = models.CharField(max_length=500, blank=True, default='')
+    price = models.DecimalField(max_digits=12, decimal_places=0, default=0)
+    status = models.CharField(max_length=20, default='pending')
+    canceled_at = models.DateTimeField(null=True, blank=True)
+    cancel_reason = models.CharField(max_length=500, blank=True, default='')
+    payload = models.JSONField(default=dict, blank=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Parada {self.stop_no} · {self.dest_address or self.service_type}"
+
+    class Meta:
+        ordering = ['stop_no', 'id']
+        verbose_name = "Order Stop"
+        verbose_name_plural = "Order Stops"
 
 
 class BotSchedule(models.Model):

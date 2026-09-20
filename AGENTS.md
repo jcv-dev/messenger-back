@@ -251,6 +251,53 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
 - Location messages accept `content` as dict: `{longitude, latitude, name, address}`.
 - WhatsApp rate limiter: `api/rate_limiter.py` — Redis sliding window per `phone_number_id`, 70 req/s default. Blocks until capacity available, fails open after 30s.
 
+## Order integration (Domiitulua ops, plan `domi-messager-ops-integration.md`)
+
+- `api/integrations/orders.py` — order creation mirror (`POST /api/conversations/{id}/orders/`),
+  refresh, batch/stop cancellation. `api/integrations/clients.py` — conversation ↔ ops
+  client link. `api/integrations/ops.py` — signed httpx client.
+- `api/integrations/status_notifications.py` (Phase 5) — aggregate batch
+  notifications. `resolve_transition()` returns only the highest satisfied state
+  (`entregado` > `en_ruta` > `asignado`; all-canceled is terminal) and
+  `claim_transition()` dedupes through `Order.notified_statuses` with a row lock
+  inside the webhook transaction. Texts/templates are `BotConfig` keys
+  `order_status_messages`, `order_status_templates` and
+  `order_status_notifications_enabled` (seeded by migrations `0041`/`0042`).
+  `order_status_templates` params are value-key strings for positional templates
+  or `{name, value}` objects for named ones; the approved `aviso_*` templates use
+  the named variable `order_code`.
+- `api/integrations/notify.py` — `create_and_send_outbound(..., fallback_template=,
+  preview=)`; `_deliver_outbound()` runs in the WhatsApp send pool, and when
+  `send_whatsapp_outbound` records Meta `131047`/`470` it marks the text
+  `metadata.status='cancelled'` (excluded by `MessageViewSet`, removed live by the
+  frontend) and sends the approved `aviso_*` template instead. `send_template`
+  payloads store JSON text; `send_whatsapp_outbound` parses it into an object
+  before calling Meta.
+- `WHATSAPP_GRAPH_BASE_URL` (setting, default `https://graph.facebook.com/v20.0`)
+  redirects the outbound send path, which is how the live service-window fallback
+  is exercised with a local mock.
+- `api/integrations/draft.py` (Phase 6) — the LLM order draft. DeepSeek V4.1
+  Flash (`ORDER_LLM_MODEL=deepseek-flash`, `ORDER_LLM_DISABLE_THINKING=true`)
+  with two calculator tools (`buscar_direccion`, `detalles_direccion`), JSON
+  schema validation with one repair retry, and a 15-min cache keyed by
+  `conversation + from_message + last_message`. The prompt includes the service
+  catalog, calculator tools, the linked client, saved addresses with coordinates
+  and the last 3 orders (so "mándame un domiciliario" resolves from stored data).
+  Endpoint: `POST /api/conversations/{id}/orders/draft/` (`orders_draft` action,
+  DRF `ScopedRateThrottle` scope `order_draft`, 10/min/user). `llm.chat()` is the
+  tool-calling client; `chat_json()` stays for simple JSON calls.
+- Saved-address defaults (Phase 7): `POST /api/orders/clients/{id}/addresses/default/`
+  (`order_views.order_client_default_address`, serializer
+  `ClientDefaultAddressInputSerializer`) proxies the ops `clients:write` endpoint —
+  upserts the address in the client history and replaces the previous default.
+  `GET /api/orders/clients/{id}/addresses/` still returns all 30 ops rows (now with
+  `updated_at`); the default + 4 chip cap lives in the frontend. Ops also bumps
+  `use_count`/`updated_at` for the destinations of every real order, which drives the
+  recency order.
+  Confirming a drafted order sends `source='llm'` and
+  `draft: {from_message_id, confidence, missing, model, cached}`; the serializer
+  validates them and `create_order` stores the block in `Order.payload['draft']`.
+
 ## Database
 
 - PostgreSQL. Point at pgbouncer in production (`CONN_MAX_AGE=0`).

@@ -8,7 +8,7 @@ from django.urls import path
 from django.conf import settings
 from django.contrib import messages
 from django.http import HttpResponseNotAllowed
-from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, CityGroup, UserProfile, BotExemptContact, TemplateExclusion, Call
+from .models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, StickerAsset, CityGroup, UserProfile, BotExemptContact, TemplateExclusion, Call, IntegrationApiKey, Order, OrderStop, BotConfig
 
 import json
 import urllib.request
@@ -78,8 +78,43 @@ class UserProfileAdmin(admin.ModelAdmin):
 
 @admin.register(BotExemptContact)
 class BotExemptContactAdmin(admin.ModelAdmin):
-    list_display = ['contact_phone', 'contact_name', 'created_by', 'created_at']
+    list_display = ['contact_phone', 'contact_name', 'source', 'ops_courier_id', 'created_by', 'created_at']
+    list_filter = ['source']
     search_fields = ['contact_phone', 'contact_name']
+
+
+@admin.register(BotConfig)
+class BotConfigAdmin(admin.ModelAdmin):
+    list_display = ['key', 'description', 'updated_at']
+    search_fields = ['key', 'description']
+    ordering = ['key']
+
+
+@admin.register(IntegrationApiKey)
+class IntegrationApiKeyAdmin(admin.ModelAdmin):
+    list_display = ['name', 'prefix', 'is_active', 'last_used_at', 'created_at']
+    list_filter = ['is_active']
+    search_fields = ['name', 'prefix']
+    readonly_fields = ['key_hash', 'prefix', 'last_used_at', 'created_at', 'updated_at']
+
+
+class OrderStopInline(admin.TabularInline):
+    model = OrderStop
+    extra = 0
+    fields = [
+        'stop_no', 'ops_order_number', 'service_type', 'dest_address',
+        'status', 'price', 'cancel_reason', 'last_synced_at',
+    ]
+    readonly_fields = ['last_synced_at']
+
+
+@admin.register(Order)
+class OrderAdmin(admin.ModelAdmin):
+    list_display = ['id', 'ops_batch_id', 'conversation', 'status', 'total', 'client_name', 'source', 'created_at']
+    list_filter = ['status', 'source']
+    search_fields = ['ops_batch_id', 'client_name', 'conversation__contact_name', 'conversation__contact_phone']
+    readonly_fields = ['created_at', 'updated_at', 'last_synced_at']
+    inlines = [OrderStopInline]
 
 
 @admin.register(TemplateExclusion)

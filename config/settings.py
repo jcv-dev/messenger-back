@@ -156,6 +156,8 @@ REST_FRAMEWORK = {
     'DEFAULT_THROTTLE_RATES': {
         'login': '5/min',
         'user': '500/min',
+        # Phase 6: one LLM call per order draft, 10 drafts/min/user
+        'order_draft': '10/min',
     },
 }
 
@@ -173,6 +175,11 @@ WHATSAPP_APP_ID = config('WHATSAPP_APP_ID', default='')
 WHATSAPP_API_TOKEN = config('WHATSAPP_API_TOKEN', default='')
 WHATSAPP_PHONE_NUMBER = config('WHATSAPP_PHONE_NUMBER', default='')
 WHATSAPP_PHONE_NUMBER_ID = config('WHATSAPP_PHONE_NUMBER_ID', default='')
+# Base URL for outbound Graph API calls; overridable so tests/live harnesses can
+# point the send path at a local mock (Phase 5 fallback verification).
+WHATSAPP_GRAPH_BASE_URL = config(
+    'WHATSAPP_GRAPH_BASE_URL', default='https://graph.facebook.com/v20.0',
+).rstrip('/')
 WEBHOOK_TOKEN = config('WEBHOOK_TOKEN', default='')
 WHATSAPP_APP_SECRET = config('WHATSAPP_APP_SECRET', default='')
 WA_RATE_LIMIT_THRESHOLD = config('WA_RATE_LIMIT_THRESHOLD', default=70, cast=int)
@@ -215,7 +222,29 @@ else:
 
 # Bot / Calculator / Gemini
 DOMII_CALCULATOR_URL = config('DOMII_CALCULATOR_URL', default='http://calculator:8000')
+DOMII_CALCULATOR_API_KEY = config('DOMII_CALCULATOR_API_KEY', default='')
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
+
+# Ops integration (Domiitulua public API v1) — server-to-server only
+OPS_API_URL = config('OPS_API_URL', default='')
+OPS_API_KEY = config('OPS_API_KEY', default='')
+OPS_TIMEOUT = config('OPS_TIMEOUT', default=15, cast=float)
+# HMAC secret for ops → Messager webhooks (X-Signature)
+INTEGRATION_WEBHOOK_SECRET = config('INTEGRATION_WEBHOOK_SECRET', default='')
+
+# DeepSeek (OpenAI-compatible) for the button-driven order draft.
+# The draft runs on V4.1 Flash with thinking disabled (plan Phase 6); the
+# provider exposes it as ``deepseek-flash``.
+ORDER_LLM_BASE_URL = config('ORDER_LLM_BASE_URL', default='https://api.deepseek.com/v1')
+ORDER_LLM_API_KEY = config('ORDER_LLM_API_KEY', default='')
+ORDER_LLM_MODEL = config('ORDER_LLM_MODEL', default='deepseek-flash')
+ORDER_LLM_TIMEOUT = config('ORDER_LLM_TIMEOUT', default=30, cast=int)
+ORDER_LLM_TEMPERATURE = config('ORDER_LLM_TEMPERATURE', default=0.2, cast=float)
+# Send ``thinking: {"type": "disabled"}`` so Flash does not burn tokens on
+# reasoning; set to false for providers that reject the parameter.
+ORDER_LLM_DISABLE_THINKING = config('ORDER_LLM_DISABLE_THINKING', default=True, cast=bool)
+# Order draft rounds: each draft confirms addresses through the calculator tools
+ORDER_LLM_MAX_TOOL_ROUNDS = config('ORDER_LLM_MAX_TOOL_ROUNDS', default=4, cast=int)
 
 # Bot operating hours — used in system prompt and FAQ router
 BOT_OPERATING_HOURS = config(

@@ -149,6 +149,16 @@ def get_send_delay_seconds():
     return int(get_config('send_delay_seconds', 10))
 
 
+def get_order_created_message():
+    """Confirmation text sent after an agent creates an order from the Messager."""
+    from api.integrations.orders import DEFAULT_ORDER_CREATED_MESSAGE
+
+    value = get_config('order_created_message', DEFAULT_ORDER_CREATED_MESSAGE)
+    if not isinstance(value, str) or not value.strip():
+        return DEFAULT_ORDER_CREATED_MESSAGE
+    return value
+
+
 def get_max_user_message_length():
     return int(get_config('max_user_message_length', settings.BOT_MAX_USER_MESSAGE_LENGTH))
 

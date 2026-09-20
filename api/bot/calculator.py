@@ -6,6 +6,18 @@ import httpx
 from django.conf import settings
 
 CALCULATOR_BASE = settings.DOMII_CALCULATOR_URL
+CALCULATOR_API_KEY = getattr(settings, 'DOMII_CALCULATOR_API_KEY', '')
+
+
+def _client(timeout: int) -> httpx.AsyncClient:
+    """httpx client for the calculator, sending the API key on every call."""
+    headers = {}
+    if CALCULATOR_API_KEY:
+        headers['X-API-Key'] = CALCULATOR_API_KEY
+    return httpx.AsyncClient(
+        base_url=CALCULATOR_BASE, timeout=timeout, headers=headers,
+        follow_redirects=True,
+    )
 
 # ---------------------------------------------------------------------------
 #  Input validation helpers
@@ -117,7 +129,7 @@ async def calculate_price(profile, segments, tools=None, payment_method="efectiv
         payment_method = "efectivo"
     valid_tools = [_sanitize(t, 50) for t in (tools or []) if isinstance(t, str)]
 
-    async with httpx.AsyncClient(base_url=CALCULATOR_BASE, timeout=15) as client:
+    async with _client(15) as client:
         return await _request_with_retry(client, "POST", "/api/calculate-price", json={
             "profile": profile,
             "segments": sanitized_segments,
@@ -131,7 +143,7 @@ async def geocode_search(query: str):
     query = _sanitize(query, 200)
     if not query:
         return {"error": "Query vacía", "results": []}
-    async with httpx.AsyncClient(base_url=CALCULATOR_BASE, timeout=10) as client:
+    async with _client(10) as client:
         return await _request_with_retry(client, "GET", "/api/geocode/search", params={"q": query})
 
 
@@ -139,19 +151,19 @@ async def geocode_details(place_id: str):
     if not _validate_place_id(_sanitize(place_id, 500)):
         return {"error": "place_id inválido"}
     place_id = _sanitize(place_id, 500)
-    async with httpx.AsyncClient(base_url=CALCULATOR_BASE, timeout=10) as client:
+    async with _client(10) as client:
         return await _request_with_retry(client, "GET", "/api/geocode/details", params={"place_id": place_id})
 
 
 async def get_tools():
-    async with httpx.AsyncClient(base_url=CALCULATOR_BASE, timeout=10) as client:
+    async with _client(10) as client:
         resp = await client.get("/api/tools")
         resp.raise_for_status()
         return resp.json()
 
 
 async def get_whatsapp_config():
-    async with httpx.AsyncClient(base_url=CALCULATOR_BASE, timeout=10) as client:
+    async with _client(10) as client:
         resp = await client.get("/api/config/whatsapp")
         resp.raise_for_status()
         return resp.json()

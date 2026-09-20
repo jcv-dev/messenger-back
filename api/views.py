@@ -8,6 +8,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.filters import SearchFilter
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from django.utils import timezone
 from django.contrib.auth.models import User
@@ -54,6 +55,7 @@ from django.core.cache import cache
 
 from .realtime import publish, subscribe, unsubscribe
 from .rate_limiter import acquire as acquire_rate_capacity
+from .integrations.clients import schedule_auto_link
 
 logger = logging.getLogger('api')
 
@@ -643,7 +645,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
         return
 
     try:
-        url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+        url = f"{settings.WHATSAPP_GRAPH_BASE_URL}/{phone_number_id}/messages"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
@@ -788,9 +790,25 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                         pass
                 payload[message_type] = media_payload
         elif message_type == 'template':
-            # content is a dict: {name, language, components}
+            # content is a dict or a JSON string: {name, language, components}
+            template = content
+            if isinstance(template, str):
+                try:
+                    template = json.loads(template)
+                except (ValueError, TypeError):
+                    template = None
+            if not isinstance(template, dict) or not template.get('name'):
+                logger.error(
+                    'WhatsApp template payload invalid for message %s: %r',
+                    message_id, str(content)[:200],
+                )
+                _mark_send_failed(
+                    message_id, conversation_id,
+                    'Plantilla de WhatsApp inválida', 100,
+                )
+                return
             payload['type'] = 'template'
-            payload['template'] = content
+            payload['template'] = template
         else:
             payload['type'] = 'text'
             payload['text'] = {"body": content}
@@ -1004,6 +1022,10 @@ def initiate_call(to_number=None, recipient_bsuid=None, sdp_offer=None,
 class ConversationViewSet(viewsets.ModelViewSet):
     """ViewSet for managing conversations"""
     permission_classes = [IsAuthenticated]
+    # Per-action DRF throttle scope (the ``orders/draft`` action sets
+    # ``order_draft``). DRF validates ``@action`` kwargs against the class, so
+    # the attribute must exist even when no action overrides it.
+    throttle_scope = None
 
     def get_permissions(self):
         if self.action in ('destroy', 'remove_expired_tags', 'send_template'):
@@ -1321,6 +1343,81 @@ class ConversationViewSet(viewsets.ModelViewSet):
         publish_conversation_update(conversation)
 
         return Response(ConversationSerializer(conversation).data)
+
+    @action(detail=True, methods=['post'], url_path='link-client')
+    def link_client(self, request, pk=None):
+        """Link or unlink this conversation to an ops (Domiitulua) client.
+
+        Body ``{"ops_client_user_id": 88}`` links (optionally with a
+        ``client`` snapshot for the card); ``{}`` or ``{"ops_client_user_id":
+        null}`` unlinks.
+        """
+        from .integrations import ops as ops_client
+        from .integrations.clients import (
+            MATCH_SOURCE_MANUAL, fetch_client_by_phone, link_conversation,
+            unlink_conversation,
+        )
+
+        conversation = self.get_object()
+        raw_id = request.data.get('ops_client_user_id')
+
+        if raw_id in (None, '', False):
+            if conversation.ops_client_user_id:
+                unlink_conversation(conversation)
+                _log_audit(request.user, conversation, 'unlink_client')
+                publish_conversation_update(conversation)
+            return Response(ConversationSerializer(conversation).data)
+
+        try:
+            client_id = int(raw_id)
+        except (TypeError, ValueError):
+            return Response(
+                {'error': 'ops_client_user_id debe ser un entero.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if client_id <= 0:
+            return Response(
+                {'error': 'ops_client_user_id inválido.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        snapshot = request.data.get('client')
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        if not snapshot and conversation.contact_phone and ops_client.is_configured():
+            # Best effort: enrich from the conversation phone when it matches.
+            resolved = fetch_client_by_phone(conversation.contact_phone, timeout=5)
+            if resolved and resolved['id'] == client_id:
+                snapshot = resolved
+
+        link_conversation(
+            conversation, client_id, snapshot=snapshot, source=MATCH_SOURCE_MANUAL,
+        )
+        _log_audit(request.user, conversation, 'link_client', str(client_id))
+        publish_conversation_update(conversation)
+        return Response(ConversationSerializer(conversation).data)
+
+    @action(detail=True, methods=['get', 'post'], url_path='orders')
+    def orders(self, request, pk=None):
+        """List or create pedidos for this conversation (plan §4.3)."""
+        from .order_views import create_conversation_order, list_conversation_orders
+
+        conversation = self.get_object()
+        if request.method == 'POST':
+            return create_conversation_order(request, conversation)
+        return list_conversation_orders(request, conversation)
+
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path='orders/draft',
+        throttle_classes=[ScopedRateThrottle],
+        throttle_scope='order_draft',
+    )
+    def orders_draft(self, request, pk=None):
+        """LLM order draft from a message onward (plan §4.3/§6.2, Phase 6)."""
+        from .order_views import draft_conversation_order
+
+        return draft_conversation_order(request, self.get_object())
 
     @action(detail=True, methods=['post'])
     def toggle_pin(self, request, pk=None):
@@ -1761,45 +1858,8 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if template.category == 'MARKETING' and TemplateExclusion.objects.filter(contact_phone=conversation.contact_phone).exists():
             return Response({'status': 'skipped', 'reason': 'El contacto solicitó no recibir más promos'})
 
-        # Build components with parameter substitution
-        components = []
-        for comp in template.components:
-            comp_type = comp.get('type')
-            if comp_type == 'body':
-                params = []
-                if parameters:
-                    for p in parameters:
-                        params.append({
-                            'type': 'text',
-                            'parameter_name': p,
-                            'text': parameters[p],
-                        })
-                components.append({'type': 'body', 'parameters': params})
-            elif comp_type == 'header' and comp.get('format') in ('image', 'video', 'document'):
-                header_param = parameters.get('header_media_id')
-                if header_param:
-                    components.append({
-                        'type': 'header',
-                        'parameters': [{'type': comp['format'], comp['format']: {'id': header_param}}],
-                    })
-            elif comp_type == 'buttons':
-                button_params = parameters.get('buttons', [])
-                btn_components = []
-                for i, btn in enumerate(comp.get('buttons', [])):
-                    if btn['type'] == 'url' and i < len(button_params):
-                        btn_components.append({
-                            'type': 'url',
-                            'text': btn['text'],
-                            'url': button_params[i],
-                        })
-                if btn_components:
-                    components.append({'type': 'button', 'sub_type': 'url', 'index': '0', 'parameters': btn_components})
-
-        payload = {
-            'name': template.name,
-            'language': {'code': template.language},
-            'components': components,
-        }
+        from .integrations.notify import build_template_payload
+        payload = build_template_payload(template, parameters)
 
         message = Message.objects.create(
             conversation=conversation,
@@ -2288,6 +2348,13 @@ class BotConfigViewSet(viewsets.ReadOnlyModelViewSet):
             return Response({'detail': 'value is required'}, status=status.HTTP_400_BAD_REQUEST)
         config.value = value
         config.save(update_fields=['value'])
+        # Apply the change immediately instead of waiting for the 30 s TTL.
+        try:
+            from .bot.config import _clear_cache
+
+            _clear_cache()
+        except Exception:
+            pass
         return Response(BotConfigSerializer(config).data)
 
 
@@ -3519,6 +3586,11 @@ def whatsapp_webhook(request):
                     if existing_custom:
                         conversation.custom_name = existing_custom
                         conversation.save(update_fields=['custom_name'])
+
+                # Auto-link to an ops client for unknown phones (daemon thread,
+                # never blocks the webhook).
+                if not conversation.ops_client_user_id and wa_id and wa_id.isdigit():
+                    schedule_auto_link(conversation.id, wa_id)
 
                 if BotExemptContact.objects.filter(contact_phone=wa_id).exists():
                     if not conversation.tags.filter(tag_name="Domii", expires_at__isnull=True).exists():

@@ -4,6 +4,21 @@ URL configuration for API
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import ConversationViewSet, MessageViewSet, UserViewSet, CityGroupViewSet, StickerAssetViewSet, BotExemptContactViewSet, BotScheduleViewSet, BotConfigViewSet, WhatsAppTemplateViewSet, TemplateExclusionViewSet, AuditLogViewSet, CannedResponseViewSet, media_proxy, serve_media, static_map, issue_sse_token, call_answer, call_reject, call_terminate, call_initiate, call_list, call_active, call_turn_config, call_settings, call_recordings, presence_heartbeat, presence_list, push_subscribe, push_unsubscribe, export_conversations_csv, agent_stats
+from .order_views import (
+    order_cancel,
+    order_client_addresses,
+    order_client_default_address,
+    order_client_orders,
+    order_client_search,
+    order_detail,
+    order_geocode_details,
+    order_geocode_search,
+    order_quote,
+    order_refresh,
+    order_services,
+    order_stop_cancel,
+    order_tools,
+)
 
 router = DefaultRouter()
 router.register(r'conversations', ConversationViewSet, basename='conversation')
@@ -21,6 +36,24 @@ router.register(r'canned-responses', CannedResponseViewSet, basename='canned-res
 
 urlpatterns = [
     path('conversations/export/', export_conversations_csv, name='conversations-export'),
+    path('orders/services/', order_services, name='order-services'),
+    path('orders/tools/', order_tools, name='order-tools'),
+    path('orders/geocode/search/', order_geocode_search, name='order-geocode-search'),
+    path('orders/geocode/details/', order_geocode_details, name='order-geocode-details'),
+    path('orders/quote/', order_quote, name='order-quote'),
+    path('orders/clients/', order_client_search, name='order-client-search'),
+    path('orders/clients/<int:client_id>/addresses/', order_client_addresses, name='order-client-addresses'),
+    path(
+        'orders/clients/<int:client_id>/addresses/default/',
+        order_client_default_address,
+        name='order-client-addresses-default',
+    ),
+    path('orders/clients/<int:client_id>/orders/', order_client_orders, name='order-client-orders'),
+    path('orders/<int:order_id>/', order_detail, name='order-detail'),
+    path('orders/<int:order_id>/refresh/', order_refresh, name='order-refresh'),
+    path('orders/<int:order_id>/cancel/', order_cancel, name='order-cancel'),
+    path('orders/<int:order_id>/stops/<int:stop_id>/cancel/', order_stop_cancel, name='order-stop-cancel'),
+    path('integrations/', include('api.integrations.urls')),
     path('', include(router.urls)),
     path('sse-token/', issue_sse_token, name='issue-sse-token'),
     path('media-proxy/', media_proxy, name='media-proxy'),
