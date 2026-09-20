@@ -445,6 +445,11 @@ class Order(models.Model):
     conversation = models.ForeignKey(Conversation, related_name='orders', on_delete=models.CASCADE)
     ops_batch_id = models.CharField(max_length=32, null=True, blank=True, db_index=True)
     ops_client_user_id = models.IntegerField(null=True, blank=True, db_index=True)
+    # Domiciliario asignado en la creación (modo manual). Se llena con la
+    # respuesta de ops y se mantiene al día con los eventos de estado.
+    ops_courier_user_id = models.IntegerField(null=True, blank=True, db_index=True)
+    courier_name = models.CharField(max_length=255, blank=True, default='')
+    courier_code = models.CharField(max_length=12, blank=True, default='')
     client_name = models.CharField(max_length=255, blank=True, default='')
     origin_address = models.TextField(blank=True, default='')
     payment_method = models.CharField(max_length=20, blank=True, default='')

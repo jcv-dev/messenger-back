@@ -292,7 +292,34 @@ def build_ops_payload(order: Order, client_ref: dict, data: dict) -> dict:
         payload['client_name'] = client_ref.get('name') or ''
         if client_ref.get('phone'):
             payload['client_phone'] = client_ref['phone']
+
+    # Phase 8: con un domi elegido la comanda se asigna de inmediato en modo
+    # manual (ops valida deuda, suspende su turno y lo notifica). Sin domi el
+    # pedido sigue saliendo libre, como hasta ahora.
+    courier = data.get('courier') or {}
+    if data.get('assignment') == 'manual' and courier.get('ops_courier_user_id'):
+        payload['courier_user_id'] = int(courier['ops_courier_user_id'])
+        payload['mode'] = 'manual'
+    else:
+        payload['mode'] = 'libre'
     return payload
+
+
+def _ops_validation_message(exc) -> str:
+    """Mensaje legible de un 422 de ops (deuda, courier inválido, etc.)."""
+    payload = exc.payload if isinstance(exc.payload, dict) else {}
+    details = payload.get('details')
+    if isinstance(details, dict):
+        for key in ('courier_user_id', 'items', 'client_user_id', 'origin_address'):
+            values = details.get(key)
+            if isinstance(values, list) and values:
+                return str(values[0])[:300]
+            if isinstance(values, str) and values.strip():
+                return values[:300]
+    error = payload.get('error')
+    if isinstance(error, str) and error.strip():
+        return error.strip()[:300]
+    return getattr(exc, 'message', '') or 'Ops rechazó el pedido.'
 
 
 def _response_order_numbers(response: dict, stop_count: int) -> list:
@@ -316,11 +343,18 @@ def apply_ops_response(order: Order, response: dict, client_ref: dict) -> Order:
     """Mirror the ops creation response onto the local batch."""
     now = timezone.now()
     client = response.get('client') or {}
+    courier = response.get('courier') if isinstance(response.get('courier'), dict) else {}
 
     order.ops_batch_id = str(response.get('batch_id') or '')[:32] or None
     order.status = response.get('status') or 'disponible'
     order.ops_client_user_id = client.get('id') or client_ref.get('user_id') or None
     order.client_name = (client.get('name') or client_ref.get('name') or '')[:255]
+    if courier.get('id'):
+        order.ops_courier_user_id = int(courier['id'])
+    if courier.get('name'):
+        order.courier_name = str(courier['name'])[:255]
+    if courier.get('code'):
+        order.courier_code = str(courier['code'])[:12]
     order.last_synced_at = now
 
     stops = list(order.stops.order_by('stop_no', 'id'))
@@ -337,6 +371,7 @@ def apply_ops_response(order: Order, response: dict, client_ref: dict) -> Order:
     order.total = sum((stop.price or 0) for stop in stops)
     order.save(update_fields=[
         'ops_batch_id', 'status', 'ops_client_user_id', 'client_name',
+        'ops_courier_user_id', 'courier_name', 'courier_code',
         'last_synced_at', 'payload', 'total', 'updated_at',
     ])
     return order
@@ -382,6 +417,29 @@ def create_order(conversation, data: dict, user):
     stops_data = validate_stops(data.get('stops') or [])
     client_ref = resolve_client(conversation, data.get('client'))
 
+    # Phase 8: domi elegido en el selector (modo manual). Sin domi el pedido
+    # sale libre y ops lo reparte como siempre.
+    assignment = (data.get('assignment') or 'libre').strip().lower()
+    courier_ref = data.get('courier') or {}
+    courier_id = courier_ref.get('ops_courier_user_id')
+
+    if assignment == 'manual':
+        if not courier_id:
+            raise OrderValidationError(
+                'Selecciona un domiciliario para asignar el pedido.', field='courier',
+            )
+        courier_id = int(courier_id)
+    else:
+        # ``libre``: un courier suelto en el payload se ignora, el pedido nunca
+        # se asigna por accidente.
+        assignment = 'libre'
+        courier_id = None
+        courier_ref = {}
+
+    # Normalized copy for ``build_ops_payload``: a stray courier with
+    # ``assignment=libre`` must never reach ops as a manual assignment.
+    data = {**data, 'assignment': assignment, 'courier': courier_ref or None}
+
     idem_key = (data.get('idempotency_key') or '').strip()[:64]
     cache_key = f'order:idem:{user.id}:{idem_key}' if idem_key else None
     if cache_key:
@@ -406,6 +464,15 @@ def create_order(conversation, data: dict, user):
             'acompanante': bool(data.get('acompanante')),
             'send_confirmation': bool(data.get('send_confirmation', True)),
             'idempotency_key': idem_key,
+            'assignment': assignment,
+            'courier': (
+                {
+                    'ops_courier_user_id': courier_id,
+                    'name': (courier_ref.get('name') or '')[:255],
+                    'code': (courier_ref.get('code') or '')[:12],
+                }
+                if courier_id else None
+            ),
         },
         'client_ref': client_ref,
     }
@@ -417,6 +484,9 @@ def create_order(conversation, data: dict, user):
     order = Order.objects.create(
         conversation=conversation,
         ops_client_user_id=client_ref.get('user_id') or None,
+        ops_courier_user_id=courier_id or None,
+        courier_name=(courier_ref.get('name') or '')[:255],
+        courier_code=(courier_ref.get('code') or '')[:12],
         client_name=(client_ref.get('name') or '')[:255],
         origin_address=(data.get('origin_address') or '').strip()[:500],
         payment_method=data.get('payment_method') or 'efectivo',
@@ -448,10 +518,17 @@ def create_order(conversation, data: dict, user):
     try:
         response = ops.create_order(ops_payload, idempotency_key=idem_key or None)
     except ops.OpsAPIError as exc:
-        order.status = 'failed'
-        order.save(update_fields=['status', 'updated_at'])
         if cache_key:
             cache.delete(cache_key)
+        if exc.status_code == 422:
+            # Validación de ops (deuda del domi, courier inválido…): es un dato
+            # corregible, no un pedido fallido. Se descarta el borrador local
+            # para que el agente corrija en la hoja y reintente.
+            order.delete()
+            logger.info('Order draft discarded after ops validation error: %s', exc)
+            raise OrderValidationError(_ops_validation_message(exc), field='courier') from exc
+        order.status = 'failed'
+        order.save(update_fields=['status', 'updated_at'])
         logger.warning('Order %s failed at ops: %s', order.id, exc)
         raise OrderCreationFailed(order, exc.message) from exc
 
@@ -505,10 +582,19 @@ def refresh_order(order: Order) -> Order:
         if stop.ops_order_number:
             groups.setdefault(int(stop.ops_order_number), []).append(stop)
 
+    courier_code = ''
     for number, group in groups.items():
         data = ops.get_order(number)
         if not isinstance(data, dict) or not data.get('ok'):
             continue
+
+        # El detalle de ops trae el código corto del domi (`sn42`); el nombre
+        # solo se conoce al crear desde el selector.
+        courier = data.get('courier')
+        if isinstance(courier, str) and courier.strip():
+            courier_code = courier.strip()[:12]
+        elif isinstance(courier, dict) and courier.get('code'):
+            courier_code = str(courier['code']).strip()[:12]
 
         entries = {}
         for entry in (data.get('stops') or []):
@@ -540,7 +626,11 @@ def refresh_order(order: Order) -> Order:
 
     recompute_order_status(order)
     order.last_synced_at = now
-    order.save(update_fields=['status', 'total', 'last_synced_at', 'updated_at'])
+    if courier_code:
+        order.courier_code = courier_code
+    order.save(update_fields=[
+        'status', 'total', 'last_synced_at', 'updated_at', 'courier_code',
+    ])
     _publish_updates(order.conversation, order)
     return order
 

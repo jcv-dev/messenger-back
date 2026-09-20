@@ -180,6 +180,7 @@ def get_order(order_number: int):
     return _request('GET', f'/api/v1/orders/{order_number}')
 
 
-def list_couriers():
-    """GET /api/v1/couriers — used for reconciliation/debug only."""
-    return _request('GET', '/api/v1/couriers')
+def list_couriers(query: str | None = None):
+    """GET /api/v1/couriers — snapshot with turn/availability state."""
+    params = {'q': query} if query else None
+    return _request('GET', '/api/v1/couriers', params=params)

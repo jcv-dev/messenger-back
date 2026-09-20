@@ -723,6 +723,7 @@ class OrderSerializer(serializers.ModelSerializer):
         model = Order
         fields = [
             'id', 'conversation', 'ops_batch_id', 'ops_client_user_id',
+            'ops_courier_user_id', 'courier_name', 'courier_code',
             'client_name', 'origin_address', 'payment_method', 'profile',
             'tools', 'acompanante', 'total', 'status', 'status_label',
             'notified_statuses', 'source', 'payload', 'stops',
@@ -770,6 +771,18 @@ class OrderDraftMetaSerializer(serializers.Serializer):
     cached = serializers.BooleanField(required=False)
 
 
+class OrderCourierInputSerializer(serializers.Serializer):
+    """Domi elegido en el selector de creación (plan Phase 8).
+
+    ``name``/``code`` son el snapshot del selector; el backend igualmente
+    refresca ambos con la respuesta de ops.
+    """
+
+    ops_courier_user_id = serializers.IntegerField(min_value=1)
+    name = serializers.CharField(max_length=120, allow_blank=True, required=False)
+    code = serializers.CharField(max_length=12, allow_blank=True, required=False)
+
+
 class OrderCreateInputSerializer(serializers.Serializer):
     client = OrderClientInputSerializer(required=False)
     origin_address = serializers.CharField(max_length=255)
@@ -787,6 +800,12 @@ class OrderCreateInputSerializer(serializers.Serializer):
     idempotency_key = serializers.CharField(max_length=64, required=False, allow_blank=True)
     source = serializers.ChoiceField(choices=['agent', 'llm'], required=False, default='agent')
     draft = OrderDraftMetaSerializer(required=False)
+    # ``manual`` con ``courier`` asigna de inmediato; ``libre`` (default del
+    # API) deja el pedido en la fila normal de ops.
+    assignment = serializers.ChoiceField(
+        choices=['libre', 'manual'], required=False, default='libre',
+    )
+    courier = OrderCourierInputSerializer(required=False, allow_null=True)
     stops = OrderStopInputSerializer(many=True)
 
 

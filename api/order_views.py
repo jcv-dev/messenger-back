@@ -268,6 +268,28 @@ def order_client_search(request):
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
+def order_couriers(request):
+    """GET /api/orders/couriers/ — ops couriers for the driver picker (Phase 8).
+
+    Thin passthrough to ``GET /api/v1/couriers``; no cache so the turn state
+    (queue position, active order, pause) is always fresh in the selector.
+    """
+    query = (request.query_params.get('q') or '').strip()[:60]
+
+    try:
+        data = ops.list_couriers(query=query or None)
+    except ops.OpsAPIError as exc:
+        logger.warning('Courier list failed: %s', exc)
+        return _ops_error_response(exc)
+
+    couriers = data.get('couriers') if isinstance(data, dict) else []
+    if not isinstance(couriers, list):
+        couriers = []
+    return Response({'ok': True, 'couriers': couriers})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def order_client_addresses(request, client_id):
     """GET /api/orders/clients/{id}/addresses/ — saved destinations.
 

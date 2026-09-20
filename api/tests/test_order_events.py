@@ -116,6 +116,8 @@ class OrderEventsTests(APITestCase):
 
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, 'asignado')
+        # Phase 8: el código del domi también queda a nivel de pedido para el card.
+        self.assertEqual(self.order.courier_code, 'sn42')
         self.assertEqual(self.order.ops_batch_id, 'a1b2c3d4e5f60718')
         self.assertEqual(self.order.ops_client_user_id, 88)
         self.assertIsNotNone(self.order.last_synced_at)

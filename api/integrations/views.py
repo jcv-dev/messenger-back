@@ -353,6 +353,11 @@ class OrderEventsView(IntegrationAPIView):
             client = data.get('client') if isinstance(data.get('client'), dict) else {}
             if client.get('name'):
                 order.client_name = str(client['name'])[:255]
+            # Phase 8: el código corto del domi viaja en cada evento; con él el
+            # card muestra quién tiene el pedido aunque no se haya elegido acá.
+            courier_code = str(data.get('courier_code') or '').strip()[:12]
+            if courier_code:
+                order.courier_code = courier_code
             recompute_order_status(order)
             order.last_synced_at = now
             order.save()

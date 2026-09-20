@@ -1,5 +1,6 @@
 """Tests for Phase 3 — order creation, proxies, local detail/refresh (plan §4.3)."""
 
+from unittest import mock
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -34,8 +35,22 @@ OPS_RESPONSE = {
     'stops_count': 2,
     'status': 'disponible',
     'client': {'id': 88, 'name': 'Ana Pérez', 'phone': '3001234567'},
+    'courier': None,
     'message': 'Pedido creado.',
     'test': True,
+}
+
+OPS_RESPONSE_ASSIGNED = {
+    **OPS_RESPONSE,
+    'status': 'asignado',
+    'courier': {'id': 1642, 'name': 'Samuel Niampira', 'code': 'sn42'},
+    'message': 'Pedido creado y asignado a sn42.',
+}
+
+COURIER_INPUT = {
+    'ops_courier_user_id': 1642,
+    'name': 'Samuel Niampira',
+    'code': 'sn42',
 }
 
 PAYLOAD = {
@@ -483,6 +498,142 @@ class CreateOrderEndpointTests(APITestCase):
         self.assertEqual(res.status_code, 400)
         self.assertIn('details', res.data)
 
+    # ------------------------------------------------------------------
+    #  Phase 8 — selector de domiciliario (asignación manual)
+    # ------------------------------------------------------------------
+
+    def test_create_order_with_courier_sends_manual_assignment(self):
+        payload = {
+            **PAYLOAD,
+            'assignment': 'manual',
+            'courier': dict(COURIER_INPUT),
+        }
+        with patch('api.integrations.orders.ops.create_order',
+                   return_value=dict(OPS_RESPONSE_ASSIGNED)) as create, \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)), \
+                patch('api.integrations.orders.send_confirmation') as confirm, \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(self.url, payload, format='json')
+
+        self.assertEqual(res.status_code, 201, res.data)
+
+        ops_payload = create.call_args.args[0]
+        self.assertEqual(ops_payload['courier_user_id'], 1642)
+        self.assertEqual(ops_payload['mode'], 'manual')
+
+        order = Order.objects.get()
+        self.assertEqual(order.status, 'asignado')
+        self.assertEqual(order.ops_courier_user_id, 1642)
+        self.assertEqual(order.courier_name, 'Samuel Niampira')
+        self.assertEqual(order.courier_code, 'sn42')
+        self.assertEqual(order.payload['request']['assignment'], 'manual')
+        self.assertEqual(
+            order.payload['request']['courier']['ops_courier_user_id'], 1642,
+        )
+
+        # El serializer expone el domi para el card y la hoja de detalle.
+        self.assertEqual(res.data['order']['ops_courier_user_id'], 1642)
+        self.assertEqual(res.data['order']['courier_name'], 'Samuel Niampira')
+        self.assertEqual(res.data['order']['courier_code'], 'sn42')
+
+        # La confirmación sigue saliendo (el aviso de asignado lo manda el
+        # evento `order.created` de ops, Phase 5).
+        confirm.assert_called_once()
+
+    def test_libre_order_sends_no_courier(self):
+        with patch('api.integrations.orders.ops.create_order',
+                   return_value=dict(OPS_RESPONSE)) as create, \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)), \
+                patch('api.integrations.orders.send_confirmation'), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(self.url, PAYLOAD, format='json')
+
+        self.assertEqual(res.status_code, 201, res.data)
+        ops_payload = create.call_args.args[0]
+        self.assertEqual(ops_payload['mode'], 'libre')
+        self.assertNotIn('courier_user_id', ops_payload)
+        order = Order.objects.get()
+        self.assertIsNone(order.ops_courier_user_id)
+        self.assertEqual(order.courier_code, '')
+
+    def test_libre_assignment_ignores_a_stray_courier(self):
+        """``assignment=libre`` never reaches ops as a manual assignment."""
+        payload = {
+            **PAYLOAD,
+            'assignment': 'libre',
+            'courier': dict(COURIER_INPUT),
+        }
+        with patch('api.integrations.orders.ops.create_order',
+                   return_value=dict(OPS_RESPONSE)) as create, \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)), \
+                patch('api.integrations.orders.send_confirmation'), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(self.url, payload, format='json')
+
+        self.assertEqual(res.status_code, 201, res.data)
+        ops_payload = create.call_args.args[0]
+        self.assertEqual(ops_payload['mode'], 'libre')
+        self.assertNotIn('courier_user_id', ops_payload)
+        order = Order.objects.get()
+        self.assertIsNone(order.ops_courier_user_id)
+        self.assertEqual(order.courier_code, '')
+        self.assertIsNone(order.payload['request']['courier'])
+
+    def test_manual_assignment_requires_a_courier(self):
+        payload = {**PAYLOAD, 'assignment': 'manual'}
+        res = self.client.post(self.url, payload, format='json')
+
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data['field'], 'courier')
+        self.assertEqual(Order.objects.count(), 0)
+
+    def test_ops_validation_error_discards_the_draft_and_allows_retry(self):
+        """Un 422 de ops (deuda del domi) es un dato corregible, no un fallido."""
+        payload = {
+            **PAYLOAD,
+            'assignment': 'manual',
+            'courier': dict(COURIER_INPUT),
+        }
+        validation_error = ops.OpsAPIError(
+            'Ops respondió 422',
+            status_code=422,
+            payload={
+                'ok': False,
+                'error': 'Datos inválidos.',
+                'details': {
+                    'courier_user_id': ['No se puede asignar. Samuel tiene deuda de días anteriores.'],
+                },
+            },
+        )
+        with patch('api.integrations.orders.ops.create_order', side_effect=validation_error), \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)):
+            res = self.client.post(self.url, payload, format='json')
+
+        self.assertEqual(res.status_code, 400, res.data)
+        self.assertEqual(res.data['field'], 'courier')
+        self.assertIn('deuda', res.data['error'])
+        # Sin batch fallido local y con la llave liberada para reintentar.
+        self.assertEqual(Order.objects.count(), 0)
+
+        with patch('api.integrations.orders.ops.create_order',
+                   return_value=dict(OPS_RESPONSE_ASSIGNED)), \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)), \
+                patch('api.integrations.orders.send_confirmation'), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            retry = self.client.post(self.url, payload, format='json')
+
+        self.assertEqual(retry.status_code, 201, retry.data)
+        self.assertEqual(Order.objects.count(), 1)
+
 
 @override_settings(**OPS_SETTINGS)
 class ConversationOrderListTests(APITestCase):
@@ -571,9 +722,12 @@ class OrderDetailRefreshTests(APITestCase):
 
         self.assertEqual(res.status_code, 200, res.data)
         self.assertEqual(res.data['order']['status'], 'asignado')
+        self.assertEqual(res.data['order']['courier_code'], 'sn42')
         get.assert_called_once_with(1234)
         self.stop.refresh_from_db()
         self.assertEqual(self.stop.status, 'asignado')
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.courier_code, 'sn42')
 
     def test_refresh_comanda_reads_per_stop_status_once(self):
         stop2 = OrderStop.objects.create(
@@ -730,3 +884,29 @@ class OrderProxyTests(APITestCase):
                 'stops': [{'service_type': 'domicilio', 'dest_address': 'Y'}],
             }, format='json')
         self.assertEqual(res.status_code, 502)
+
+    def test_couriers_proxy_passes_query_and_rows(self):
+        rows = [
+            {
+                'id': 1642, 'name': 'Samuel Niampira', 'phone': '3001234567',
+                'code': 'sn42', 'active': True, 'is_working': True,
+                'is_paused': False, 'shift_order': 1, 'shift_suspended': False,
+                'active_order': None, 'active_status': None,
+                'status_label': 'Disponible',
+            },
+        ]
+        with patch('api.order_views.ops.list_couriers', return_value={'ok': True, 'couriers': rows}) as get:
+            res = self.client.get('/api/orders/couriers/?q=sam')
+            all_rows = self.client.get('/api/orders/couriers/')
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data['couriers'], rows)
+        get.assert_any_call(query='sam')
+        self.assertEqual(get.call_args_list[-1], mock.call(query=None))
+        self.assertEqual(all_rows.status_code, 200)
+        self.assertEqual(all_rows.data['couriers'], rows)
+
+    def test_couriers_proxy_error_is_502(self):
+        with patch('api.order_views.ops.list_couriers',
+                   side_effect=ops.OpsAPIError('boom')):
+            self.assertEqual(self.client.get('/api/orders/couriers/').status_code, 502)
