@@ -1,4 +1,6 @@
 import asyncio
+import os
+import tempfile
 from unittest.mock import patch, MagicMock, AsyncMock
 from django.core.files.uploadedfile import SimpleUploadedFile
 from urllib.parse import quote
@@ -15,7 +17,7 @@ from django.utils import timezone
 from datetime import timedelta
 import json
 
-from api.models import Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, TemplateExclusion, AgentPresence, PushSubscription, AuditLog, CannedResponse, StickerAsset
+from api.models import Call, Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, TemplateExclusion, AgentPresence, PushSubscription, AuditLog, CannedResponse, StickerAsset
 from api.serializers import (
     ConversationSerializer, MessageSerializer,
     ConversationTagSerializer, ConversationNoteSerializer, ConversationTakeSerializer,
@@ -2642,6 +2644,75 @@ class CleanupExpiredMessagesCommandTests(APITestCase):
         with self.settings(MESSAGE_RETENTION_MINUTES=60):
             call_command('cleanup_expired_messages', stdout=out)
         self.assertIn('No expired', out.getvalue())
+
+    def _make_call(self, call_id, **kwargs):
+        return Call.objects.create(
+            call_id=call_id,
+            conversation=self.conv,
+            direction='inbound',
+            status='completed',
+            from_number='15550009999',
+            to_number='15550000000',
+            **kwargs,
+        )
+
+    def test_retention_deletes_old_calls(self):
+        from io import StringIO
+        from django.core.management import call_command
+        old = self._make_call('cleanup-old-call')
+        Call.objects.filter(id=old.id).update(
+            updated_at=timezone.now() - timedelta(days=30)
+        )
+        new = self._make_call('cleanup-new-call')
+        out = StringIO()
+        with self.settings(MESSAGE_RETENTION_MINUTES=60):
+            call_command('cleanup_expired_messages', stdout=out)
+        self.assertFalse(Call.objects.filter(id=old.id).exists())
+        self.assertTrue(Call.objects.filter(id=new.id).exists())
+        self.assertIn('1 calls', out.getvalue())
+
+    def test_retention_deletes_call_recording_file(self):
+        from io import StringIO
+        from django.core.management import call_command
+        with tempfile.TemporaryDirectory() as tmp:
+            recordings_dir = os.path.join(tmp, 'recordings')
+            os.makedirs(recordings_dir)
+            recording_file = os.path.join(recordings_dir, 'old.ogg')
+            with open(recording_file, 'wb') as f:
+                f.write(b'audio')
+            old = self._make_call(
+                'cleanup-rec-call',
+                recording_local_path=f'{settings.MEDIA_URL}recordings/old.ogg',
+            )
+            Call.objects.filter(id=old.id).update(
+                updated_at=timezone.now() - timedelta(days=30)
+            )
+            out = StringIO()
+            with self.settings(MESSAGE_RETENTION_MINUTES=60, MEDIA_ROOT=tmp):
+                call_command('cleanup_expired_messages', stdout=out)
+            self.assertFalse(Call.objects.filter(id=old.id).exists())
+            self.assertFalse(os.path.exists(recording_file))
+            self.assertIn('1 recording files', out.getvalue())
+
+    def test_recent_call_and_recording_kept(self):
+        from io import StringIO
+        from django.core.management import call_command
+        with tempfile.TemporaryDirectory() as tmp:
+            recordings_dir = os.path.join(tmp, 'recordings')
+            os.makedirs(recordings_dir)
+            recording_file = os.path.join(recordings_dir, 'new.ogg')
+            with open(recording_file, 'wb') as f:
+                f.write(b'audio')
+            recent = self._make_call(
+                'cleanup-recent-rec-call',
+                recording_local_path=f'{settings.MEDIA_URL}recordings/new.ogg',
+            )
+            out = StringIO()
+            with self.settings(MESSAGE_RETENTION_MINUTES=60, MEDIA_ROOT=tmp):
+                call_command('cleanup_expired_messages', stdout=out)
+            self.assertTrue(Call.objects.filter(id=recent.id).exists())
+            self.assertTrue(os.path.exists(recording_file))
+            self.assertIn('No expired', out.getvalue())
 
 
 # ── Cache Configuration ─────────────────────────────────────────────────────

@@ -83,7 +83,7 @@ python manage.py test api               # run all tests (needs PostgreSQL + Redi
 python manage.py test api --keepdb      # reuse test DB for speed
 python manage.py runserver              # dev at :8000
 python manage.py migrate                # apply migrations
-python manage.py cleanup_expired_messages  # delete old messages (MESSAGE_RETENTION_MINUTES)
+python manage.py cleanup_expired_messages  # delete old messages, calls + media (MESSAGE_RETENTION_MINUTES)
 ```
 
 ## Test prerequisites
@@ -337,7 +337,9 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
 
 - PostgreSQL. Point at pgbouncer in production (`CONN_MAX_AGE=0`).
 - `.env.test` uses port 5436, `.env.example` uses 5434, production env varies.
-- `MESSAGE_RETENTION_MINUTES=0` disables retention cleanup.
+- `MESSAGE_RETENTION_MINUTES=0` disables retention cleanup. `manage.py cleanup_expired_messages`
+  deletes expired messages (by `created_at`) and expired calls (by `updated_at`) together with their
+  local media files — message media under `MEDIA_URL` and call recordings under `MEDIA_ROOT/recordings/`.
 
 ## Gotchas
 
