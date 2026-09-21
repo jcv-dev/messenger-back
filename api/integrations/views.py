@@ -97,6 +97,23 @@ def _apply_stop_fields(stop: OrderStop, entry: dict) -> None:
         stop.lng = entry['lng']
 
 
+def _client_id(data) -> int | None:
+    client = data.get('client') if isinstance(data.get('client'), dict) else {}
+    try:
+        return int(client.get('id'))
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_stop_no(data) -> int | None:
+    """Stop index from the event payload (comandas share one order number)."""
+    try:
+        stop_no = int(data.get('stop'))
+    except (TypeError, ValueError):
+        return None
+    return stop_no if stop_no > 0 else None
+
+
 def _publish_order_updated(order: Order):
     try:
         payload = {
@@ -155,6 +172,94 @@ def recompute_order_status(order: Order) -> str:
     if total or not order.total:
         order.total = total
     return new_status
+
+
+def adopt_order(conversation, data, order_number: int):
+    """Mirror an ops batch that was not created from the Messager.
+
+    Panel/mobile orders only reach us as events; the first one creates the
+    local batch and its stops so the conversation's ``Pedidos activos`` card
+    can show it (and refresh/cancel/notify work like any other order). A batch
+    adopted after the fact never messages the client about a transition that
+    already happened (entregado/cancelado are seeded into
+    ``notified_statuses``); later ones notify normally.
+
+    Used by the webhook (``OrderEventsView._locate``) and by the link-time
+    backfill (``adoption.sync_active_orders``), so both share one mirror shape.
+    """
+    # Another event may have adopted the batch already.
+    existing = (
+        OrderStop.objects
+        .select_related('order')
+        .filter(ops_order_number=order_number)
+        .first()
+    )
+    if existing is not None:
+        return existing.order, existing
+
+    client = data.get('client') if isinstance(data.get('client'), dict) else {}
+    courier = data.get('courier') if isinstance(data.get('courier'), dict) else {}
+    event_status = str(data.get('status') or '').strip().lower() or 'disponible'
+    now = timezone.now()
+
+    entries = [e for e in (data.get('stops') or []) if isinstance(e, dict)]
+    if not entries:
+        entries = [{'stop': 1, 'status': event_status}]
+
+    order = Order.objects.create(
+        conversation=conversation,
+        ops_batch_id=str(data.get('batch_id') or '')[:32] or None,
+        ops_client_user_id=_client_id(data),
+        ops_courier_user_id=_as_int(courier.get('id')) or None,
+        courier_name=str(courier.get('name') or '')[:255],
+        courier_code=str(data.get('courier_code') or courier.get('code') or '')[:12],
+        client_name=str(client.get('name') or '')[:255],
+        origin_address=str(data.get('origin') or ''),
+        total=_as_int(data.get('total')),
+        status=event_status,
+        payload={'ops_event': data, 'adopted': True},
+        last_synced_at=now,
+    )
+    # ``auto_now_add`` overrides created_at on create; the card's "hace X"
+    # should read the push time, not the adoption moment.
+    created_at = _event_created_at(data)
+    Order.objects.filter(pk=order.pk).update(created_at=created_at)
+    order.created_at = created_at
+
+    wanted = _event_stop_no(data)
+    located = None
+    for index, entry in enumerate(entries, start=1):
+        stop_no = _as_int(entry.get('stop')) or index
+        stop = OrderStop.objects.create(
+            order=order,
+            stop_no=stop_no,
+            ops_order_number=order_number,
+            service_type=str(entry.get('service_type') or '')[:40],
+            dest_address=str(entry.get('address') or ''),
+            lat=entry.get('lat'),
+            lng=entry.get('lng'),
+            description=str(entry.get('description') or '')[:500],
+            observation=str(entry.get('observation') or '')[:500],
+            price=_as_int(entry.get('price')),
+            status=str(entry.get('status') or event_status).strip().lower(),
+            payload={
+                'status_label': str(data.get('status_label') or ''),
+                'courier_code': str(data.get('courier_code') or courier.get('code') or ''),
+                'last_event': str(data.get('event') or ''),
+            },
+            last_synced_at=now,
+        )
+        if located is None or (wanted is not None and stop_no == wanted):
+            located = stop
+
+    recompute_order_status(order)
+    updates = ['status', 'total']
+    transition = resolve_transition(order)
+    if transition in ('entregado', 'cancelado'):
+        order.notified_statuses = [transition]
+        updates.append('notified_statuses')
+    order.save(update_fields=updates)
+    return order, located
 
 
 class IntegrationAPIView(APIView):
@@ -347,7 +452,7 @@ class OrderEventsView(IntegrationAPIView):
             )
 
         occurred_at = str(data.get('occurred_at') or '')
-        stop_no = self._event_stop_no(data) or 0
+        stop_no = _event_stop_no(data) or 0
         dedupe_key = (
             f'integration:event:{order_number}:{stop_no}:{status_value}:{occurred_at}'
         )
@@ -382,7 +487,7 @@ class OrderEventsView(IntegrationAPIView):
             for target in touched:
                 target.save()
             order.ops_batch_id = order.ops_batch_id or (data.get('batch_id') or None)
-            order.ops_client_user_id = order.ops_client_user_id or self._client_id(data)
+            order.ops_client_user_id = order.ops_client_user_id or _client_id(data)
             if data.get('origin'):
                 order.origin_address = str(data['origin'])
             client = data.get('client') if isinstance(data.get('client'), dict) else {}
@@ -422,23 +527,6 @@ class OrderEventsView(IntegrationAPIView):
     # ------------------------------------------------------------------
     #  Helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _client_id(data) -> int | None:
-        client = data.get('client') if isinstance(data.get('client'), dict) else {}
-        try:
-            return int(client.get('id'))
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _event_stop_no(data) -> int | None:
-        """Stop index from the event payload (comandas share one order number)."""
-        try:
-            stop_no = int(data.get('stop'))
-        except (TypeError, ValueError):
-            return None
-        return stop_no if stop_no > 0 else None
 
     @staticmethod
     def _match_stop(order: Order, order_number: int, stop_no: int | None = None):
@@ -498,7 +586,7 @@ class OrderEventsView(IntegrationAPIView):
         the phone in the payload wins; otherwise the most recently active one
         owns the batch.
         """
-        client_id = self._client_id(data)
+        client_id = _client_id(data)
         if not client_id:
             return None
 
@@ -511,91 +599,8 @@ class OrderEventsView(IntegrationAPIView):
                 return preferred
         return linked.order_by(F('last_message_at').desc(nulls_last=True), '-id').first()
 
-    def _adopt_order(self, conversation, data, order_number: int):
-        """Mirror an ops batch that was not created from the Messager.
-
-        Panel/mobile orders only reach us as events; the first one creates the
-        local batch and its stops so the conversation's ``Pedidos activos``
-        card can show it (and refresh/cancel/notify work like any other order).
-        A batch adopted after the fact never messages the client about a
-        transition that already happened; later ones notify normally.
-        """
-        # Another event may have adopted the batch already.
-        existing = (
-            OrderStop.objects
-            .select_related('order')
-            .filter(ops_order_number=order_number)
-            .first()
-        )
-        if existing is not None:
-            return existing.order, existing
-
-        client = data.get('client') if isinstance(data.get('client'), dict) else {}
-        courier = data.get('courier') if isinstance(data.get('courier'), dict) else {}
-        event_status = str(data.get('status') or '').strip().lower() or 'disponible'
-        now = timezone.now()
-
-        entries = [e for e in (data.get('stops') or []) if isinstance(e, dict)]
-        if not entries:
-            entries = [{'stop': 1, 'status': event_status}]
-
-        order = Order.objects.create(
-            conversation=conversation,
-            ops_batch_id=str(data.get('batch_id') or '')[:32] or None,
-            ops_client_user_id=self._client_id(data),
-            ops_courier_user_id=_as_int(courier.get('id')) or None,
-            courier_name=str(courier.get('name') or '')[:255],
-            courier_code=str(data.get('courier_code') or courier.get('code') or '')[:12],
-            client_name=str(client.get('name') or '')[:255],
-            origin_address=str(data.get('origin') or ''),
-            total=_as_int(data.get('total')),
-            status=event_status,
-            payload={'ops_event': data, 'adopted': True},
-            last_synced_at=now,
-        )
-        # ``auto_now_add`` overrides created_at on create; the card's "hace X"
-        # should read the push time, not the adoption moment.
-        created_at = _event_created_at(data)
-        Order.objects.filter(pk=order.pk).update(created_at=created_at)
-        order.created_at = created_at
-
-        wanted = self._event_stop_no(data)
-        located = None
-        for index, entry in enumerate(entries, start=1):
-            stop_no = _as_int(entry.get('stop')) or index
-            stop = OrderStop.objects.create(
-                order=order,
-                stop_no=stop_no,
-                ops_order_number=order_number,
-                service_type=str(entry.get('service_type') or '')[:40],
-                dest_address=str(entry.get('address') or ''),
-                lat=entry.get('lat'),
-                lng=entry.get('lng'),
-                description=str(entry.get('description') or '')[:500],
-                observation=str(entry.get('observation') or '')[:500],
-                price=_as_int(entry.get('price')),
-                status=str(entry.get('status') or event_status).strip().lower(),
-                payload={
-                    'status_label': str(data.get('status_label') or ''),
-                    'courier_code': str(data.get('courier_code') or courier.get('code') or ''),
-                    'last_event': str(data.get('event') or ''),
-                },
-                last_synced_at=now,
-            )
-            if located is None or (wanted is not None and stop_no == wanted):
-                located = stop
-
-        recompute_order_status(order)
-        updates = ['status', 'total']
-        transition = resolve_transition(order)
-        if transition in ('entregado', 'cancelado'):
-            order.notified_statuses = [transition]
-            updates.append('notified_statuses')
-        order.save(update_fields=updates)
-        return order, located
-
     def _locate(self, data, order_number: int):
-        stop_no = self._event_stop_no(data)
+        stop_no = _event_stop_no(data)
 
         # 1) A stop of a batch already mirrored (created from the Messager, or
         #    adopted by an earlier event).
@@ -638,7 +643,7 @@ class OrderEventsView(IntegrationAPIView):
                 if stop.ops_order_number is None:
                     stop.ops_order_number = order_number
                 return stop.order, stop
-            return self._adopt_order(conversation, data, order_number)
+            return adopt_order(conversation, data, order_number)
 
         return None, None
 

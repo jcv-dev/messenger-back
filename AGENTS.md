@@ -256,6 +256,15 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
 - `api/integrations/orders.py` — order creation mirror (`POST /api/conversations/{id}/orders/`),
   refresh, batch/stop cancellation. `api/integrations/clients.py` — conversation ↔ ops
   client link. `api/integrations/ops.py` — signed httpx client.
+- `api/integrations/adoption.py` (fix 2026-09-21) — link-time backfill.
+  `sync_active_orders()` runs right after a manual link (`link_client`), an
+  auto-link (`auto_link_now`, phone match) and via `manage.py
+  sync_active_orders`; it lists the client's recent orders in
+  `GET /api/v1/clients/{id}/orders`, adopts the active ones missing locally
+  (reusing `views.adopt_order`), seeds `notified_statuses` so no late WhatsApp
+  goes out and publishes `order.updated`. Batches already mirrored (any
+  conversation) are skipped; the client-orders row is enriched with
+  `GET /api/v1/orders/{n}` when available; ops failures are silent.
 - `api/integrations/status_notifications.py` (Phase 5) — aggregate batch
   notifications. `resolve_transition()` returns only the highest satisfied state
   (`entregado` > `en_ruta` > `asignado`; all-canceled is terminal) and

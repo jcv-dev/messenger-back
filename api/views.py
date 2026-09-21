@@ -1393,6 +1393,16 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation, client_id, snapshot=snapshot, source=MATCH_SOURCE_MANUAL,
         )
         _log_audit(request.user, conversation, 'link_client', str(client_id))
+
+        # An ops batch created before the link never matched an event, so it
+        # stays invisible in "Pedidos activos" until its next status change.
+        # Adopt the client's active orders now (best effort: never fails the link).
+        try:
+            from .integrations.adoption import sync_active_orders
+            sync_active_orders(conversation)
+        except Exception:
+            logger.exception('Failed to backfill active orders after link')
+
         publish_conversation_update(conversation)
         return Response(ConversationSerializer(conversation).data)
 

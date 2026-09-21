@@ -162,6 +162,14 @@ def auto_link_now(conversation_id: int, phone: str) -> bool:
         'Auto-linked conversation %s to ops client %s', conversation.id, client['id'],
     )
 
+    # An ops batch created before the link never matched an event; pull the
+    # client's active orders into the mirror now (best effort).
+    try:
+        from .adoption import sync_active_orders
+        sync_active_orders(conversation)
+    except Exception:
+        logger.exception('Failed to backfill active orders after auto-link')
+
     try:
         from api.views import publish_conversation_update
         publish_conversation_update(conversation)

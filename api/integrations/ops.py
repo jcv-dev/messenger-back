@@ -144,9 +144,12 @@ def set_client_default_address(client_id: int, address: str, lat=None, lng=None)
     return _request('POST', f'/api/v1/clients/{client_id}/addresses/default', json_body=body)
 
 
-def get_client_orders(client_id: int, limit: int = 5):
+def get_client_orders(client_id: int, limit: int = 5, timeout: float | None = None):
     """GET /api/v1/clients/{id}/orders — returns ``{ok, orders: [...]}``."""
-    return _request('GET', f'/api/v1/clients/{client_id}/orders', params={'limit': limit})
+    return _request(
+        'GET', f'/api/v1/clients/{client_id}/orders',
+        params={'limit': limit}, timeout=timeout,
+    )
 
 
 def create_order(payload: dict, idempotency_key: str | None = None):
@@ -175,9 +178,9 @@ def cancel_order_stop(order_number: int, stop_no: int, reason: str):
     )
 
 
-def get_order(order_number: int):
+def get_order(order_number: int, timeout: float | None = None):
     """GET /api/v1/orders/{n}."""
-    return _request('GET', f'/api/v1/orders/{order_number}')
+    return _request('GET', f'/api/v1/orders/{order_number}', timeout=timeout)
 
 
 def list_couriers(query: str | None = None):

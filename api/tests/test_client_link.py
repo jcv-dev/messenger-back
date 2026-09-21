@@ -133,9 +133,10 @@ class AutoLinkTests(TestCase):
         )
         cache.delete(cache_key('3001234567'))
 
+    @patch('api.integrations.adoption.sync_active_orders')
     @patch('api.views.publish_conversation_update')
     @patch('api.integrations.clients.ops.get_client_by_phone')
-    def test_auto_link_now_links_and_publishes(self, lookup, publish):
+    def test_auto_link_now_links_and_publishes(self, lookup, publish, sync):
         lookup.return_value = CLIENT_PAYLOAD
 
         linked = auto_link_now(self.conversation.id, '573001234567')
@@ -147,6 +148,7 @@ class AutoLinkTests(TestCase):
         self.assertEqual(self.conversation.ops_client_snapshot['name'], 'Ana Pérez')
         self.assertIsNotNone(self.conversation.ops_client_linked_at)
         publish.assert_called_once()
+        sync.assert_called_once()
 
     @patch('api.views.publish_conversation_update')
     @patch('api.integrations.clients.ops.get_client_by_phone')
@@ -210,8 +212,9 @@ class LinkClientEndpointTests(APITestCase):
         )
         self.assertEqual(response.status_code, 401)
 
+    @patch('api.integrations.adoption.sync_active_orders')
     @patch('api.views.publish_conversation_update')
-    def test_link_with_snapshot(self, publish):
+    def test_link_with_snapshot(self, publish, sync):
         response = self.client.post(
             f'/api/conversations/{self.conversation.id}/link-client/',
             {
@@ -227,6 +230,7 @@ class LinkClientEndpointTests(APITestCase):
         self.assertEqual(response.data['ops_client_match_source'], 'manual')
         self.assertEqual(response.data['ops_client_snapshot']['name'], 'Ana Pérez')
         publish.assert_called_once()
+        sync.assert_called_once()
         self.assertTrue(AuditLog.objects.filter(
             action='link_client', conversation=self.conversation,
         ).exists())
@@ -259,9 +263,10 @@ class LinkClientEndpointTests(APITestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    @patch('api.integrations.adoption.sync_active_orders')
     @patch('api.views.publish_conversation_update')
     @patch('api.integrations.clients.ops.get_client_by_phone')
-    def test_link_without_snapshot_enriches_from_phone(self, lookup, publish):
+    def test_link_without_snapshot_enriches_from_phone(self, lookup, publish, sync):
         lookup.return_value = CLIENT_PAYLOAD
 
         response = self.client.post(
@@ -273,9 +278,10 @@ class LinkClientEndpointTests(APITestCase):
         self.assertEqual(response.data['ops_client_snapshot']['name'], 'Ana Pérez')
         lookup.assert_called_once_with('3001234567', timeout=5)
 
+    @patch('api.integrations.adoption.sync_active_orders')
     @patch('api.views.publish_conversation_update')
     @patch('api.integrations.clients.ops.get_client_by_phone')
-    def test_link_without_snapshot_ignores_mismatched_phone(self, lookup, publish):
+    def test_link_without_snapshot_ignores_mismatched_phone(self, lookup, publish, sync):
         lookup.return_value = {**CLIENT_PAYLOAD, 'id': 99}
 
         response = self.client.post(
