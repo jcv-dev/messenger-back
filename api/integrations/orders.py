@@ -26,6 +26,7 @@ from api.models import Order, OrderStop
 
 from . import ops
 from .clients import MATCH_SOURCE_ORDER, fetch_client_by_phone, link_conversation
+from .couriers import courier_snapshot
 from .phones import to_ops
 from .services import OPS_SERVICE_KEYS, normalize_ops_key
 
@@ -576,7 +577,7 @@ def refresh_order(order: Order) -> Order:
     panel edit that didn't push an event still lands on Refrescar.
     Raises ``ops.OpsAPIError`` when ops cannot be reached.
     """
-    from .views import _apply_stop_fields, recompute_order_status
+    from .views import _apply_stop_fields, _as_int, recompute_order_status
 
     now = timezone.now()
     groups: dict[int, list] = {}
@@ -584,19 +585,20 @@ def refresh_order(order: Order) -> Order:
         if stop.ops_order_number:
             groups.setdefault(int(stop.ops_order_number), []).append(stop)
 
-    courier_code = ''
+    courier: dict = {}
+    courier_resolved = False
     for number, group in groups.items():
         data = ops.get_order(number)
         if not isinstance(data, dict) or not data.get('ok'):
             continue
 
-        # El detalle de ops trae el código corto del domi (`sn42`); el nombre
-        # solo se conoce al crear desde el selector.
-        courier = data.get('courier')
-        if isinstance(courier, str) and courier.strip():
-            courier_code = courier.strip()[:12]
-        elif isinstance(courier, dict) and courier.get('code'):
-            courier_code = str(courier['code']).strip()[:12]
+        # El detalle de ops trae la identidad del domi (`{id, name, code}` desde
+        # el fix 2026-09-21; antes solo el código corto). Sin courier en la
+        # respuesta, ops liberó el pedido y el espejo debe soltar al domi.
+        courier_resolved = True
+        snapshot = courier_snapshot(data)
+        if snapshot:
+            courier = snapshot
 
         entries = {}
         for entry in (data.get('stops') or []):
@@ -633,11 +635,26 @@ def refresh_order(order: Order) -> Order:
 
     recompute_order_status(order)
     order.last_synced_at = now
-    if courier_code:
-        order.courier_code = courier_code
-    order.save(update_fields=[
-        'status', 'total', 'last_synced_at', 'updated_at', 'courier_code',
-    ])
+    updates = ['status', 'total', 'last_synced_at', 'updated_at']
+    if courier_resolved:
+        if courier:
+            if courier.get('code'):
+                order.courier_code = courier['code']
+                updates.append('courier_code')
+            if courier.get('id'):
+                order.ops_courier_user_id = _as_int(courier['id']) or None
+                updates.append('ops_courier_user_id')
+            if courier.get('name'):
+                order.courier_name = courier['name'][:255]
+                updates.append('courier_name')
+        else:
+            # Ops liberó el pedido (sin domi): soltar la asignación local para
+            # que el card no siga mostrando al domiciliario anterior.
+            order.ops_courier_user_id = None
+            order.courier_name = ''
+            order.courier_code = ''
+            updates += ['ops_courier_user_id', 'courier_name', 'courier_code']
+    order.save(update_fields=updates)
     _publish_updates(order.conversation, order)
     return order
 

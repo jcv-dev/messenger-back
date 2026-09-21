@@ -324,8 +324,11 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
   (`libre|manual`, default `libre`) and `courier {ops_courier_user_id, name, code}`;
   `create_order` normalizes it, sends `courier_user_id` + `mode=manual` to ops,
   mirrors `Order.ops_courier_user_id`/`courier_name`/`courier_code` (migration
-  `0043_order_courier`) and refreshes `courier_code` from `GET /orders/{n}` and from
-  the `order.status_changed` events. An ops `422` deletes the local draft and raises
+  `0043_order_courier`) and refreshes the courier identity (`{id, name, code}`)
+  from `GET /orders/{n}` and from the `order.status_changed` events. Refresh and
+  the link-time backfill share `api/integrations/couriers.py::courier_snapshot`,
+  which also accepts the legacy code string and clears the local domi when ops
+  reports the order as released. An ops `422` deletes the local draft and raises
   `OrderValidationError(field='courier')` (the view returns 400) instead of leaving a
   `failed` batch; other ops errors keep the 502 + retry flow. Ops keeps owning the
   turn logic: `createCommand` suspends the domi's queue position and notifies them.

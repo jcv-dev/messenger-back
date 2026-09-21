@@ -26,6 +26,8 @@ from django.utils.dateparse import parse_datetime
 
 from api.models import Order, OrderStop
 
+from .couriers import courier_snapshot
+
 logger = logging.getLogger('api')
 
 #: Ops stores ``orders.created_at`` in Bogotá local time (session TZ ``-05:00``).
@@ -71,8 +73,8 @@ def _backfill_payload(conversation, client_id: int, row: dict, order_number: int
 
     The client-orders row carries ``batch_id``/``total``/``created_at``;
     ``GET /orders/{n}`` adds per-stop price/coords/observation and the courier
-    code. When the detail call fails the row is enough (``Refrescar`` fills the
-    gaps later).
+    identity (``{id, name, code}``, or the legacy code string). When the detail
+    call fails the row is enough (``Refrescar`` fills the gaps later).
     """
     from . import ops
     from .views import _as_int
@@ -94,8 +96,7 @@ def _backfill_payload(conversation, client_id: int, row: dict, order_number: int
     if not entries:
         entries = [{'stop': 1, 'status': row.get('status')}]
 
-    courier = detail.get('courier')
-    courier_code = str(courier).strip()[:12] if isinstance(courier, str) else ''
+    courier = courier_snapshot(detail)
     snapshot = (
         conversation.ops_client_snapshot
         if isinstance(conversation.ops_client_snapshot, dict) else {}
@@ -115,8 +116,8 @@ def _backfill_payload(conversation, client_id: int, row: dict, order_number: int
         },
         'origin': str(detail.get('origin') or row.get('origin') or ''),
         'total': _as_int(row.get('total')),
-        'courier_code': courier_code,
-        'courier': {'code': courier_code},
+        'courier_code': courier.get('code', ''),
+        'courier': courier,
         'stops': entries,
     }
     occurred_at = _created_at_value(detail) or _created_at_value(row)

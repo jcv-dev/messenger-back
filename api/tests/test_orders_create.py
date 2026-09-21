@@ -729,6 +729,70 @@ class OrderDetailRefreshTests(APITestCase):
         self.order.refresh_from_db()
         self.assertEqual(self.order.courier_code, 'sn42')
 
+    def test_refresh_mirrors_courier_identity(self):
+        ops_order = {
+            'ok': True, 'order_number': 1234, 'status': 'asignado',
+            'status_label': 'Domiciliario asignado',
+            'courier': {'id': 34, 'name': 'Luis Camilo Vargas', 'code': 'MV06'},
+            'stops': [{'stop': 1, 'service_type': 'domicilio', 'address': 'Cra 5 #12-01',
+                       'description': '', 'status': 'asignado'}],
+        }
+        with patch('api.integrations.orders.ops.get_order', return_value=ops_order), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(f'/api/orders/{self.order.id}/refresh/')
+
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data['order']['ops_courier_user_id'], 34)
+        self.assertEqual(res.data['order']['courier_name'], 'Luis Camilo Vargas')
+        self.assertEqual(res.data['order']['courier_code'], 'MV06')
+
+    def test_refresh_legacy_code_keeps_known_name(self):
+        # Pre-fix ops only returned the anonymous code; the name set by an event
+        # must survive a Refrescar.
+        self.order.ops_courier_user_id = 34
+        self.order.courier_name = 'Luis Camilo Vargas'
+        self.order.courier_code = 'MV06'
+        self.order.save(update_fields=['ops_courier_user_id', 'courier_name', 'courier_code'])
+        ops_order = {
+            'ok': True, 'order_number': 1234, 'status': 'asignado',
+            'status_label': 'Domiciliario asignado', 'courier': 'lv34',
+            'stops': [{'stop': 1, 'service_type': 'domicilio', 'address': 'Cra 5 #12-01',
+                       'description': '', 'status': 'asignado'}],
+        }
+        with patch('api.integrations.orders.ops.get_order', return_value=ops_order), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(f'/api/orders/{self.order.id}/refresh/')
+
+        self.assertEqual(res.status_code, 200, res.data)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.courier_code, 'lv34')
+        self.assertEqual(self.order.courier_name, 'Luis Camilo Vargas')
+        self.assertEqual(self.order.ops_courier_user_id, 34)
+
+    def test_refresh_clears_released_courier(self):
+        self.order.ops_courier_user_id = 34
+        self.order.courier_name = 'Luis Camilo Vargas'
+        self.order.courier_code = 'MV06'
+        self.order.save(update_fields=['ops_courier_user_id', 'courier_name', 'courier_code'])
+        ops_order = {
+            'ok': True, 'order_number': 1234, 'status': 'disponible',
+            'status_label': 'Buscando domiciliario', 'courier': None,
+            'stops': [{'stop': 1, 'service_type': 'domicilio', 'address': 'Cra 5 #12-01',
+                       'description': '', 'status': 'disponible'}],
+        }
+        with patch('api.integrations.orders.ops.get_order', return_value=ops_order), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(f'/api/orders/{self.order.id}/refresh/')
+
+        self.assertEqual(res.status_code, 200, res.data)
+        self.order.refresh_from_db()
+        self.assertIsNone(self.order.ops_courier_user_id)
+        self.assertEqual(self.order.courier_name, '')
+        self.assertEqual(self.order.courier_code, '')
+
     def test_refresh_comanda_reads_per_stop_status_once(self):
         stop2 = OrderStop.objects.create(
             order=self.order, stop_no=2, service_type='compras',

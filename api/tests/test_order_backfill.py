@@ -14,12 +14,13 @@ from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
 from api.integrations import ops
 from api.integrations.adoption import _lock_key, sync_active_orders
+from api.integrations.couriers import courier_snapshot
 from api.models import Conversation, Order, OrderStop
 from api.tests import get_or_create_tulua_group
 
@@ -67,7 +68,7 @@ DETAIL = {
     'status': 'asignado',
     'status_label': 'Domiciliario asignado',
     'origin': 'Calle 10 #20-30',
-    'courier': 'sn42',
+    'courier': {'id': 1642, 'name': 'Samuel Niampira', 'code': 'sn42'},
     'created_at': '2026-09-21 15:30:11',
     'stops': [
         {'stop': 1, 'service_type': 'compras', 'address': '',
@@ -78,6 +79,34 @@ DETAIL = {
          'price': 100, 'lat': 4.08, 'lng': -76.19},
     ],
 }
+
+#: Payloads pushed before the 2026-09-21 ops fix: the detail endpoint only
+#: carried the short code string. The backfill must keep working.
+LEGACY_DETAIL = {**DETAIL, 'courier': 'sn42'}
+
+
+class CourierSnapshotTests(SimpleTestCase):
+    """The normalizer accepts the object shape and the legacy code string."""
+
+    def test_object_keeps_id_name_and_code(self):
+        self.assertEqual(
+            courier_snapshot({'courier': {'id': 34, 'name': 'Luis Camilo Vargas', 'code': 'MV06'}}),
+            {'id': 34, 'name': 'Luis Camilo Vargas', 'code': 'MV06'},
+        )
+
+    def test_legacy_string_becomes_code_only(self):
+        self.assertEqual(courier_snapshot({'courier': 'sn42'}), {'code': 'sn42'})
+
+    def test_top_level_courier_code_is_the_fallback(self):
+        self.assertEqual(
+            courier_snapshot({'courier': None, 'courier_code': 'MV06'}),
+            {'code': 'MV06'},
+        )
+
+    def test_no_courier_is_empty(self):
+        self.assertEqual(courier_snapshot({}), {})
+        self.assertEqual(courier_snapshot({'courier': None}), {})
+        self.assertEqual(courier_snapshot(None), {})
 
 
 @override_settings(**OPS_SETTINGS)
@@ -119,12 +148,37 @@ class SyncActiveOrdersTests(TestCase):
             sync_active_orders(self.conversation)
 
         order = Order.objects.get(conversation=self.conversation)
+        self.assertEqual(order.ops_courier_user_id, 1642)
+        self.assertEqual(order.courier_name, 'Samuel Niampira')
         self.assertEqual(order.courier_code, 'sn42')
         stop = order.stops.get(stop_no=2)
         self.assertEqual(stop.price, 100)
         self.assertEqual(stop.lat, 4.08)
         self.assertEqual(stop.lng, -76.19)
         self.assertEqual(stop.observation, 'Timbre azul')
+
+    def test_detail_accepts_legacy_courier_string(self):
+        orders_patch, detail_patch = self._patch_ops(
+            client_orders(ACTIVE_ROW), detail=LEGACY_DETAIL,
+        )
+        with orders_patch, detail_patch:
+            sync_active_orders(self.conversation)
+
+        order = Order.objects.get(conversation=self.conversation)
+        self.assertEqual(order.courier_code, 'sn42')
+        self.assertEqual(order.courier_name, '')
+        self.assertIsNone(order.ops_courier_user_id)
+
+    def test_detail_without_courier_keeps_mirror_clean(self):
+        detail = {**DETAIL, 'courier': None}
+        orders_patch, detail_patch = self._patch_ops(client_orders(ACTIVE_ROW), detail=detail)
+        with orders_patch, detail_patch:
+            sync_active_orders(self.conversation)
+
+        order = Order.objects.get(conversation=self.conversation)
+        self.assertEqual(order.courier_code, '')
+        self.assertEqual(order.courier_name, '')
+        self.assertIsNone(order.ops_courier_user_id)
 
     def test_created_at_kept_from_ops_bogota_time(self):
         orders_patch, detail_patch = self._patch_ops(client_orders(ACTIVE_ROW))
