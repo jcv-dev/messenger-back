@@ -27,6 +27,8 @@ from api.integrations.draft import (
     fetch_client_context,
     message_text,
     normalize_draft,
+    resolve_address_ui_flow,
+    resolve_draft_addresses,
     resolve_draft_client,
     run_tool,
     summarize_addresses,
@@ -368,6 +370,222 @@ class NormalizeDraftTests(TestCase):
 
 
 # ---------------------------------------------------------------------------
+#  Address resolution (same flow as the UI)
+# ---------------------------------------------------------------------------
+
+
+@override_settings(DOMII_CALCULATOR_URL='https://calc.test', DOMII_CALCULATOR_API_KEY='key')
+class AddressResolutionTests(TestCase):
+    def test_match_tokens_strip_accents_and_punctuation(self):
+        self.assertEqual(
+            draft._match_tokens('Calle 43 #23A - 45, Príncipe'),
+            ['calle', '43', '23a', '45', 'principe'],
+        )
+
+    @patch('api.integrations.draft.calculator.geocode_details')
+    @patch('api.integrations.draft.calculator.geocode_search')
+    def test_resolve_address_picks_the_matching_suggestion_then_details(self, search, details):
+        # The México suggestion comes first, but the Tuluá one matches the
+        # street + number the client gave (and wins the Tuluá preference).
+        search.return_value = [
+            {'display_name': 'Calle 5ᶜ 17-88, Mérida, Yuc., México', 'place_id': 'mx-1'},
+            {'display_name': 'Calle 5c # 17-88, Tuluá, Valle del Cauca', 'place_id': 'tulua-1'},
+        ]
+        details.return_value = {
+            'display_name': 'Cl. 5c # 17-88, Tuluá, Valle del Cauca, Colombia',
+            'lat': 4.100583, 'lng': -76.206644,
+        }
+
+        place = resolve_address_ui_flow('Calle 5c #17-88 tercer milenio')
+
+        self.assertEqual(place['place_id'], 'tulua-1')
+        self.assertEqual(place['display_name'], 'Cl. 5c # 17-88, Tuluá, Valle del Cauca, Colombia')
+        self.assertEqual(place['lat'], 4.100583)
+        details.assert_called_once_with('tulua-1')
+
+    @patch('api.integrations.draft.calculator.geocode_details')
+    @patch('api.integrations.draft.calculator.geocode_search')
+    def test_resolve_address_returns_none_without_a_plausible_match(self, search, details):
+        search.return_value = [{'display_name': 'Otra vía 99, Tuluá', 'place_id': 'x'}]
+
+        self.assertIsNone(resolve_address_ui_flow('Calle 12 #34-56'))
+        details.assert_not_called()
+
+    @patch('api.integrations.draft.calculator.geocode_details')
+    @patch('api.integrations.draft.calculator.geocode_search')
+    def test_resolve_address_tries_the_next_candidate_when_details_fail(self, search, details):
+        from api.integrations import calculator
+
+        search.return_value = [
+            {'display_name': 'Calle 43 # 23A-45, Tuluá, Valle del Cauca', 'place_id': 'p1'},
+            {'display_name': 'Calle 43 # 23A-45, Corozal', 'place_id': 'p2'},
+        ]
+        details.side_effect = [
+            calculator.CalculatorAPIError('404'),
+            {'display_name': 'Cl. 43 # 23A-45, Tuluá, Valle del Cauca, Colombia', 'lat': 4.07, 'lng': -76.2},
+        ]
+
+        place = resolve_address_ui_flow('Calle 43 #23A - 45 nuevo príncipe')
+
+        self.assertEqual(place['place_id'], 'p2')
+        self.assertEqual(place['lat'], 4.07)
+
+    @patch('api.integrations.draft.calculator.geocode_details')
+    @patch('api.integrations.draft.calculator.geocode_search')
+    def test_resolve_address_rejects_business_name_matches(self, search, details):
+        # A vague phrase can autocomplete a business; the details street must
+        # still match the query or it must not be picked.
+        search.return_value = [{'display_name': 'Donde Siempre, Tuluá', 'place_id': 'biz'}]
+        details.return_value = {
+            'display_name': 'Cra. 25A #44A-73, Bogotá, Colombia',
+            'lat': 4.5807, 'lng': -74.1277,
+        }
+
+        self.assertIsNone(resolve_address_ui_flow('Donde siempre'))
+
+    @override_settings(DOMII_CALCULATOR_URL='')
+    def test_resolve_address_requires_the_calculator(self):
+        self.assertIsNone(resolve_address_ui_flow('Calle 10 #20-30'))
+
+    @patch('api.integrations.draft.resolve_address_ui_flow')
+    def test_resolution_fills_addresses_the_model_did_not_confirm(self, resolve):
+        resolve.side_effect = [
+            {'display_name': 'Cl. 5c # 17-88, Tuluá, Valle del Cauca, Colombia', 'lat': 4.1006, 'lng': -76.2066},
+            {'display_name': 'Cl. 43 # 23A-45, Tuluá, Valle del Cauca, Colombia', 'lat': 4.0708, 'lng': -76.2023},
+        ]
+        payload = {
+            'origin_address': 'Calle 5c #17-88 tercer milenio',
+            'origin_lat': None, 'origin_lng': None,
+            'stops': [{
+                'stop_no': 1, 'service_type': 'domicilio',
+                'dest_address': 'Calle 43 #23A - 45 nuevo principe',
+                'lat': None, 'lng': None,
+            }],
+            'missing': [],
+        }
+
+        result = resolve_draft_addresses(payload, CATALOG, [], [])
+
+        self.assertEqual(result['origin_address'], 'Cl. 5c # 17-88, Tuluá, Valle del Cauca, Colombia')
+        self.assertEqual(result['origin_lat'], 4.1006)
+        self.assertEqual(result['stops'][0]['dest_address'], 'Cl. 43 # 23A-45, Tuluá, Valle del Cauca, Colombia')
+        self.assertEqual(result['stops'][0]['lat'], 4.0708)
+        self.assertEqual(result['missing'], [])
+        self.assertEqual(resolve.call_count, 2)
+
+    @patch('api.integrations.draft.resolve_address_ui_flow')
+    def test_resolution_trusts_tool_confirmed_places(self, resolve):
+        tool_log = [
+            {
+                'name': 'detalles_direccion', 'arguments': {'place_id': 'p1'},
+                'result': {
+                    'display_name': 'Cra 5 #12-01, Tuluá, Valle del Cauca, Colombia',
+                    'lat': 4.085, 'lng': -76.195,
+                },
+            },
+            {
+                'name': 'detalles_direccion', 'arguments': {'place_id': 'p2'},
+                'result': {
+                    'display_name': 'Cl. 43 # 23A-45, Tuluá, Valle del Cauca, Colombia',
+                    'lat': 4.07084, 'lng': -76.20234,
+                },
+            },
+        ]
+        payload = {
+            'origin_address': 'Cra 5 #12-01, Tuluá', 'origin_lat': 4.085, 'origin_lng': -76.195,
+            'stops': [{
+                'stop_no': 1, 'service_type': 'domicilio',
+                'dest_address': 'Calle 43 #23A - 45 nuevo príncipe',
+                'lat': 4.07084, 'lng': -76.20234,
+            }],
+            'missing': [],
+        }
+
+        result = resolve_draft_addresses(payload, CATALOG, tool_log, [])
+
+        resolve.assert_not_called()
+        self.assertEqual(result['origin_address'], 'Cra 5 #12-01, Tuluá, Valle del Cauca, Colombia')
+        self.assertEqual(result['stops'][0]['dest_address'], 'Cl. 43 # 23A-45, Tuluá, Valle del Cauca, Colombia')
+        self.assertEqual(result['missing'], [])
+
+    @patch('api.integrations.draft.resolve_address_ui_flow')
+    def test_resolution_trusts_saved_addresses_with_coordinates(self, resolve):
+        saved = [{'address': 'Cra 5 #12-01', 'is_default': True, 'lat': 4.085, 'lng': -76.195}]
+        payload = {
+            'origin_address': 'Cra 5 #12-01', 'origin_lat': None, 'origin_lng': None,
+            'stops': [], 'missing': [],
+        }
+
+        result = resolve_draft_addresses(payload, CATALOG, [], saved)
+
+        resolve.assert_not_called()
+        self.assertEqual(result['origin_lat'], 4.085)
+        self.assertEqual(result['origin_lng'], -76.195)
+
+    @patch('api.integrations.draft.resolve_address_ui_flow')
+    def test_resolution_replaces_coordinates_without_a_confirmed_place(self, resolve):
+        resolve.return_value = {
+            'display_name': 'Cl. 5c # 17-88, Tuluá, Valle del Cauca, Colombia',
+            'lat': 4.1006, 'lng': -76.2066,
+        }
+        payload = {
+            'origin_address': 'Calle 5c #17-88', 'origin_lat': 3.0, 'origin_lng': -75.0,
+            'stops': [], 'missing': [],
+        }
+
+        result = resolve_draft_addresses(payload, CATALOG, [], [])
+
+        self.assertEqual(result['origin_lat'], 4.1006)
+        self.assertEqual(result['origin_lng'], -76.2066)
+        self.assertEqual(result['origin_address'], 'Cl. 5c # 17-88, Tuluá, Valle del Cauca, Colombia')
+        self.assertEqual(result['missing'], [])
+
+    @patch('api.integrations.draft.resolve_address_ui_flow', return_value=None)
+    def test_resolution_flags_unconfirmed_addresses_and_keeps_the_text(self, resolve):
+        payload = {
+            'origin_address': 'Donde siempre', 'origin_lat': None, 'origin_lng': None,
+            'stops': [
+                {'stop_no': 1, 'service_type': 'domicilio', 'dest_address': 'La casa de mi mamá', 'lat': None, 'lng': None},
+                {'stop_no': 2, 'service_type': 'compras', 'dest_address': 'mercado', 'lat': None, 'lng': None},
+            ],
+            'missing': [],
+        }
+
+        result = resolve_draft_addresses(payload, CATALOG, [], [])
+
+        self.assertEqual(result['origin_address'], 'Donde siempre')
+        self.assertEqual(result['stops'][0]['dest_address'], 'La casa de mi mamá')
+        self.assertEqual(result['missing'], [
+            'dirección de origen (sin verificar)',
+            'dirección de la parada 1 (sin verificar)',
+        ])
+        self.assertEqual(resolve.call_count, 2)
+
+    @patch('api.integrations.draft.resolve_address_ui_flow')
+    def test_resolution_caps_the_lookups_per_draft(self, resolve):
+        resolve.return_value = {'display_name': 'X, Tuluá', 'lat': 4.0, 'lng': -76.0}
+        payload = {
+            'origin_address': '', 'origin_lat': None, 'origin_lng': None,
+            'stops': [
+                {
+                    'stop_no': index, 'service_type': 'domicilio',
+                    'dest_address': f'Calle {index} #1-1', 'lat': None, 'lng': None,
+                }
+                for index in range(1, draft.MAX_ADDRESS_LOOKUPS + 2)
+            ],
+            'missing': [],
+        }
+
+        result = resolve_draft_addresses(payload, CATALOG, [], [])
+
+        self.assertEqual(resolve.call_count, draft.MAX_ADDRESS_LOOKUPS)
+        self.assertEqual(
+            result['missing'],
+            [f'dirección de la parada {draft.MAX_ADDRESS_LOOKUPS + 1} (sin verificar)'],
+        )
+
+
+# ---------------------------------------------------------------------------
 #  Generation loop (retry + caching)
 # ---------------------------------------------------------------------------
 
@@ -384,16 +602,22 @@ class GenerateTests(TestCase):
     def test_retries_once_when_the_model_breaks_the_schema(self):
         messages = [{'role': 'user', 'content': 'x'}]
         with patch('api.integrations.draft._run_tool_loop') as loop:
-            loop.side_effect = ['no soy json', json.dumps(MODEL_DRAFT)]
-            result = draft._generate(messages, CATALOG, TOOL_CATALOG)
+            loop.side_effect = [
+                ('no soy json', []),
+                (json.dumps(MODEL_DRAFT), [{'name': 'detalles_direccion'}]),
+            ]
+            result, tool_log = draft._generate(messages, CATALOG, TOOL_CATALOG)
 
         self.assertEqual(result['stops'][0]['service_type'], 'domicilio')
         self.assertEqual(loop.call_count, 2)
+        self.assertEqual(tool_log, [{'name': 'detalles_direccion'}])
         # The repair message quotes the first failure and stays in the thread.
         self.assertIn('no cumple el esquema', messages[-1]['content'])
+        # The repair attempt does not force tools again.
+        self.assertFalse(loop.call_args.kwargs.get('force_tools', True))
 
     def test_fails_after_the_single_retry(self):
-        with patch('api.integrations.draft._run_tool_loop', return_value='no soy json'):
+        with patch('api.integrations.draft._run_tool_loop', return_value=('no soy json', [])):
             with self.assertRaises(DraftError):
                 draft._generate([{'role': 'user', 'content': 'x'}], CATALOG, TOOL_CATALOG)
 
@@ -408,23 +632,64 @@ class GenerateTests(TestCase):
         ]
         with patch('api.integrations.draft.llm.chat', side_effect=responses) as chat:
             with patch('api.integrations.draft.run_tool', return_value={'resultados': []}) as tool:
-                content = draft._run_tool_loop(messages)
+                content, tool_log = draft._run_tool_loop(messages)
 
         self.assertIn('origin_address', content)
         self.assertEqual(chat.call_count, 2)
         tool.assert_called_once_with('buscar_direccion', {'query': 'Calle 10'})
+        self.assertEqual(tool_log, [{
+            'name': 'buscar_direccion',
+            'arguments': {'query': 'Calle 10'},
+            'result': {'resultados': []},
+        }])
         tool_messages = [m for m in messages if m.get('role') == 'tool']
         self.assertEqual(len(tool_messages), 1)
         self.assertEqual(tool_messages[0]['tool_call_id'], 'c1')
+        # Round 1 forces the search; tool rounds never mix in JSON mode.
+        self.assertEqual(chat.call_args_list[0].kwargs['tool_choice'], 'required')
+        self.assertNotIn('json_mode', chat.call_args_list[0].kwargs)
+
+    def test_tool_loop_falls_back_when_tool_choice_is_rejected(self):
+        messages = [{'role': 'user', 'content': 'x'}]
+        responses = [
+            draft.llm.LLMError('400 tool_choice no soportado'),
+            {'role': 'assistant', 'content': json.dumps(MODEL_DRAFT), 'tool_calls': []},
+        ]
+        with patch('api.integrations.draft.llm.chat', side_effect=responses) as chat:
+            content, _tool_log = draft._run_tool_loop(messages)
+
+        self.assertIn('origin_address', content)
+        self.assertEqual(chat.call_args_list[0].kwargs['tool_choice'], 'required')
+        self.assertIsNone(chat.call_args_list[1].kwargs.get('tool_choice'))
+
+    def test_tool_loop_asks_for_json_when_the_answer_is_not_json(self):
+        messages = [{'role': 'user', 'content': 'x'}]
+        responses = [
+            {
+                'role': 'assistant', 'content': '',
+                'tool_calls': [{'id': 'c1', 'name': 'buscar_direccion', 'arguments': {'query': 'Calle 10'}}],
+            },
+            {'role': 'assistant', 'content': 'Aquí está el pedido…', 'tool_calls': []},
+            {'role': 'assistant', 'content': json.dumps(MODEL_DRAFT), 'tool_calls': []},
+        ]
+        with patch('api.integrations.draft.llm.chat', side_effect=responses) as chat:
+            with patch('api.integrations.draft.run_tool', return_value={'resultados': []}):
+                content, _tool_log = draft._run_tool_loop(messages)
+
+        self.assertIn('origin_address', content)
+        self.assertEqual(chat.call_count, 3)
+        self.assertTrue(chat.call_args_list[-1].kwargs['json_mode'])
+        self.assertNotIn('tools', chat.call_args_list[-1].kwargs)
 
     def test_draft_from_message_caches_by_message_window(self):
         start = make_message(self.conversation, 'manda un domiciliario')
-        with patch('api.integrations.draft._generate', return_value=dict(MODEL_DRAFT)) as generate:
+        with patch('api.integrations.draft._generate', return_value=(dict(MODEL_DRAFT), [])) as generate:
             with patch('api.integrations.draft.llm.is_configured', return_value=True):
                 with patch('api.integrations.draft.resolve_draft_client', return_value={'ops_client_user_id': None, 'name': '', 'phone': ''}):
                     with patch('api.integrations.draft.fetch_client_context', return_value={'addresses': [], 'orders': []}):
-                        first = draft.draft_from_message(self.conversation, start)
-                        second = draft.draft_from_message(self.conversation, start)
+                        with patch('api.integrations.draft.resolve_draft_addresses'):
+                            first = draft.draft_from_message(self.conversation, start)
+                            second = draft.draft_from_message(self.conversation, start)
 
         self.assertFalse(first['cached'])
         self.assertTrue(second['cached'])
@@ -433,8 +698,9 @@ class GenerateTests(TestCase):
 
         # A new inbound message opens a new window and regenerates.
         make_message(self.conversation, '¿ya va?')
-        with patch('api.integrations.draft._generate', return_value=dict(MODEL_DRAFT)) as generate:
-            third = draft.draft_from_message(self.conversation, start)
+        with patch('api.integrations.draft._generate', return_value=(dict(MODEL_DRAFT), [])) as generate:
+            with patch('api.integrations.draft.resolve_draft_addresses'):
+                third = draft.draft_from_message(self.conversation, start)
         self.assertFalse(third['cached'])
         self.assertEqual(generate.call_count, 1)
 

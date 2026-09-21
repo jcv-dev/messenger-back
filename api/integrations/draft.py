@@ -6,17 +6,21 @@ pedido starts. This module:
 1. Builds the transcript from that message onward (cap 60, 800 chars each).
 2. Loads the ops context the model needs: client link, saved addresses, a
    summary of the last 3 orders, the service catalog and the calculator tools.
-3. Runs the DeepSeek call in JSON mode with two tools (address search and
-   place details), so addresses are real Tuluá addresses with coordinates.
-4. Validates the response against the order schema, retries once when the
-   model breaks it, and caches by
-   ``(conversation, from_message_id, last_message_id)``.
+3. Runs the DeepSeek call with two tools (address search and place details)
+   that hit the same calculator endpoints the UI uses; the first round forces
+   a tool call instead of letting the model answer from memory.
+4. Validates the response, replays the UI's search → best match → details
+   sequence for any address the model did not confirm (unresolved addresses
+   are flagged in ``missing[]``), retries once when the model breaks the
+   schema, and caches by ``(conversation, from_message_id, last_message_id)``.
 
 Nothing is sent to ops: the response only prefills the order sheet.
 """
 
 import json
 import logging
+import re
+import unicodedata
 from datetime import date
 
 from django.conf import settings
@@ -48,6 +52,25 @@ ALLOWED_PROFILE = frozenset({'usuario_final', 'negocio'})
 # Message types that never carry order context (reactions/edits are noise and
 # template messages are the automatic status notifications).
 SKIPPED_MESSAGE_TYPES = frozenset({'reaction', 'edit', 'template'})
+
+# Address post-validation (follow-up 2026-09-21): a draft address only counts
+# when it went through the same Places search → details flow as the UI, so the
+# quote uses the picked place's coordinates instead of the calculator's
+# text-geocoding fallback (a different engine, a different price).
+MAX_ADDRESS_LOOKUPS = 6
+ADDRESS_COORD_TOLERANCE = 1e-3  # ~110 m; absorbs model rounding
+
+# Street-type aliases (accent-less) so "calle" matches Google's "cl".
+_STREET_ALIASES = (
+    frozenset({'calle', 'cl', 'cll'}),
+    frozenset({'carrera', 'cra', 'cr'}),
+    frozenset({'avenida', 'av', 'ave', 'avda'}),
+    frozenset({'diagonal', 'diag'}),
+    frozenset({'transversal', 'trans', 'tr'}),
+    frozenset({'autopista'}),
+    frozenset({'circular'}),
+    frozenset({'manzana', 'mz'}),
+)
 
 
 class DraftError(Exception):
@@ -363,16 +386,19 @@ REGLAS
    direcciones guardadas y sus últimos pedidos para completar origen y destinos. Las
    direcciones guardadas ya están confirmadas: cópialas tal cual, con sus coordenadas
    cuando aparezcan.
-4. Para las direcciones que el cliente mencione en la conversación, confírmalas con la
-   herramienta `buscar_direccion`. Luego usa `detalles_direccion` con el `place_id`
-   elegido y copia EXACTAMENTE la dirección y las coordenadas que devuelve la
-   herramienta.
-5. Si la conversación no menciona una ciudad, busca siempre en Tuluá (Valle del Cauca).
+4. Para cada dirección que mencione el cliente, usa `buscar_direccion` y luego
+   `detalles_direccion` con el `place_id` de la sugerencia que coincida con la vía y el
+   número que dijo el cliente (las palabras del barrio son opcionales). Copia EXACTAMENTE
+   la dirección y las coordenadas que devuelve `detalles_direccion`.
+5. Si ninguna sugerencia coincide con la dirección, NO la inventes ni copies el texto
+   del cliente: agrégala a `missing[]`. Nunca devuelvas una dirección sin confirmarla
+   con las herramientas.
+6. Si la conversación no menciona una ciudad, busca siempre en Tuluá (Valle del Cauca).
    Usa otra ciudad únicamente si el cliente la menciona de forma explícita.
-6. No inventes direcciones, precios ni datos. Si un dato falta, agrégalo a `missing[]`
+7. No inventes precios ni datos. Si un dato falta, agrégalo a `missing[]`
    con un texto corto en español (por ejemplo "dirección de la parada 2").
-7. `confidence` es un número entre 0 y 1: qué tan seguro estás del pedido extraído.
-8. Responde SIEMPRE con un único objeto JSON válido, sin texto extra, con esta forma:
+8. `confidence` es un número entre 0 y 1: qué tan seguro estás del pedido extraído.
+9. Responde SIEMPRE con un único objeto JSON válido, sin texto extra, con esta forma:
 {{
   "origin_address": "dirección de recogida",
   "origin_lat": 4.0,
@@ -513,11 +539,44 @@ def run_tool(name: str, arguments: dict) -> dict:
     return {'error': f'herramienta desconocida: {name}'}
 
 
-def _run_tool_loop(messages) -> str:
-    """Chat until the model answers without tool calls; returns its content."""
+def _is_json_object(content) -> bool:
+    try:
+        return isinstance(json.loads(content or ''), dict)
+    except ValueError:
+        return False
+
+
+def _chat_with_tools(messages, tool_choice=None):
+    """One tool-enabled chat call; drops ``tool_choice`` if the provider rejects it."""
+    try:
+        return llm.chat(messages, tools=TOOL_DEFINITIONS, tool_choice=tool_choice)
+    except llm.LLMError:
+        if not tool_choice:
+            raise
+        logger.warning('LLM rejected tool_choice=%r; retrying without it', tool_choice)
+        return llm.chat(messages, tools=TOOL_DEFINITIONS)
+
+
+def _final_json_answer(messages) -> str:
+    """Ask for the final JSON object with tools removed and JSON mode on."""
+    final = llm.chat(messages, json_mode=True)
+    return final.get('content') or ''
+
+
+def _run_tool_loop(messages, *, force_tools=True):
+    """Chat until the model answers without tool calls.
+
+    Returns ``(content, tool_log)``; the log records every executed call
+    (name, arguments, result) so the draft can trust the addresses the model
+    confirmed through the tools. The first round forces at least one tool call
+    when ``force_tools``, and JSON mode is reserved for the final answer call:
+    sending both at once is what let the model skip the address tools.
+    """
+    tool_log = []
     max_rounds = int(getattr(settings, 'ORDER_LLM_MAX_TOOL_ROUNDS', MAX_TOOL_ROUNDS))
-    for _round in range(max(1, max_rounds)):
-        message = llm.chat(messages, tools=TOOL_DEFINITIONS, json_mode=True)
+    for round_index in range(max(1, max_rounds)):
+        tool_choice = 'required' if (force_tools and round_index == 0) else None
+        message = _chat_with_tools(messages, tool_choice=tool_choice)
         calls = message.get('tool_calls') or []
         messages.append({
             'role': 'assistant',
@@ -535,10 +594,18 @@ def _run_tool_loop(messages) -> str:
             ]} if calls else {}),
         })
         if not calls:
-            return message.get('content') or ''
+            content = message.get('content') or ''
+            if _is_json_object(content):
+                return content, tool_log
+            return _final_json_answer(messages), tool_log
 
         for call in calls[:MAX_TOOL_CALLS]:
             result = run_tool(call['name'], call['arguments'])
+            tool_log.append({
+                'name': call['name'],
+                'arguments': call['arguments'],
+                'result': result,
+            })
             messages.append({
                 'role': 'tool',
                 'tool_call_id': call['id'],
@@ -546,8 +613,7 @@ def _run_tool_loop(messages) -> str:
             })
 
     # Tool budget spent: ask for the final JSON without tools.
-    final = llm.chat(messages, json_mode=True)
-    return final.get('content') or ''
+    return _final_json_answer(messages), tool_log
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +735,227 @@ def normalize_draft(raw, catalog, tool_catalog) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+#  Address resolution (same flow as the UI)
+# ---------------------------------------------------------------------------
+
+
+def _match_tokens(text) -> list:
+    """Accent-less lowercase alphanumeric tokens for address matching."""
+    decomposed = unicodedata.normalize('NFKD', str(text or ''))
+    without_accents = ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+    cleaned = re.sub(r'[^a-z0-9]+', ' ', without_accents.lower())
+    return cleaned.split()
+
+
+def _street_group(token):
+    for index, aliases in enumerate(_STREET_ALIASES):
+        if token in aliases:
+            return index
+    return None
+
+
+def _address_candidate_matches(query_tokens, candidate_tokens) -> bool:
+    """Whether a suggestion plausibly is the address the client mentioned.
+
+    Street + number are the anchors (barrio words are optional); when the
+    query carries no number, every token must appear in the suggestion.
+    """
+    if not query_tokens:
+        return False
+    candidate = set(candidate_tokens)
+    numeric = [token for token in query_tokens if any(ch.isdigit() for ch in token)]
+    if not numeric:
+        return all(token in candidate for token in query_tokens)
+    if any(token not in candidate for token in numeric):
+        return False
+    groups = {group for group in (_street_group(t) for t in query_tokens) if group is not None}
+    if groups and not any(_street_group(t) in groups for t in candidate_tokens):
+        return False
+    return True
+
+
+def _address_candidate_score(query_tokens, candidate_tokens) -> tuple:
+    candidate = set(candidate_tokens)
+    matches = sum(1 for token in query_tokens if token in candidate)
+    return matches, 1 if 'tulua' in candidate else 0
+
+
+def _confirmed_places(tool_log, saved_addresses) -> list:
+    """Places the draft may trust as-is: details results + saved addresses."""
+    confirmed = []
+    for entry in tool_log or []:
+        if not isinstance(entry, dict) or entry.get('name') != 'detalles_direccion':
+            continue
+        result = entry.get('result')
+        if not isinstance(result, dict):
+            continue
+        confirmed.append({
+            'address': str(result.get('display_name') or '').strip(),
+            'lat': _as_float(result.get('lat'), low=-90, high=90),
+            'lng': _as_float(result.get('lng'), low=-180, high=180),
+        })
+    for row in saved_addresses or []:
+        if not isinstance(row, dict):
+            continue
+        confirmed.append({
+            'address': str(row.get('address') or '').strip(),
+            'lat': _as_float(row.get('lat'), low=-90, high=90),
+            'lng': _as_float(row.get('lng'), low=-180, high=180),
+        })
+    return confirmed
+
+
+def _match_confirmed_place(address, lat, lng, confirmed):
+    """The confirmed place for an address: same text (or same coordinates)."""
+    address_tokens = _match_tokens(address)
+    if address_tokens:
+        for row in confirmed:
+            if _match_tokens(row.get('address')) == address_tokens:
+                return row
+    if lat is not None and lng is not None:
+        for row in confirmed:
+            row_lat, row_lng = row.get('lat'), row.get('lng')
+            if row_lat is None or row_lng is None:
+                continue
+            if (
+                abs(lat - row_lat) <= ADDRESS_COORD_TOLERANCE
+                and abs(lng - row_lng) <= ADDRESS_COORD_TOLERANCE
+            ):
+                return row
+    return None
+
+
+def resolve_address_ui_flow(address: str):
+    """Replay the UI flow: Places search → best matching suggestion → details.
+
+    Returns ``{'place_id', 'display_name', 'lat', 'lng'}`` or ``None`` when
+    the calculator is unavailable or no suggestion matches.
+    """
+    query = str(address or '').strip()
+    if not query or not calculator.is_configured():
+        return None
+    try:
+        results = calculator.geocode_search(query)
+    except calculator.CalculatorAPIError as exc:
+        logger.warning('Draft: address search failed for %r: %s', query[:120], exc)
+        return None
+
+    query_tokens = _match_tokens(query)
+    candidates = []
+    for index, row in enumerate(results or []):
+        if not isinstance(row, dict):
+            continue
+        place_id = str(row.get('place_id') or '').strip()
+        display_name = str(row.get('display_name') or '').strip()
+        if not place_id or not display_name:
+            continue
+        tokens = _match_tokens(display_name)
+        if not _address_candidate_matches(query_tokens, tokens):
+            continue
+        # Highest token match wins; Tuluá is preferred, then Places' own order.
+        candidates.append((_address_candidate_score(query_tokens, tokens), -index, place_id))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+
+    for _score, _order, place_id in candidates[:3]:
+        try:
+            place = calculator.geocode_details(place_id)
+        except calculator.CalculatorAPIError as exc:
+            logger.warning('Draft: place details failed for %s: %s', place_id, exc)
+            continue
+        if not isinstance(place, dict):
+            continue
+        display_name = str(place.get('display_name') or '').strip()
+        # The formatted address must itself match the query: otherwise a
+        # business-name autocomplete hit ("Donde siempre") would resolve to a
+        # street the client never gave.
+        if not display_name or not _address_candidate_matches(
+            query_tokens, _match_tokens(display_name),
+        ):
+            continue
+        lat = _as_float(place.get('lat'), low=-90, high=90)
+        lng = _as_float(place.get('lng'), low=-180, high=180)
+        if lat is None or lng is None:
+            continue
+        return {
+            'place_id': place_id,
+            'display_name': display_name,
+            'lat': lat,
+            'lng': lng,
+        }
+    return None
+
+
+def resolve_draft_addresses(draft, catalog, tool_log, saved_addresses) -> dict:
+    """Guarantee every draft address went through the UI's Places flow.
+
+    Trusted as-is: coordinates confirmed with ``detalles_direccion`` during the
+    model's own tool calls, and saved ops addresses (already confirmed, copied
+    verbatim). Anything else is re-resolved with :func:`resolve_address_ui_flow`
+    — the address the agent would get by clicking the best suggestion.
+
+    When the search finds no plausible match (or the calculator is down) the
+    address text is kept and the field is flagged in ``missing[]``, so the
+    sheet warns the agent instead of quoting a guess.
+    """
+    confirmed = _confirmed_places(tool_log, saved_addresses)
+    lookups = 0
+
+    def resolve_one(address, lat, lng, label):
+        nonlocal lookups
+        address = str(address or '').strip()
+        if not address:
+            return lat, lng, None, None
+        place = _match_confirmed_place(address, lat, lng, confirmed)
+        place_lat = place.get('lat') if place else None
+        place_lng = place.get('lng') if place else None
+        if place and place_lat is not None and place_lng is not None:
+            return place_lat, place_lng, (place.get('address') or None), None
+        if lookups >= MAX_ADDRESS_LOOKUPS:
+            return lat, lng, None, label
+        lookups += 1
+        resolved = resolve_address_ui_flow(address)
+        if resolved:
+            return resolved['lat'], resolved['lng'], resolved['display_name'], None
+        return lat, lng, None, label
+
+    missing = draft.setdefault('missing', [])
+
+    def flag(label):
+        # The sheet renders these as "Falta confirmar: {label}."
+        text = f'dirección de {label} (sin verificar)'
+        if text not in missing:
+            missing.append(text)
+
+    origin_lat, origin_lng, origin_address, origin_missing = resolve_one(
+        draft.get('origin_address'), draft.get('origin_lat'), draft.get('origin_lng'), 'origen',
+    )
+    draft['origin_lat'] = origin_lat
+    draft['origin_lng'] = origin_lng
+    if origin_address:
+        draft['origin_address'] = origin_address
+    if origin_missing:
+        flag('origen')
+
+    for stop in draft.get('stops') or []:
+        if not service_requires_address(stop.get('service_type') or '', catalog):
+            continue
+        label = f'la parada {stop.get("stop_no")}'
+        lat, lng, address, unresolved = resolve_one(
+            stop.get('dest_address'), stop.get('lat'), stop.get('lng'), label,
+        )
+        stop['lat'] = lat
+        stop['lng'] = lng
+        if address:
+            stop['dest_address'] = address
+        if unresolved:
+            flag(label)
+
+    return draft
+
+
 def _parse_content(content: str) -> dict:
     try:
         parsed = json.loads(content or '')
@@ -679,11 +966,15 @@ def _parse_content(content: str) -> dict:
     return parsed
 
 
-def _generate(messages, catalog, tool_catalog) -> dict:
-    """Run the tool loop, validate, retry once with a repair message."""
-    content = _run_tool_loop(messages)
+def _generate(messages, catalog, tool_catalog) -> tuple:
+    """Run the tool loop, validate, retry once with a repair message.
+
+    Returns ``(draft, tool_log)``; the log concatenates both attempts so the
+    address post-validation can trust confirmed places from either one.
+    """
+    content, tool_log = _run_tool_loop(messages)
     try:
-        return normalize_draft(_parse_content(content), catalog, tool_catalog)
+        return normalize_draft(_parse_content(content), catalog, tool_catalog), tool_log
     except DraftResponseError as first_error:
         logger.info('Draft response invalid, retrying once: %s', first_error.message)
         messages.append({'role': 'assistant', 'content': content[:4000]})
@@ -695,9 +986,12 @@ def _generate(messages, catalog, tool_catalog) -> dict:
                 f'claves indicadas. Error: {first_error.message}'
             ),
         })
-        content = _run_tool_loop(messages)
+        content, retry_log = _run_tool_loop(messages, force_tools=False)
         try:
-            return normalize_draft(_parse_content(content), catalog, tool_catalog)
+            return (
+                normalize_draft(_parse_content(content), catalog, tool_catalog),
+                [*tool_log, *retry_log],
+            )
         except DraftResponseError as second_error:
             raise DraftError(
                 f'No se pudo interpretar el pedido: {second_error.message}',
@@ -742,11 +1036,13 @@ def draft_from_message(conversation, from_message: Message) -> dict:
     messages = build_messages(transcript, client_ref, client_context, catalog, tool_catalog)
 
     try:
-        draft = _generate(messages, catalog, tool_catalog)
+        draft, tool_log = _generate(messages, catalog, tool_catalog)
     except llm.LLMNotConfigured as exc:
         raise DraftNotConfigured(exc.args[0] if exc.args else str(exc)) from exc
     except llm.LLMError as exc:
         raise DraftError(exc.args[0] if exc.args else str(exc)) from exc
+
+    resolve_draft_addresses(draft, catalog, tool_log, client_context.get('addresses'))
 
     result = {
         'from_message_id': from_message.id,
