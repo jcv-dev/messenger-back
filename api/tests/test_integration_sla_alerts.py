@@ -203,6 +203,50 @@ class SlaAlertTests(APITestCase):
         self.assertEqual(data['skipped'], 'disabled')
         self.assertEqual(self.outbound_templates(), [])
 
+    def test_test_order_is_skipped_without_conversation(self):
+        res = self.post_alert(self.alert(order={
+            'order_number': 900123456,
+            'status': 'asignado',
+            'minutes': 12,
+            'threshold': 5,
+            'is_test': True,
+        }))
+
+        data = res.json()
+        self.assertTrue(data['ok'])
+        self.assertFalse(data['sent'])
+        self.assertFalse(data['duplicate'])
+        self.assertEqual(data['skipped'], 'test_order')
+        self.assertEqual(Conversation.objects.count(), 0)
+        self.assertEqual(self.outbound_templates(), [])
+
+    def test_test_order_flag_accepts_string_values(self):
+        res = self.post_alert(self.alert(order={
+            'order_number': 900123456,
+            'status': 'asignado',
+            'minutes': 12,
+            'threshold': 5,
+            'is_test': 'true',
+        }))
+
+        data = res.json()
+        self.assertFalse(data['sent'])
+        self.assertEqual(data['skipped'], 'test_order')
+        self.assertEqual(self.outbound_templates(), [])
+
+    def test_real_order_is_not_skipped_by_the_test_guard(self):
+        data = self.post_alert(self.alert(order={
+            'order_number': 900123456,
+            'status': 'asignado',
+            'minutes': 12,
+            'threshold': 5,
+            'is_test': False,
+        })).json()
+
+        self.assertTrue(data['sent'])
+        self.assertIsNone(data['skipped'])
+        self.assertEqual(len(self.outbound_templates()), 1)
+
     # ── Configuration ────────────────────────────────────────────────────
 
     def test_config_override_changes_template_and_variables(self):

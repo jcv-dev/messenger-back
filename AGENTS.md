@@ -282,7 +282,9 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
   `BotConfig` keys `sla_alert_template`, `sla_notifications_enabled` (migration
   `0044`); `sla_alert_template` params map the template placeholders
   (`order_code`, `time`, `order_status`) to the ops values, with `en_ruta`
-  rendered as `en ruta`.
+  rendered as `en ruta`. `order.is_test` truthy → `skipped: "test_order"`
+  without creating conversation or message (follow-up 2026-09-21: ops already
+  filters test orders/couriers in `domii:sla-alerts`).
 - `WHATSAPP_GRAPH_BASE_URL` (setting, default `https://graph.facebook.com/v20.0`)
   redirects the outbound send path, which is how the live service-window fallback
   is exercised with a local mock.

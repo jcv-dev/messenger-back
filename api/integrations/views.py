@@ -769,6 +769,8 @@ class SlaAlertView(IntegrationAPIView):
                 'status': status_value,
                 'minutes': minutes,
                 'threshold': threshold,
+                # Pedidos/domis de prueba: el módulo los omite (test_order).
+                'is_test': order.get('is_test', False),
             },
         })
 

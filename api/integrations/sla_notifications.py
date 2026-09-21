@@ -20,6 +20,11 @@ message; ops appends the threshold cycle (``minutes // threshold``) so an
 intentional later reminder is a different key. When the courier has no
 conversation yet, one is created (and tagged ``Domii``) so the alert also shows
 up in the panel thread.
+
+``order.is_test`` is defense in depth: a test order (or test courier) never
+gets WhatsApp. Its phone is fictitious, Meta rejects the template (131026) and
+the thread fills with failed messages; ops already excludes those orders from
+``domii:sla-alerts``.
 """
 
 import json
@@ -66,6 +71,13 @@ def notifications_enabled() -> bool:
     from api.bot.config import get_config
 
     return bool(get_config('sla_notifications_enabled', True))
+
+
+def _is_test_flag(value) -> bool:
+    """``order.is_test`` may arrive as bool, int or string (``"true"``/``"1"``)."""
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'on')
+    return bool(value)
 
 
 def get_sla_template() -> dict:
@@ -196,6 +208,9 @@ def send_sla_alert(payload: dict) -> dict:
 
     if not notifications_enabled():
         return {'sent': False, 'duplicate': False, 'skipped': 'disabled', 'message_id': None}
+
+    if _is_test_flag(order.get('is_test')):
+        return {'sent': False, 'duplicate': False, 'skipped': 'test_order', 'message_id': None}
 
     phone = to_wa(courier.get('phone'))
     if not phone:
