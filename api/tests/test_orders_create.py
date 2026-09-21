@@ -759,6 +759,30 @@ class OrderDetailRefreshTests(APITestCase):
         self.assertEqual(stop2.status, 'en_ruta')
         self.assertEqual(res.data['order']['status'], 'en_ruta')
 
+    def test_refresh_mirrors_price_and_content(self):
+        ops_order = {
+            'ok': True, 'order_number': 1234, 'status': 'asignado',
+            'status_label': 'Domiciliario asignado', 'courier': 'sn42',
+            'stops': [{'stop': 1, 'service_type': 'domicilio', 'address': 'Cra 9 #99-99',
+                       'description': 'Paquete grande', 'observation': 'Timbre azul',
+                       'status': 'asignado', 'price': 9500, 'lat': 4.6, 'lng': -74.1}],
+        }
+        with patch('api.integrations.orders.ops.get_order', return_value=ops_order), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(f'/api/orders/{self.order.id}/refresh/')
+
+        self.assertEqual(res.status_code, 200, res.data)
+        self.stop.refresh_from_db()
+        self.assertEqual(self.stop.price, 9500)
+        self.assertEqual(self.stop.dest_address, 'Cra 9 #99-99')
+        self.assertEqual(self.stop.description, 'Paquete grande')
+        self.assertEqual(self.stop.observation, 'Timbre azul')
+        self.assertAlmostEqual(self.stop.lat, 4.6)
+        self.assertAlmostEqual(self.stop.lng, -74.1)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.total, 9500)
+
     def test_refresh_ops_error_returns_502(self):
         with patch('api.integrations.orders.ops.get_order',
                    side_effect=ops.OpsAPIError('Ops respondió 500')):

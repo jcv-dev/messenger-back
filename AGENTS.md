@@ -273,6 +273,16 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
   frontend) and sends the approved `aviso_*` template instead. `send_template`
   payloads store JSON text; `send_whatsapp_outbound` parses it into an object
   before calling Meta.
+- `api/integrations/sla_notifications.py` (Phase 9) — courier SLA reminder over
+  WhatsApp (`POST /api/integrations/notifications/sla/`, scope `orders:write`).
+  `domii:sla-alerts` in ops posts `{alert_key, courier, order}`; the endpoint
+  dedupes on `alert_key` (24 h), normalizes the phone, finds/creates the courier
+  conversation (+ `Domii` tag) and sends the utility template directly (no
+  text-first; valid outside the 24 h window). Template and variables are
+  `BotConfig` keys `sla_alert_template`, `sla_notifications_enabled` (migration
+  `0044`); `sla_alert_template` params map the template placeholders
+  (`order_code`, `time`, `order_status`) to the ops values, with `en_ruta`
+  rendered as `en ruta`.
 - `WHATSAPP_GRAPH_BASE_URL` (setting, default `https://graph.facebook.com/v20.0`)
   redirects the outbound send path, which is how the live service-window fallback
   is exercised with a local mock.

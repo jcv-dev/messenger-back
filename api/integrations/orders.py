@@ -572,9 +572,11 @@ def refresh_order(order: Order) -> Order:
 
     A comanda shares one order number across stops, so ops is called once per
     unique number and each local stop reads its own status from the response
-    ``stops[]`` entry. Raises ``ops.OpsAPIError`` when ops cannot be reached.
+    ``stops[]`` entry. The snapshot also refreshes price/coords/content, so a
+    panel edit that didn't push an event still lands on Refrescar.
+    Raises ``ops.OpsAPIError`` when ops cannot be reached.
     """
-    from .views import recompute_order_status
+    from .views import _apply_stop_fields, recompute_order_status
 
     now = timezone.now()
     groups: dict[int, list] = {}
@@ -609,8 +611,10 @@ def refresh_order(order: Order) -> Order:
 
         for stop in group:
             entry = entries.get(stop.stop_no)
-            if entry and entry.get('status'):
-                stop.status = str(entry['status'])[:20]
+            if entry:
+                _apply_stop_fields(stop, entry)
+                if entry.get('status'):
+                    stop.status = str(entry['status'])[:20]
             elif not entries:
                 # Response without a stops snapshot: fall back to the header.
                 stop.status = (data.get('status') or stop.status)[:20]
@@ -618,7 +622,10 @@ def refresh_order(order: Order) -> Order:
             payload = stop.payload if isinstance(stop.payload, dict) else {}
             payload['ops'] = data
             stop.payload = payload
-            stop.save(update_fields=['status', 'last_synced_at', 'payload'])
+            stop.save(update_fields=[
+                'status', 'service_type', 'dest_address', 'description',
+                'observation', 'price', 'lat', 'lng', 'last_synced_at', 'payload',
+            ])
 
     # ``order`` may carry a stale prefetched stops cache (the view prefetches).
     if hasattr(order, '_prefetched_objects_cache'):

@@ -2,11 +2,13 @@
 
 import json
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.core.cache import cache
 from django.test import override_settings
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework.test import APITestCase
 
 from api.integrations.auth import generate_api_key
@@ -92,7 +94,11 @@ class OrderEventsTests(APITestCase):
     # ── Locating ────────────────────────────────────────────────────────
 
     def test_unknown_order_returns_linked_false(self):
-        res, _ = self.post_event(self.event(999999, 'asignado'))
+        payload = self.event(
+            999999, 'asignado', batch_id=None,
+            client={'id': 999, 'name': 'Nadie', 'phone': '3009999999'},
+        )
+        res, _ = self.post_event(payload)
         self.assertEqual(res.status_code, 200)
         self.assertTrue(res.json()['ok'])
         self.assertFalse(res.json()['linked'])
@@ -150,6 +156,147 @@ class OrderEventsTests(APITestCase):
         self.assertTrue(res.json()['linked'])
         stop.refresh_from_db()
         self.assertEqual(stop.ops_order_number, 6000)
+
+    # ── Adoption (panel-created orders) ─────────────────────────────────
+
+    def test_adopts_order_for_linked_phone_less_client(self):
+        """A manual link (no phone) used to drop panel orders as linked:false."""
+        self.conversation.contact_phone = None
+        self.conversation.ops_client_user_id = 570
+        self.conversation.save(update_fields=['contact_phone', 'ops_client_user_id'])
+
+        payload = self.event(
+            39086, 'confirmado', event='order.created',
+            batch_id='4ba872d32498b09a',
+            client={'id': 570, 'name': 'Cristaleria La Regalona', 'phone': ''},
+            courier_code='jj76',
+            courier={'id': 176, 'name': 'Juan José', 'code': 'jj76'},
+            stops=[{
+                'stop': 1, 'service_type': 'domicilio', 'address': 'Cra 5 #12-01',
+                'description': '', 'observation': 'Timbre azul',
+                'status': 'confirmado', 'price': 8000, 'lat': 4.6, 'lng': -74.1,
+            }],
+        )
+        res, publish = self.post_event(payload)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json()['linked'])
+        self.assertEqual(res.json()['batch_status'], 'confirmado')
+        # A panel batch that is already assigned notifies ``asignado`` once.
+        self.assertTrue(res.json()['notified'])
+        self.assertEqual(res.json()['notified_status'], 'asignado')
+
+        order = Order.objects.exclude(pk=self.order.pk).get(conversation=self.conversation)
+        self.assertEqual(order.ops_batch_id, '4ba872d32498b09a')
+        self.assertEqual(order.ops_client_user_id, 570)
+        self.assertEqual(order.client_name, 'Cristaleria La Regalona')
+        self.assertEqual(order.status, 'confirmado')
+        self.assertEqual(order.total, 8000)
+        self.assertEqual(order.courier_code, 'jj76')
+        self.assertEqual(order.courier_name, 'Juan José')
+        self.assertEqual(order.ops_courier_user_id, 176)
+        self.assertTrue(order.payload['adopted'])
+        self.assertEqual(order.created_at, parse_datetime(payload['occurred_at']))
+
+        stop = order.stops.get()
+        self.assertEqual(stop.ops_order_number, 39086)
+        self.assertEqual(stop.status, 'confirmado')
+        self.assertEqual(stop.dest_address, 'Cra 5 #12-01')
+        self.assertEqual(stop.observation, 'Timbre azul')
+        self.assertEqual(stop.price, 8000)
+        self.assertAlmostEqual(stop.lat, 4.6)
+        self.assertAlmostEqual(stop.lng, -74.1)
+
+        self.assertEqual(publish.call_count, 1)
+
+    def test_adopts_by_phone_when_no_local_stop_matches(self):
+        """Same client, no Messager-created batch yet: adopt from the event."""
+        res, _ = self.post_event(self.event(39089, 'disponible', batch_id=None))
+
+        self.assertTrue(res.json()['linked'])
+        order = Order.objects.exclude(pk=self.order.pk).get(conversation=self.conversation)
+        stop = order.stops.get()
+        self.assertEqual(stop.ops_order_number, 39089)
+        self.assertEqual(order.status, 'disponible')
+
+    def test_adopts_into_most_recent_linked_conversation(self):
+        old = Conversation.objects.create(
+            whatsapp_id='573001112222', contact_name='Cristal (1)',
+            contact_phone='573001112222', ops_client_user_id=570,
+            last_message_at=timezone.now() - timedelta(hours=2),
+        )
+        new = Conversation.objects.create(
+            whatsapp_id='573003334444', contact_name='Cristal (2)',
+            contact_phone='573003334444', ops_client_user_id=570,
+            last_message_at=timezone.now(),
+        )
+
+        payload = self.event(
+            39087, 'disponible', event='order.created',
+            batch_id=None,
+            client={'id': 570, 'name': 'Cristaleria', 'phone': ''},
+        )
+        res, _ = self.post_event(payload)
+
+        self.assertTrue(res.json()['linked'])
+        self.assertTrue(Order.objects.filter(conversation=new).exists())
+        self.assertFalse(Order.objects.filter(conversation=old).exists())
+
+    def test_linked_conversation_with_matching_phone_wins(self):
+        matching = Conversation.objects.create(
+            whatsapp_id='573005556666', contact_name='Cristal (móvil)',
+            contact_phone='573005556666', ops_client_user_id=570,
+            last_message_at=timezone.now() - timedelta(hours=2),
+        )
+        Conversation.objects.create(
+            whatsapp_id='573003334444', contact_name='Cristal (2)',
+            contact_phone='573003334444', ops_client_user_id=570,
+            last_message_at=timezone.now(),
+        )
+
+        payload = self.event(
+            39088, 'disponible', event='order.created',
+            batch_id=None,
+            client={'id': 570, 'name': 'Cristaleria', 'phone': '3005556666'},
+        )
+        res, _ = self.post_event(payload)
+
+        self.assertTrue(res.json()['linked'])
+        self.assertTrue(Order.objects.filter(conversation=matching).exists())
+
+    def test_adoption_of_finished_order_does_not_notify(self):
+        self.conversation.ops_client_user_id = 570
+        self.conversation.save(update_fields=['ops_client_user_id'])
+
+        payload = self.event(
+            39090, 'entregado', event='order.created',
+            batch_id=None,
+            client={'id': 570, 'name': 'Cristaleria', 'phone': ''},
+            stops=[{'stop': 1, 'service_type': 'domicilio', 'address': 'Cra 5',
+                    'description': '', 'status': 'entregado', 'price': 5000}],
+        )
+        res, _ = self.post_event(payload)
+
+        self.assertTrue(res.json()['linked'])
+        self.assertFalse(res.json()['notified'])
+        order = Order.objects.exclude(pk=self.order.pk).get(conversation=self.conversation)
+        self.assertEqual(order.status, 'entregado')
+        self.assertEqual(order.notified_statuses, ['entregado'])
+
+    def test_second_event_updates_the_adopted_order(self):
+        self.conversation.ops_client_user_id = 570
+        self.conversation.save(update_fields=['ops_client_user_id'])
+
+        self.post_event(self.event(
+            39091, 'asignado', event='order.created', batch_id=None,
+            client={'id': 570, 'name': 'Cristaleria', 'phone': ''},
+        ))
+        res, _ = self.post_event(self.event(39091, 'en_ruta'))
+
+        self.assertTrue(res.json()['linked'])
+        self.assertEqual(res.json()['batch_status'], 'en_ruta')
+        order = Order.objects.exclude(pk=self.order.pk).get(conversation=self.conversation)
+        self.assertEqual(order.stops.get().status, 'en_ruta')
 
     def test_comanda_shared_number_updates_only_the_event_stop(self):
         """A comanda shares one order_number: `stop` picks the parada."""
