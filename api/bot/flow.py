@@ -32,7 +32,7 @@ from .router import _build_hours_response
 from .config import get_escalate_orders_enabled
 from api.models import Conversation, Message
 from api.serializers import MessageSerializer
-from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
+from api.views import publish_conversation_update, _enqueue_outbound_send
 
 logger = logging.getLogger("api.bot.flow")
 
@@ -269,13 +269,9 @@ async def _send_location(conversation, lat: float, lng: float, display_name: str
     conversation.last_message = f"📍 {payload['name']}"[:255]
     conversation.last_message_at = timezone.now()
     conversation._last_msg_direction = 'outbound'
+    await sync_to_async(_enqueue_outbound_send)(msg, schedule_delay=0)
     msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
     await sync_to_async(publish_conversation_update)(conversation, msg_data)
-    _send_pool.submit(
-        send_whatsapp_outbound,
-        'location', payload,
-        conversation.contact_phone, msg.id, conversation.id,
-    )
 
 
 # ---------------------------------------------------------------------------

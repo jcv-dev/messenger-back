@@ -23,7 +23,7 @@ from .config import (
 )
 from api.models import Conversation, ConversationNote, ConversationTake, Message
 from api.serializers import MessageSerializer
-from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
+from api.views import publish_conversation_update, _enqueue_outbound_send
 
 logger = logging.getLogger("api.bot.llm")
 
@@ -525,13 +525,9 @@ async def _execute_tool(function_call, conversation, session):
                 conversation.last_message = f"📍 {location_payload['name']}"[:255]
                 conversation.last_message_at = timezone.now()
                 conversation._last_msg_direction = 'outbound'
+                await sync_to_async(_enqueue_outbound_send)(msg, schedule_delay=0)
                 msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
                 await sync_to_async(publish_conversation_update)(conversation, msg_data)
-                _send_pool.submit(
-                    send_whatsapp_outbound,
-                    'location', location_payload,
-                    conversation.contact_phone, msg.id, conversation.id,
-                )
                 result = dict(result)
                 result["map_sent"] = True
 
@@ -585,12 +581,6 @@ async def _execute_tool(function_call, conversation, session):
                     ],
                 }
 
-            _send_pool.submit(
-                send_whatsapp_outbound,
-                'interactive', interactive_payload,
-                conversation.contact_phone, None, conversation.id,
-            )
-
             bot = await get_bot_user_async()
             last_msg_text = body[:255] or 'Mensaje interactivo'
             msg = await sync_to_async(Message.objects.create)(
@@ -611,6 +601,7 @@ async def _execute_tool(function_call, conversation, session):
             conversation.last_message = last_msg_text
             conversation.last_message_at = timezone.now()
             conversation._last_msg_direction = 'outbound'
+            await sync_to_async(_enqueue_outbound_send)(msg, schedule_delay=0)
             msg_data = await sync_to_async(lambda: MessageSerializer(msg).data)()
             await sync_to_async(publish_conversation_update)(conversation, msg_data)
 

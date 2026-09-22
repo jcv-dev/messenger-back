@@ -1,9 +1,11 @@
 """Tests for the outbound notify helpers (plan Phase 0)."""
 
 import json
+from datetime import datetime
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.utils import timezone
 
 from api.integrations.notify import (
     build_template_payload,
@@ -90,13 +92,17 @@ class CreateAndSendOutboundTests(TestCase):
         self.conversation.refresh_from_db()
         self.assertEqual(self.conversation.last_message, '[Document]')
 
-    def test_message_has_no_pending_status(self):
+    def test_message_is_queued_immediately_without_send_delay(self):
         with patch('api.views._send_pool'), patch('api.views.publish_conversation_update'):
             with self.captureOnCommitCallbacks(execute=True):
                 message = create_and_send_outbound(self.conversation, 'text', 'Hola')
 
         message.refresh_from_db()
-        self.assertNotEqual(message.metadata.get('status'), 'pending')
+        # Ops notifications still honor no undo delay: queued as pending but
+        # due right away (the default send_delay_seconds is 10).
+        self.assertEqual(message.metadata['status'], 'pending')
+        scheduled = datetime.fromisoformat(message.metadata['scheduled_for'])
+        self.assertLessEqual(scheduled, timezone.now())
         self.assertTrue(Message.objects.filter(id=message.id).exists())
 
     @patch('api.views._send_pool')
@@ -113,12 +119,10 @@ class CreateAndSendOutboundTests(TestCase):
 
         message.refresh_from_db()
         self.assertEqual(message.metadata['fallback_template']['name'], 'aviso_en_ruta')
-        # The pool receives the delivery wrapper (fallback-aware), not the raw
-        # sender, so a window rejection can be replaced by the template.
-        from api.integrations.notify import _deliver_outbound
-
-        self.assertEqual(pool.submit.call_args.args[0], _deliver_outbound)
-        self.assertEqual(pool.submit.call_args.args[3]['name'], 'aviso_en_ruta')
+        # The pool receives the claimed-send runner; the fallback descriptor
+        # rides the message metadata so recovery/retries keep it.
+        self.assertEqual(pool.submit.call_args.args[0].__name__, '_run_claimed_send')
+        self.assertEqual(pool.submit.call_args.args[1], message.id)
 
     @patch('api.views._send_pool')
     @patch('api.views.publish_conversation_update')

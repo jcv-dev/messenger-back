@@ -149,6 +149,28 @@ def get_send_delay_seconds():
     return int(get_config('send_delay_seconds', 10))
 
 
+def get_send_lease_seconds():
+    """How long a send claim is owned before the sweeper recovers it.
+
+    Must stay above the worst-case in-flight send (network timeouts, ffmpeg)
+    so recovery never re-sends a message that is still being delivered.
+    """
+    try:
+        value = int(get_config('send_lease_seconds', 300))
+    except (TypeError, ValueError):
+        value = 300
+    return max(1, value)
+
+
+def get_send_max_attempts():
+    """Send attempts for one message before it is marked failed."""
+    try:
+        value = int(get_config('send_max_attempts', 3))
+    except (TypeError, ValueError):
+        value = 3
+    return max(1, value)
+
+
 def get_order_created_message():
     """Confirmation text sent after an agent creates an order from the Messager."""
     from api.integrations.orders import DEFAULT_ORDER_CREATED_MESSAGE

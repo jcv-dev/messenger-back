@@ -374,7 +374,7 @@ class ServiceWindowFallbackTests(TestCase):
                 preview='🛵 Pedido #1234 en camino.',
             )
 
-    def fail(self, message, code=131047, text='(#131047) Re-engagement message'):
+    def mark_failed(self, message, code=131047, text='(#131047) Re-engagement message'):
         metadata = dict(message.metadata or {})
         metadata['send_error_code'] = code
         metadata['send_error'] = text
@@ -406,7 +406,7 @@ class ServiceWindowFallbackTests(TestCase):
 
     def test_fallback_replaces_the_failed_text(self):
         message = self.make_message(self.fallback())
-        self.fail(message)
+        self.mark_failed(message)
 
         with self.captureOnCommitCallbacks(execute=True):
             template = send_service_window_fallback(message.id, self.fallback())
@@ -437,16 +437,18 @@ class ServiceWindowFallbackTests(TestCase):
 
     def test_other_failures_are_not_replaced(self):
         message = self.make_message(self.fallback())
-        self.fail(message, code=131000, text='Message undeliverable')
+        self.mark_failed(message, code=131000, text='Message undeliverable')
 
         self.assertIsNone(send_service_window_fallback(message.id, self.fallback()))
         message.refresh_from_db()
-        self.assertNotIn('status', message.metadata)
+        # Queued (pending) but never replaced by a template.
+        self.assertNotEqual(message.metadata.get('status'), 'cancelled')
+        self.assertFalse(message.metadata.get('fallback_sent'))
         self.assertEqual(Message.objects.filter(message_type='template').count(), 0)
 
     def test_message_without_fallback_is_untouched(self):
         message = self.make_message()
-        self.fail(message)
+        self.mark_failed(message)
         self.assertIsNone(send_service_window_fallback(message.id, {
             'name': '', 'language': 'es', 'params': [], 'values': {},
         }))
@@ -458,7 +460,7 @@ class ServiceWindowFallbackTests(TestCase):
             components=[{'type': 'body', 'text': 'Hola {{pedido}}, tu pedido va en camino'}],
         )
         message = self.make_message(self.fallback())
-        self.fail(message)
+        self.mark_failed(message)
 
         with self.captureOnCommitCallbacks(execute=True):
             template = send_service_window_fallback(message.id, self.fallback())
@@ -474,7 +476,7 @@ class ServiceWindowFallbackTests(TestCase):
         message = self.make_message(self.fallback())
 
         def fake_send(*args, **kwargs):
-            self.fail(message, code=131047)
+            self.mark_failed(message, code=131047)
 
         with patch('api.views.send_whatsapp_outbound', side_effect=fake_send):
             with self.captureOnCommitCallbacks(execute=True):

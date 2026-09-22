@@ -77,6 +77,27 @@ WHATSAPP_MEDIA_LIMITS = {
 }
 _download_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix='wa-dl')
 
+# Outbound send queue.
+#
+# Every outbound Message walks the same lifecycle stored in
+# ``Message.metadata``:
+#
+#   pending  -> queued, cancellable, ``scheduled_for`` is due now (bot/ops) or
+#               ``send_delay_seconds`` ahead (agent undo window)
+#   sending  -> claimed by a send-pool worker; the claim carries
+#               ``send_claimed_at`` / ``send_claim_id`` / ``send_attempts``
+#   sent / failed / cancelled -> terminal
+#
+# The DB is the durable queue: the sweeper re-dispatches due ``pending`` rows
+# and recovers ``sending`` rows whose claiming process died (uvicorn recycles
+# workers with --limit-max-requests, deploys/SIGKILL kill in-flight tasks).
+# Rows stranded by older code carry no ``send_claimed_at`` and are never
+# retried automatically.
+_SEND_CLAIM_ERROR = (
+    'El servidor se reinició durante el envío y no se pudo confirmar la entrega. '
+    'Revisa el estado con el cliente antes de reenviarlo.'
+)
+
 _sweeper_started = False
 _sweeper_lock = threading.Lock()
 
@@ -97,70 +118,260 @@ def _sweeper_loop():
             _process_pending_messages()
         except Exception:
             logger.exception("Message sweeper error")
+        try:
+            _recover_stale_sends()
+        except Exception:
+            logger.exception("Stale send recovery error")
         time.sleep(5)
 
 
-def _process_pending_messages():
-    from api.bot.config import get_send_delay_seconds
-    if get_send_delay_seconds() == 0:
-        return
-    now = timezone.now().isoformat()
-    pending = list(Message.objects.filter(
-        metadata__status='pending',
-        metadata__scheduled_for__lte=now,
-    ).select_related('conversation', 'context_message')[:20])
-    for msg in pending:
-        with transaction.atomic():
-            locked = Message.objects.select_for_update(skip_locked=True).filter(
-                id=msg.id, metadata__status='pending'
-            ).first()
-            if locked is None:
-                continue
-            locked.metadata['status'] = 'sending'
-            locked.save(update_fields=['metadata'])
-            _send_pool.submit(
-                send_whatsapp_outbound,
-                locked.message_type, locked.media_url or locked.content,
-                locked.conversation.contact_phone,
-                locked.id, locked.conversation_id,
-                context_wamid=locked.context_message.whatsapp_message_id if locked.context_message else None,
-            )
+def _parse_send_timestamp(value):
+    """Parse an ISO timestamp stored in ``Message.metadata``."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed
 
 
-def _schedule_delayed_send(message_id):
+def _outbound_payload(message):
+    """Resolve the ``(message_type, content)`` pair the sender expects.
+
+    Messages store human-readable text in ``content`` while the wire payload
+    for interactive/location messages lives in ``metadata``.
+    """
+    meta = message.metadata if isinstance(message.metadata, dict) else {}
+    message_type = message.message_type or 'text'
+    if message_type == 'location':
+        return message_type, meta.get('location') or message.content
+    if message_type == 'interactive':
+        return message_type, meta.get('interactive') or message.content
+    if message_type in ('sticker', 'image', 'video', 'audio', 'document'):
+        return message_type, message.media_url or message.content
+    return message_type, message.content
+
+
+def _send_claim_is_current(message_id, claim_id):
+    """Whether ``claim_id`` still owns the send for ``message_id``."""
+    if not message_id or not claim_id:
+        return True
+    meta = Message.objects.filter(id=message_id).values_list('metadata', flat=True).first()
+    if meta is None:
+        return False
+    return isinstance(meta, dict) and meta.get('send_claim_id') == claim_id
+
+
+def _enqueue_outbound_send(message, schedule_delay=None):
+    """Persist the durable queue markers for a freshly created outbound message.
+
+    The message stays ``pending`` (and cancellable) until a send-pool worker
+    claims it. ``schedule_delay`` defaults to ``send_delay_seconds``; bot and
+    ops notifications pass ``0`` so they leave immediately.
+    """
     from api.bot.config import get_send_delay_seconds
-    delay = get_send_delay_seconds()
-    if delay == 0:
-        msg = Message.objects.get(id=message_id)
-        _send_pool.submit(
-            send_whatsapp_outbound,
-            msg.message_type, msg.media_url or msg.content,
-            msg.conversation.contact_phone,
-            msg.id, msg.conversation_id,
-            context_wamid=msg.context_message.whatsapp_message_id if msg.context_message else None,
-        )
-        return
+    if schedule_delay is None:
+        schedule_delay = get_send_delay_seconds()
+    schedule_delay = max(0, int(schedule_delay))
+    meta = dict(message.metadata or {})
+    meta['status'] = 'pending'
+    meta.setdefault('send_attempts', 0)
+    meta['scheduled_for'] = (timezone.now() + timedelta(seconds=schedule_delay)).isoformat()
+    message.metadata = meta
+    message.save(update_fields=['metadata'])
+
     _start_sweeper()
-    threading.Timer(delay, _delayed_send, args=[message_id]).start()
+    message_id = message.id
+    if schedule_delay:
+        threading.Timer(schedule_delay, _delayed_send, args=[message_id]).start()
+    else:
+        transaction.on_commit(lambda mid=message_id: _dispatch_send(mid))
+    return message
 
 
 def _delayed_send(message_id):
+    _dispatch_send(message_id)
+
+
+def _dispatch_send(message_id):
+    """Submit a message to the send pool. Idempotent: the worker claims it."""
     try:
-        with transaction.atomic():
-            msg = Message.objects.select_for_update().get(id=message_id)
-            if msg.metadata.get('status') != 'pending':
+        _send_pool.submit(_run_claimed_send, message_id)
+    except RuntimeError:
+        # Pool already shut down (process exiting): the row stays pending and
+        # another process's sweeper re-dispatches it.
+        logger.info("Send pool closed; message %s left for the sweeper", message_id)
+    except Exception:
+        logger.exception("Failed to dispatch outbound send for message %s", message_id)
+
+
+def _process_pending_messages():
+    """Dispatch due ``pending`` messages; workers claim and send them."""
+    now = timezone.now().isoformat()
+    due_ids = list(Message.objects.filter(
+        metadata__status='pending',
+        metadata__scheduled_for__lte=now,
+    ).values_list('id', flat=True)[:20])
+    for message_id in due_ids:
+        _dispatch_send(message_id)
+
+
+def _run_claimed_send(message_id):
+    """Claim a queued message and send it. Runs inside the send pool.
+
+    Claiming is atomic and lease-based: only one worker owns a send at a time
+    (a second dispatched task sees a fresh claim and skips), a stale claim from
+    a dead process is adopted after the lease, and recovery rotates
+    ``send_claim_id`` so a zombie worker can no longer send.
+    """
+    from api.bot.config import get_send_lease_seconds, get_send_max_attempts
+    now = timezone.now()
+    lease = timedelta(seconds=max(1, int(get_send_lease_seconds())))
+    max_attempts = max(1, int(get_send_max_attempts()))
+    fail_reason = None
+    claim_id = None
+    msg = None
+    with transaction.atomic():
+        # No select_related here: ``context_message`` is nullable and the
+        # LEFT OUTER JOIN makes Postgres reject FOR UPDATE.
+        msg = (
+            Message.objects.select_for_update(skip_locked=True)
+            .filter(id=message_id)
+            .first()
+        )
+        if msg is None or msg.whatsapp_message_id:
+            return
+        meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+        status = meta.get('status')
+        if status not in (None, 'pending', 'sending'):
+            return
+        if status != 'sending':
+            scheduled_for = _parse_send_timestamp(meta.get('scheduled_for'))
+            if scheduled_for is not None and scheduled_for > now:
                 return
-            msg.metadata['status'] = 'sending'
+        claimed_at = _parse_send_timestamp(meta.get('send_claimed_at'))
+        if claimed_at is not None and now - claimed_at < lease:
+            return  # another worker is already sending this message
+        attempts = int(meta.get('send_attempts') or 0) + 1
+        if attempts > max_attempts:
+            fail_reason = _SEND_CLAIM_ERROR
+        else:
+            claim_id = uuid4().hex
+            meta = dict(meta)
+            meta['status'] = 'sending'
+            meta['send_attempts'] = attempts
+            meta['send_claimed_at'] = now.isoformat()
+            meta['send_claim_id'] = claim_id
+            msg.metadata = meta
             msg.save(update_fields=['metadata'])
-    except Message.DoesNotExist:
+    if fail_reason:
+        _mark_send_failed(message_id, msg.conversation_id, fail_reason, 100)
         return
-    _send_pool.submit(
-        send_whatsapp_outbound,
-        msg.message_type, msg.media_url or msg.content,
-        msg.conversation.contact_phone,
+    try:
+        _deliver_claimed_send(msg, claim_id)
+    except Exception:
+        logger.exception("Outbound send crashed for message %s", message_id)
+        current = Message.objects.filter(id=message_id).values_list('metadata', flat=True).first()
+        if isinstance(current, dict) and current.get('status') == 'sending':
+            _mark_send_failed(
+                message_id, msg.conversation_id, 'Error inesperado al enviar el mensaje', 100,
+            )
+
+
+def _deliver_claimed_send(msg, claim_id):
+    """Run the delivery for a claimed message (outside the claim transaction)."""
+    meta = msg.metadata if isinstance(msg.metadata, dict) else {}
+    fallback = meta.get('fallback_template')
+    context_wamid = None
+    if msg.context_message is not None:
+        context_wamid = msg.context_message.whatsapp_message_id
+    if fallback:
+        # Ops status notifications swap in an approved template when Meta
+        # rejects the text for a closed 24 h window.
+        from api.integrations.notify import _deliver_outbound
+        _deliver_outbound(
+            msg.id, msg.conversation_id, fallback, context_wamid, claim_id=claim_id,
+        )
+        return
+    message_type, content = _outbound_payload(msg)
+    send_whatsapp_outbound(
+        message_type, content, msg.conversation.contact_phone,
         msg.id, msg.conversation_id,
-        context_wamid=msg.context_message.whatsapp_message_id if msg.context_message else None,
+        context_wamid=context_wamid,
+        claim_id=claim_id,
     )
+
+
+def _recover_stale_sends():
+    """Re-dispatch sends whose claiming process died mid-flight.
+
+    Only rows carrying a ``send_claimed_at`` marker are eligible, so messages
+    stranded by older code (no marker) are never retried automatically. A
+    message that exhausts its attempts is marked failed instead of silently
+    staying in ``sending`` forever.
+    """
+    from api.bot.config import get_send_lease_seconds, get_send_max_attempts
+    lease_seconds = max(1, int(get_send_lease_seconds()))
+    max_attempts = max(1, int(get_send_max_attempts()))
+    now = timezone.now()
+    lease = timedelta(seconds=lease_seconds)
+    cutoff = (now - lease).isoformat()
+    stale = list(Message.objects.filter(
+        metadata__status='sending',
+        whatsapp_message_id__isnull=True,
+        metadata__send_claimed_at__lt=cutoff,
+    ).only('id', 'conversation_id', 'metadata').order_by('id')[:50])
+
+    recovered = 0
+    failed = 0
+    for candidate in stale:
+        fail_id = None
+        fail_conv_id = None
+        recover_id = None
+        with transaction.atomic():
+            locked = (
+                Message.objects.select_for_update(skip_locked=True)
+                .filter(
+                    id=candidate.id,
+                    metadata__status='sending',
+                    whatsapp_message_id__isnull=True,
+                )
+                .first()
+            )
+            if locked is None:
+                continue
+            meta = locked.metadata if isinstance(locked.metadata, dict) else {}
+            claimed_at = _parse_send_timestamp(meta.get('send_claimed_at'))
+            if claimed_at is None or now - claimed_at < lease:
+                continue
+            attempts = int(meta.get('send_attempts') or 0)
+            if attempts >= max_attempts:
+                fail_id = locked.id
+                fail_conv_id = locked.conversation_id
+            else:
+                meta = dict(meta)
+                meta['send_claim_id'] = uuid4().hex
+                locked.metadata = meta
+                locked.save(update_fields=['metadata'])
+                recover_id = locked.id
+        if fail_id is not None:
+            _mark_send_failed(fail_id, fail_conv_id, _SEND_CLAIM_ERROR, 100)
+            failed += 1
+            logger.error(
+                "Send %s marked failed after %s attempts (process restarts)",
+                fail_id, max_attempts,
+            )
+        elif recover_id is not None:
+            _dispatch_send(recover_id)
+            recovered += 1
+    if recovered or failed:
+        logger.warning(
+            "Stale send recovery: requeued=%s failed=%s (lease=%ss)",
+            recovered, failed, lease_seconds,
+        )
 
 
 import uuid
@@ -670,7 +881,13 @@ def _resolve_whatsapp_target(contact_phone, recipient=None, conversation_id=None
     return None, None
 
 
-def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None, conversation_id=None, context_wamid=None, recipient=None):
+def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None, conversation_id=None, context_wamid=None, recipient=None, claim_id=None):
+    if claim_id and not _send_claim_is_current(message_id, claim_id):
+        logger.warning(
+            'Outbound send for message %s aborted: claim %s was superseded',
+            message_id, claim_id,
+        )
+        return
     phone_number_id = getattr(settings, 'WHATSAPP_PHONE_NUMBER_ID', None) or settings.WHATSAPP_PHONE_NUMBER
     token = settings.WHATSAPP_API_TOKEN
     to, bsuid = _resolve_whatsapp_target(contact_phone, recipient, conversation_id)
@@ -863,6 +1080,12 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
         if context_wamid:
             payload['context'] = {"message_id": context_wamid}
 
+        if claim_id and not _send_claim_is_current(message_id, claim_id):
+            logger.warning(
+                'Outbound send for message %s aborted before POST: claim %s was superseded',
+                message_id, claim_id,
+            )
+            return
         acquire_rate_capacity(phone_number_id)
 
         body = json.dumps(payload).encode('utf-8')
@@ -1663,12 +1886,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
             conversation.last_message_at = timezone.now()
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
-                from api.bot.config import get_send_delay_seconds
-                if get_send_delay_seconds() > 0:
-                    message.metadata['status'] = 'pending'
-                    message.metadata['scheduled_for'] = (timezone.now() + timedelta(seconds=get_send_delay_seconds())).isoformat()
-                    message.save(update_fields=['metadata'])
-                transaction.on_commit(lambda mid=message.id: _schedule_delayed_send(mid))
+                _enqueue_outbound_send(message)
 
             if direction == 'outbound' and message_type not in ('edit', 'reaction'):
                 set_first_response(conversation, request.user)
@@ -1825,10 +2043,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         conversation._last_msg_direction = 'outbound'
 
         if message_type not in ('edit', 'reaction'):
-            transaction.on_commit(lambda: _send_pool.submit(
-                send_whatsapp_outbound,
-                message_type, content, conversation.contact_phone, message.id, conversation.id,
-            ))
+            _enqueue_outbound_send(message)
 
         publish_conversation_update(conversation)
 
@@ -1936,12 +2151,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if hasattr(conversation, '_prefetched_objects_cache'):
             conversation._prefetched_objects_cache.pop('takes', None)
 
-        from api.bot.config import get_send_delay_seconds
-        if get_send_delay_seconds() > 0:
-            message.metadata['status'] = 'pending'
-            message.metadata['scheduled_for'] = (timezone.now() + timedelta(seconds=get_send_delay_seconds())).isoformat()
-            message.save(update_fields=['metadata'])
-        transaction.on_commit(lambda mid=message.id: _schedule_delayed_send(mid))
+        _enqueue_outbound_send(message)
 
         publish_conversation_update(conversation)
         return Response(MessageSerializer(message).data, status=status.HTTP_201_CREATED)
@@ -2180,16 +2390,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
                     conv.last_message_at = timezone.now()
                     conv.save(update_fields=['last_message', 'last_message_at', 'updated_at'])
 
-                    send_content = new_msg.media_url or new_msg.content
-                    if forwarded_type == 'location':
-                        send_content = self._extract_location_metadata(original.metadata)
-
-                    _send_pool.submit(
-                        send_whatsapp_outbound,
-                        forwarded_type, send_content,
-                        conv.contact_phone,
-                        new_msg.id, conv.id,
-                    )
+                    _enqueue_outbound_send(new_msg)
 
                     serializer = MessageSerializer(new_msg)
                     created_messages.append(serializer.data)
@@ -2644,10 +2845,7 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
             conv.last_message_at = timezone.now()
             conv.save(update_fields=['last_message', 'last_message_at'])
             conv._last_msg_direction = 'outbound'
-            transaction.on_commit(lambda c=conv, p=payload, m=message: _send_pool.submit(
-                send_whatsapp_outbound,
-                'template', p, c.contact_phone, m.id, c.id,
-            ))
+            _enqueue_outbound_send(message)
             publish_conversation_update(conv)
             return 1
 

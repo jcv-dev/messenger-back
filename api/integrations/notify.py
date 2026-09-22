@@ -15,7 +15,6 @@ import json
 import logging
 import re
 
-from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger('api')
@@ -301,26 +300,11 @@ def create_and_send_outbound(conversation, message_type, content, *,
 
     # Imports here to avoid a circular import with api.views.
     from api.serializers import MessageSerializer
-    from api.views import _send_pool, publish_conversation_update
+    from api.views import _enqueue_outbound_send, publish_conversation_update
 
-    def _send(mid=message.id):
-        from api.models import Message as Msg
-
-        try:
-            msg = Msg.objects.select_related('context_message').get(id=mid)
-        except Msg.DoesNotExist:
-            return
-        fallback = msg.metadata.get('fallback_template') if isinstance(msg.metadata, dict) else None
-        context_wamid = msg.context_message.whatsapp_message_id if msg.context_message else None
-        _send_pool.submit(
-            _deliver_outbound,
-            msg.id,
-            msg.conversation_id,
-            fallback,
-            context_wamid,
-        )
-
-    transaction.on_commit(_send)
+    # Ops notifications leave immediately (no undo delay) but still ride the
+    # durable claim queue, so a dying process cannot strand them.
+    _enqueue_outbound_send(message, schedule_delay=0)
     # Publish the message right away so open threads show it even before (or
     # without) the WhatsApp send result; the send path merges by id later.
     publish_conversation_update(conversation, MessageSerializer(message).data)
@@ -341,7 +325,8 @@ def _is_service_window_error(metadata) -> bool:
     return any(hint in text for hint in _SERVICE_WINDOW_HINTS)
 
 
-def _deliver_outbound(message_id, conversation_id, fallback=None, context_wamid=None):
+def _deliver_outbound(message_id, conversation_id, fallback=None, context_wamid=None,
+                      claim_id=None):
     """Send one message, replacing it with the approved template on window errors.
 
     Runs inside the WhatsApp send pool. ``send_whatsapp_outbound`` records the
@@ -351,7 +336,7 @@ def _deliver_outbound(message_id, conversation_id, fallback=None, context_wamid=
     from api.models import Message
 
     # Imported here (not at module level) to avoid a circular import.
-    from api.views import send_whatsapp_outbound
+    from api.views import _outbound_payload, send_whatsapp_outbound
 
     msg = (
         Message.objects.select_related('conversation')
@@ -361,13 +346,15 @@ def _deliver_outbound(message_id, conversation_id, fallback=None, context_wamid=
     if msg is None:
         return
 
+    message_type, content = _outbound_payload(msg)
     send_whatsapp_outbound(
-        msg.message_type or 'text',
-        msg.media_url or msg.content,
+        message_type,
+        content,
         msg.conversation.contact_phone,
         msg.id,
         msg.conversation_id,
         context_wamid=context_wamid,
+        claim_id=claim_id,
     )
 
     if fallback:

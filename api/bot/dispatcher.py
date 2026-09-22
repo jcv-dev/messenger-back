@@ -18,7 +18,7 @@ from django.utils import timezone
 from api.models import Conversation, Message, ConversationNote, ConversationTake, ConversationTag, AgentTakeRecord, create_agent_take_record, release_agent_take_records, set_first_response
 from api.realtime import subscribe, unsubscribe
 from api.serializers import MessageSerializer
-from api.views import publish_conversation_update, send_whatsapp_outbound, _send_pool
+from api.views import publish_conversation_update, _enqueue_outbound_send
 
 from .constants import WELCOME_REPLY, STOP_TEMPLATE_BUTTON_TEXT, REACTIVATE_BUTTON_TEXT
 from .utils import get_bot_user, get_bot_user_async
@@ -228,12 +228,8 @@ def send_reply(conversation, text):
     conversation.last_message_at = timezone.now()
     conversation.save(update_fields=["last_message", "last_message_at"])
 
+    _enqueue_outbound_send(msg, schedule_delay=0)
     msg_data = MessageSerializer(msg).data
-
-    _send_pool.submit(
-        send_whatsapp_outbound,
-        'text', text, conversation.contact_phone, msg.id, conversation.id,
-    )
 
     conversation._last_msg_direction = 'outbound'
     publish_conversation_update(conversation, msg_data)
@@ -665,14 +661,6 @@ def _send_interactive_payload(conversation, interactive_payload: dict):
     if not bot:
         return
     body_text = interactive_payload.get("body", {}).get("text", "Mensaje interactivo")
-    _send_pool.submit(
-        send_whatsapp_outbound,
-        'interactive',
-        interactive_payload,
-        conversation.contact_phone,
-        None,
-        conversation.id,
-    )
     msg = Message.objects.create(
         conversation=conversation,
         direction="outbound",
@@ -686,6 +674,7 @@ def _send_interactive_payload(conversation, interactive_payload: dict):
     conversation.last_message_at = timezone.now()
     conversation.save(update_fields=["last_message", "last_message_at"])
 
+    _enqueue_outbound_send(msg, schedule_delay=0)
     msg_data = MessageSerializer(msg).data
     conversation._last_msg_direction = 'outbound'
     publish_conversation_update(conversation, msg_data)

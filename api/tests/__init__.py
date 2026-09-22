@@ -14,7 +14,7 @@ from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 from django.utils import timezone
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 
 from api.models import Call, Conversation, Message, ConversationTag, ConversationNote, ConversationTake, ConversationUserPin, SSEToken, CityGroup, UserProfile, BotExemptContact, WhatsAppTemplate, TemplateExclusion, AgentPresence, PushSubscription, AuditLog, CannedResponse, StickerAsset
@@ -626,7 +626,7 @@ class MessageViewSetTests(APITestCase):
         self.assertEqual(response.data['metadata']['status'], 'pending')
         self.assertIn('scheduled_for', response.data['metadata'])
 
-    def test_create_outbound_message_with_zero_delay_skips_pending(self):
+    def test_create_outbound_message_with_zero_delay_is_due_immediately(self):
         from api.models import BotConfig
         BotConfig.objects.update_or_create(key='send_delay_seconds', defaults={'value': 0})
         from api.bot.config import _clear_cache
@@ -637,7 +637,12 @@ class MessageViewSetTests(APITestCase):
                 {'direction': 'outbound', 'message_type': 'text', 'content': 'Instant message'},
             )
             self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-            self.assertNotEqual(response.data['metadata'].get('status'), 'pending')
+            metadata = response.data['metadata']
+            # Pending is the durable queue marker for every send; with delay 0
+            # there is no undo window, so the message is due right away.
+            self.assertEqual(metadata.get('status'), 'pending')
+            scheduled = datetime.fromisoformat(metadata['scheduled_for'])
+            self.assertLessEqual(scheduled, timezone.now())
         finally:
             BotConfig.objects.filter(key='send_delay_seconds').delete()
             _clear_cache()

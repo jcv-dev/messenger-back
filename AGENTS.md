@@ -245,11 +245,40 @@ LLMs mutate numeric values. To prevent wrong coordinates reaching `calculate_pri
 
 ## WhatsApp Integration
 
-- Graph API v20.0. Outbound messages sent via `ThreadPoolExecutor` (32 workers).
+- Graph API v20.0. Outbound messages go through the durable send queue below.
 - `send_whatsapp_outbound` supports: `text`, `interactive`, `location`, `sticker`, `image`, `video`, `audio`, `document`.
 - Delivery statuses are **inspect-only**: `_handle_message_status_webhook` records Meta's `sent < delivered < read < played` progression in `Message.metadata` (`delivery_status`, `sent_at`/`delivered_at`/`read_at`/`played_at`, `send_error*`, `deleted`, `delivery_warning`). Out-of-order webhooks never downgrade a status, `failed` is terminal unless the message was already read, duplicate statuses do not re-publish SSE, and nothing is ever sent back to Meta (no read receipts, no typing indicators).
 - Location messages accept `content` as dict: `{longitude, latitude, name, address}`.
 - WhatsApp rate limiter: `api/rate_limiter.py` — Redis sliding window per `phone_number_id`, 70 req/s default. Blocks until capacity available, fails open after 30s.
+
+### Outbound send queue (durable)
+
+Every outbound message is queued in the DB (`Message.metadata`) instead of being
+handed straight to an in-process thread, so uvicorn worker recycling
+(`--limit-max-requests`) and container restarts/`SIGKILL` can no longer strand
+sends silently:
+
+- Creation writes `status='pending'` + `scheduled_for` (`_enqueue_outbound_send`
+  in `views.py`): due now for bot/ops, `send_delay_seconds` ahead for agent
+  messages. Pending is also the cancellable state.
+- `_run_claimed_send` (send pool) claims atomically with
+  `select_for_update(skip_locked=True)` and writes `status='sending'`,
+  `send_claimed_at`, `send_claim_id` and `send_attempts`. A duplicate dispatched
+  task sees a fresh claim and skips; rows with a `wamid` are never re-sent.
+- The sweeper (`_process_pending_messages` + `_recover_stale_sends`, every 5 s
+  in every process) re-dispatches due pending rows and adopts `sending` rows
+  whose claim is older than `send_lease_seconds` (BotConfig, default 300),
+  rotating `send_claim_id` first. After `send_max_attempts` (BotConfig,
+  default 3) the message is marked `failed` with `_SEND_CLAIM_ERROR`.
+- `send_whatsapp_outbound(..., claim_id=...)` re-checks the claim right before
+  the Graph POST, so a zombie worker whose claim was recovered aborts instead of
+  double-sending.
+- Rows stranded by pre-queue code carry **no** `send_claimed_at` marker and are
+  never retried automatically (the 2026-09 backlog stays `sending`; do not
+  backfill the marker or the sweeper will resend them).
+- Bot (`send_reply`, interactive, location in `api/bot/`) and ops
+  (`create_and_send_outbound`) send through the same queue with
+  `schedule_delay=0`.
 
 ## Order integration (Domiitulua ops, plan `domi-messager-ops-integration.md`)
 
