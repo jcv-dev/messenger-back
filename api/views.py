@@ -634,13 +634,56 @@ def _mark_send_failed(message_id, conversation_id, error_message, error_code=Non
         logger.exception('Failed to update send_error for message %d', message_id)
 
 
-def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None, conversation_id=None, context_wamid=None):
+def _resolve_whatsapp_target(contact_phone, recipient=None, conversation_id=None):
+    """Resolve what an outbound send should target: phone or BSUID.
+
+    Username-only WhatsApp contacts have no phone number; Meta identifies them
+    with a business-scoped user ID (BSUID, ``CO.956283237534428``) stored as the
+    conversation's ``whatsapp_id``. Phone numbers go in the ``to`` field, BSUIDs
+    in the top-level ``recipient`` field. When the caller only knows the
+    conversation, its ``whatsapp_id`` is used as a fallback so every existing
+    send site supports username contacts.
+
+    Returns ``(to, bsuid)``; at most one of them is set.
+    """
+    for value in (contact_phone, recipient):
+        text = str(value or '').strip()
+        if not text:
+            continue
+        digits = text[1:] if text.startswith('+') else text
+        if digits.isdigit():
+            return digits, None
+        return None, text
+
+    if conversation_id:
+        wa_id = (
+            Conversation.objects.filter(id=conversation_id)
+            .values_list('whatsapp_id', flat=True)
+            .first()
+        )
+        text = str(wa_id or '').strip()
+        if text:
+            digits = text[1:] if text.startswith('+') else text
+            if digits.isdigit():
+                return digits, None
+            return None, text
+    return None, None
+
+
+def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None, conversation_id=None, context_wamid=None, recipient=None):
     phone_number_id = getattr(settings, 'WHATSAPP_PHONE_NUMBER_ID', None) or settings.WHATSAPP_PHONE_NUMBER
     token = settings.WHATSAPP_API_TOKEN
-    if not phone_number_id or not token or not contact_phone:
+    to, bsuid = _resolve_whatsapp_target(contact_phone, recipient, conversation_id)
+    target = to or bsuid
+    if not phone_number_id or not token or not target:
         logger.error(
-            'WhatsApp outbound send blocked: phone_number_id=%s token_set=%s contact_phone=%r',
-            bool(phone_number_id), bool(token), contact_phone,
+            'WhatsApp outbound send blocked: phone_number_id=%s token_set=%s contact_phone=%r recipient=%r',
+            bool(phone_number_id), bool(token), contact_phone, recipient,
+        )
+        _mark_send_failed(
+            message_id, conversation_id,
+            'No se pudo enviar: el contacto no tiene número de teléfono ni usuario de WhatsApp',
+            100,
         )
         return
 
@@ -652,9 +695,13 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
         }
         payload = {
             "messaging_product": "whatsapp",
-            "to": contact_phone,
             "type": message_type,
         }
+        if to:
+            payload["to"] = to
+        if bsuid:
+            # Username-only contact: target the business-scoped user ID.
+            payload["recipient"] = bsuid
 
         if message_type == 'text':
             payload['text'] = {"body": content}
@@ -819,7 +866,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
         acquire_rate_capacity(phone_number_id)
 
         body = json.dumps(payload).encode('utf-8')
-        logger.info('WhatsApp outbound -> %s [%s]', contact_phone, message_type)
+        logger.info('WhatsApp outbound -> %s [%s]', target, message_type)
         req = urllib.request.Request(url, data=body, headers=headers, method='POST')
         with urllib.request.urlopen(req, timeout=30) as response:
             resp_body = response.read().decode()
@@ -833,7 +880,7 @@ def send_whatsapp_outbound(message_type, content, contact_phone, message_id=None
                 )
             logger.info(
                 'WhatsApp outbound response -> %s [%s]: %s',
-                contact_phone, message_type, resp_body[:600],
+                target, message_type, resp_body[:600],
             )
             if message_id:
                 err = resp_data.get('error')
@@ -1862,10 +1909,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
         parameters = serializer.validated_data.get('parameters', {})
         conversation = self.get_object()
 
-        if not conversation.contact_phone:
+        if not any(_resolve_whatsapp_target(conversation.contact_phone, conversation_id=conversation.id)):
             return Response({'error': 'No contact phone'}, status=status.HTTP_400_BAD_REQUEST)
 
-        if template.category == 'MARKETING' and TemplateExclusion.objects.filter(contact_phone=conversation.contact_phone).exists():
+        exclusion_key = conversation.contact_phone or conversation.whatsapp_id
+        if template.category == 'MARKETING' and TemplateExclusion.objects.filter(contact_phone=exclusion_key).exists():
             return Response({'status': 'skipped', 'reason': 'El contacto solicitó no recibir más promos'})
 
         from .integrations.notify import build_template_payload
@@ -3357,7 +3405,11 @@ def _handle_message_status_webhook(status_event):
     wamid = status_event.get('id', '')
     status_value = status_event.get('status', '')
     errors = status_event.get('errors', [])
-    recipient = status_event.get('recipient_id', '')
+    recipient = (
+        status_event.get('recipient_id')
+        or status_event.get('recipient_user_id')
+        or ''
+    )
     logger.info(
         'WhatsApp message status: id=%s status=%s recipient=%s errors=%s',
         wamid, status_value, recipient, errors,
@@ -3376,10 +3428,15 @@ def _handle_message_status_webhook(status_event):
         logger.warning('WhatsApp message status for unknown wamid: %s %s', wamid, status_value)
         return
 
-    if recipient and str(recipient) != str(msg.conversation.contact_phone):
+    known_targets = {
+        str(msg.conversation.contact_phone or ''),
+        str(getattr(msg.conversation, 'whatsapp_id', '') or ''),
+    }
+    if recipient and str(recipient) not in known_targets:
         logger.warning(
-            'Status recipient mismatch: msg=%s wamid=%s status_recipient=%s conv_phone=%s',
+            'Status recipient mismatch: msg=%s wamid=%s status_recipient=%s conv_phone=%s conv_whatsapp_id=%s',
             msg.id, wamid, recipient, msg.conversation.contact_phone,
+            getattr(msg.conversation, 'whatsapp_id', ''),
         )
 
     meta = dict(msg.metadata or {})

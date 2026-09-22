@@ -388,7 +388,7 @@ def send_service_window_fallback(message_id, fallback):
         .filter(id=message_id)
         .first()
     )
-    if msg is None or not msg.conversation or not msg.conversation.contact_phone:
+    if msg is None or not msg.conversation:
         return None
 
     meta = dict(msg.metadata or {})
