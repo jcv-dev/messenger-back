@@ -160,21 +160,27 @@ def create_order(payload: dict, idempotency_key: str | None = None):
     return _request('POST', '/api/v1/orders', json_body=payload, extra_headers=headers)
 
 
-def cancel_order(order_number: int, reason: str):
+def cancel_order(order_number: int, reason: str, actor_dni: str | None = None):
     """POST /api/v1/orders/{n}/cancel with a mandatory reason."""
+    body = {'reason': reason}
+    if actor_dni:
+        body['created_by_dni'] = actor_dni
     return _request(
         'POST',
         f'/api/v1/orders/{order_number}/cancel',
-        json_body={'reason': reason},
+        json_body=body,
     )
 
 
-def cancel_order_stop(order_number: int, stop_no: int, reason: str):
+def cancel_order_stop(order_number: int, stop_no: int, reason: str, actor_dni: str | None = None):
     """POST /api/v1/orders/{n}/stops/{stop}/cancel (one parada of a comanda)."""
+    body = {'reason': reason}
+    if actor_dni:
+        body['created_by_dni'] = actor_dni
     return _request(
         'POST',
         f'/api/v1/orders/{order_number}/stops/{stop_no}/cancel',
-        json_body={'reason': reason},
+        json_body=body,
     )
 
 

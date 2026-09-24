@@ -239,6 +239,20 @@ def claim_transition(order, status: str) -> bool:
     return True
 
 
+def has_delivery_target(conversation) -> bool:
+    """Whether the client can be addressed: phone or WhatsApp username.
+
+    Username-only contacts (the WhatsApp username feature) have an empty
+    ``contact_phone``; the shared send path targets their business-scoped user
+    ID stored in ``whatsapp_id`` (``_resolve_whatsapp_target``). Every
+    conversation has a ``whatsapp_id``, so this is False only when the
+    conversation (or its whole identity) is missing.
+    """
+    if conversation is None:
+        return False
+    return bool(conversation.contact_phone or conversation.whatsapp_id)
+
+
 def send_status_notification(order_id: int, status: str) -> None:
     """Send one aggregate notification for ``order_id`` (after commit)."""
     from api.models import Order
@@ -255,7 +269,7 @@ def send_status_notification(order_id: int, status: str) -> None:
         return
 
     conversation = order.conversation
-    if not conversation or not conversation.contact_phone:
+    if not has_delivery_target(conversation):
         return
 
     text = render_status_text(order, status)
@@ -293,6 +307,14 @@ def maybe_notify(order) -> str | None:
         return None
     transition = resolve_transition(order)
     if not transition:
+        return None
+    if not has_delivery_target(order.conversation):
+        # Nothing to address (no phone and no username): do not claim the
+        # transition, so it can still be sent if an identity appears later.
+        logger.warning(
+            'Order %s has no delivery target; %s notification skipped',
+            order.id, transition,
+        )
         return None
     if not notify_transition(order, transition):
         return None

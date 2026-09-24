@@ -17,6 +17,7 @@ can retry with the same idempotency key without creating duplicates in ops.
 """
 
 import logging
+import re
 from decimal import Decimal, InvalidOperation
 
 from django.core.cache import cache
@@ -40,6 +41,21 @@ DEFAULT_ORDER_CREATED_MESSAGE = (
     '✅ Pedido {order_numbers} recibido. '
     'Un domiciliario lo aceptará pronto.'
 )
+
+# Agent logins are national ids (DNI); ops matches them on ``users.dni``.
+_ACTOR_DNI_RE = re.compile(r'^\d{6,15}$')
+
+
+def actor_dni(user) -> str | None:
+    """National id of the acting Messager user, for ops attribution.
+
+    Agents log into the Messager with their DNI as the username; ops resolves
+    that value against ``users.dni`` to record who created/canceled an order.
+    Non-numeric logins (``bot``, ``test_user``) map to no actor, so ops keeps
+    the action as system.
+    """
+    username = str(getattr(user, 'username', '') or '').strip()
+    return username if _ACTOR_DNI_RE.match(username) else None
 
 FINISHED_STATUSES = frozenset({'entregado', 'cancelado', 'failed'})
 
@@ -273,7 +289,7 @@ def validate_stops(stops_data: list, catalog: list | None = None) -> list:
     return normalized
 
 
-def build_ops_payload(order: Order, client_ref: dict, data: dict) -> dict:
+def build_ops_payload(order: Order, client_ref: dict, data: dict, actor: str | None = None) -> dict:
     payload = {
         'origin_address': (data.get('origin_address') or '').strip()[:255],
         'items': [
@@ -303,6 +319,9 @@ def build_ops_payload(order: Order, client_ref: dict, data: dict) -> dict:
         payload['mode'] = 'manual'
     else:
         payload['mode'] = 'libre'
+    # Atribución del agente: ops resuelve el DNI contra `users.dni`.
+    if actor:
+        payload['created_by_dni'] = actor
     return payload
 
 
@@ -515,7 +534,7 @@ def create_order(conversation, data: dict, user):
             payload={'request': stop},
         )
 
-    ops_payload = build_ops_payload(order, client_ref, data)
+    ops_payload = build_ops_payload(order, client_ref, data, actor_dni(user))
     try:
         response = ops.create_order(ops_payload, idempotency_key=idem_key or None)
     except ops.OpsAPIError as exc:
@@ -558,7 +577,9 @@ def create_order(conversation, data: dict, user):
 
 def send_confirmation(conversation, order: Order) -> None:
     """Send the configurable confirmation text right away."""
-    if not conversation.contact_phone:
+    # Username-only WhatsApp contacts have no phone; the send path addresses
+    # them by their business-scoped user ID (``whatsapp_id``).
+    if not conversation.contact_phone and not conversation.whatsapp_id:
         return
     try:
         from .notify import send_text
@@ -755,7 +776,7 @@ def cancel_order(order: Order, reason: str, user) -> dict:
         return {'canceled': 0, 'order': order}
 
     for number in _active_order_numbers(active):
-        ops.cancel_order(number, reason)
+        ops.cancel_order(number, reason, actor_dni=actor_dni(user))
 
     now = timezone.now()
     for stop in active:
@@ -793,7 +814,9 @@ def cancel_stop(order: Order, stop: OrderStop, reason: str, user) -> dict:
         return {'canceled': 0, 'order': order, 'stop': stop}
 
     if stop.ops_order_number:
-        ops.cancel_order_stop(int(stop.ops_order_number), stop.stop_no, reason)
+        ops.cancel_order_stop(
+            int(stop.ops_order_number), stop.stop_no, reason, actor_dni=actor_dni(user),
+        )
 
     now = timezone.now()
     stop.status = 'cancelado'

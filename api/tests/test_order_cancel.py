@@ -81,7 +81,7 @@ class OrderCancelEndpointTests(APITestCase):
         self.assertTrue(res.data['ok'])
         self.assertEqual(res.data['canceled'], 2)
 
-        cancel.assert_called_once_with(1234, REASON)
+        cancel.assert_called_once_with(1234, REASON, actor_dni=None)
 
         self.stop1.refresh_from_db()
         self.stop2.refresh_from_db()
@@ -109,6 +109,20 @@ class OrderCancelEndpointTests(APITestCase):
 
         publish_order.assert_called_once()
         publish_conv.assert_called_once()
+
+    def test_cancel_order_forwards_the_agent_dni(self):
+        self.user.username = '1192764057'
+        self.user.save(update_fields=['username'])
+
+        with patch('api.integrations.orders.ops.cancel_order',
+                   return_value={'ok': True, 'order_number': 1234, 'canceled': 2,
+                                 'status': 'cancelado'}) as cancel, \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self._post()
+
+        self.assertEqual(res.status_code, 200, res.data)
+        cancel.assert_called_once_with(1234, REASON, actor_dni='1192764057')
 
     def test_cancel_order_is_idempotent_when_no_active_stops(self):
         self.stop1.status = 'cancelado'
@@ -156,7 +170,7 @@ class OrderCancelEndpointTests(APITestCase):
 
         self.assertEqual(res.status_code, 502, res.data)
         self.assertFalse(res.data['ok'])
-        cancel.assert_called_once_with(1234, REASON)
+        cancel.assert_called_once_with(1234, REASON, actor_dni=None)
 
         self.stop1.refresh_from_db()
         self.order.refresh_from_db()
@@ -208,7 +222,7 @@ class OrderCancelEndpointTests(APITestCase):
 
         self.assertEqual(res.status_code, 200, res.data)
         self.assertEqual(res.data['canceled'], 1)
-        cancel.assert_called_once_with(1234, 2, REASON)
+        cancel.assert_called_once_with(1234, 2, REASON, actor_dni=None)
 
         self.stop1.refresh_from_db()
         self.stop2.refresh_from_db()
@@ -224,6 +238,20 @@ class OrderCancelEndpointTests(APITestCase):
         audit = AuditLog.objects.get(action='cancel_order')
         self.assertIn('parada 2', audit.detail)
         publish_order.assert_called_once()
+
+    def test_cancel_stop_forwards_the_agent_dni(self):
+        self.user.username = '1116072389'
+        self.user.save(update_fields=['username'])
+
+        url = f'/api/orders/{self.order.id}/stops/{self.stop2.id}/cancel/'
+        with patch('api.integrations.orders.ops.cancel_order_stop',
+                   return_value={'ok': True}) as cancel, \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self._post(url)
+
+        self.assertEqual(res.status_code, 200, res.data)
+        cancel.assert_called_once_with(1234, 2, REASON, actor_dni='1116072389')
 
     def test_cancel_stop_all_canceled_marks_order_canceled(self):
         self.stop1.status = 'cancelado'
@@ -267,7 +295,7 @@ class OrderCancelEndpointTests(APITestCase):
             res = self._post(url)
 
         self.assertEqual(res.status_code, 200, res.data)
-        cancel.assert_called_once_with(1235, 2, REASON)
+        cancel.assert_called_once_with(1235, 2, REASON, actor_dni=None)
 
     def test_cancel_stop_ops_failure_returns_502(self):
         url = f'/api/orders/{self.order.id}/stops/{self.stop2.id}/cancel/'

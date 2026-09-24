@@ -13,6 +13,7 @@ from api.integrations import ops
 from api.integrations.orders import (
     DEFAULT_ORDER_CREATED_MESSAGE,
     OrderValidationError,
+    actor_dni,
     build_confirmation_text,
     format_cop,
     order_numbers_text,
@@ -257,6 +258,19 @@ class OrderCreatedMessageConfigTests(APITestCase):
         self.assertEqual(config.value, 'Pedido {order_number} · {total}')
 
 
+class ActorDniTests(TestCase):
+    """The Messager username (national id) becomes the ops actor DNI."""
+
+    def test_numeric_username_is_forwarded(self):
+        self.assertEqual(actor_dni(User(username='1117352101')), '1117352101')
+        self.assertEqual(actor_dni(User(username='38878643')), '38878643')
+
+    def test_non_numeric_logins_have_no_actor(self):
+        for name in ('agent', 'bot', 'test_user', '', '1117352101x', 'x1117352101'):
+            self.assertIsNone(actor_dni(User(username=name)))
+        self.assertIsNone(actor_dni(None))
+
+
 @override_settings(**OPS_SETTINGS)
 class CreateOrderEndpointTests(APITestCase):
     def setUp(self):
@@ -318,6 +332,35 @@ class CreateOrderEndpointTests(APITestCase):
         self.assertEqual(self.conversation.ops_client_match_source, 'order')
 
         confirm.assert_called_once()
+
+    def test_create_order_forwards_the_agent_dni(self):
+        self.user.username = '1117352101'
+        self.user.save(update_fields=['username'])
+        with patch('api.integrations.orders.ops.create_order',
+                   return_value=OPS_RESPONSE) as create, \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)), \
+                patch('api.integrations.orders.send_confirmation'), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(self.url, PAYLOAD, format='json')
+
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(create.call_args.args[0]['created_by_dni'], '1117352101')
+
+    def test_create_order_from_a_non_numeric_login_has_no_actor(self):
+        # ``self.user`` is 'agent': nothing to attribute in ops.
+        with patch('api.integrations.orders.ops.create_order',
+                   return_value=OPS_RESPONSE) as create, \
+                patch('api.integrations.orders.fetch_client_by_phone',
+                      return_value=dict(CLIENT_SNAPSHOT)), \
+                patch('api.integrations.orders.send_confirmation'), \
+                patch('api.integrations.views._publish_order_updated'), \
+                patch('api.views.publish_conversation_update'):
+            res = self.client.post(self.url, PAYLOAD, format='json')
+
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertNotIn('created_by_dni', create.call_args.args[0])
 
     def test_records_ai_draft_source_and_metadata(self):
         """Phase 6: the order sheet reports the AI prefill (source + payload)."""

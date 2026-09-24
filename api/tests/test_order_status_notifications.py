@@ -22,9 +22,11 @@ from api.integrations.notify import (
     send_service_window_fallback,
     send_text,
 )
+from api.integrations.orders import send_confirmation
 from api.integrations.status_notifications import (
     DEFAULT_ORDER_STATUS_MESSAGES,
     build_fallback_template,
+    maybe_notify,
     render_status_text,
     resolve_transition,
     status_values,
@@ -635,3 +637,88 @@ class FallbackPayloadTests(TestCase):
             MessageSerializer(message).data['content_display'],
             'Pedido #1234 entregado',
         )
+
+
+class UsernameOnlyOrderNotificationTests(TestCase):
+    """Orders for WhatsApp username-only contacts still reach the client.
+
+    Regression: a conversation with an empty ``contact_phone`` (username-only
+    contact, addressed by the BSUID in ``whatsapp_id``) was silently skipped by
+    both the aggregate status notification and the creation confirmation.
+    """
+
+    BSUID = 'CO.3271735316332842'
+
+    def setUp(self):
+        from api.bot.config import _clear_cache
+
+        _clear_cache()
+        self.conversation = Conversation.objects.create(
+            whatsapp_id=self.BSUID, contact_name='Juan Camilo', contact_phone='',
+        )
+        self.order = Order.objects.create(
+            conversation=self.conversation,
+            ops_client_user_id=8596,
+            client_name='Juan Camilo',
+            origin_address='Calle 9A #13-40',
+            status='pending',
+            source='agent',
+        )
+        self.stop = OrderStop.objects.create(
+            order=self.order, stop_no=1, ops_order_number=39511,
+            service_type='domicilio', dest_address='Kra 36 #33-41',
+            price=4500, status='en_ruta',
+        )
+        # Never touch WhatsApp from tests.
+        pool_patcher = patch('api.views._send_pool')
+        self.pool = pool_patcher.start()
+        self.addCleanup(pool_patcher.stop)
+
+    def outbound(self, message_type='text'):
+        return list(Message.objects.filter(
+            conversation=self.conversation, direction='outbound',
+            message_type=message_type,
+        ).order_by('id'))
+
+    def test_has_delivery_target_accepts_username_only(self):
+        from api.integrations.status_notifications import has_delivery_target
+
+        self.assertTrue(has_delivery_target(self.conversation))
+        self.assertFalse(has_delivery_target(None))
+
+    def test_username_only_conversation_gets_a_status_notification(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            notified = maybe_notify(self.order)
+
+        self.assertEqual(notified, 'en_ruta')
+        texts = self.outbound()
+        self.assertEqual(len(texts), 1)
+        self.assertIn('#39511', texts[0].content)
+        # The approved template fallback travels with the text (BSUID-capable).
+        self.assertEqual(
+            texts[0].metadata['fallback_template']['name'], 'aviso_en_ruta',
+        )
+        self.order.refresh_from_db()
+        self.assertIn('en_ruta', self.order.notified_statuses)
+
+    def test_username_only_conversation_gets_the_confirmation(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            send_confirmation(self.conversation, self.order)
+
+        texts = self.outbound()
+        self.assertEqual(len(texts), 1)
+        self.assertIn('#39511', texts[0].content)
+
+    def test_missing_identity_does_not_claim_the_transition(self):
+        Conversation.objects.filter(pk=self.conversation.pk).update(
+            whatsapp_id='', contact_phone='',
+        )
+        self.conversation.refresh_from_db()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            notified = maybe_notify(self.order)
+
+        self.assertIsNone(notified)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.notified_statuses, [])
+        self.assertEqual(self.outbound(), [])
