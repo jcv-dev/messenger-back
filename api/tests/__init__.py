@@ -1281,6 +1281,8 @@ class ConversationGroupFilterTests(APITestCase):
 class WebhookTests(APITestCase):
 
     def setUp(self):
+        from django.core.cache import cache
+        cache.clear()  # wamid dedup keys live in the shared Redis cache
         get_or_create_tulua_group()
 
     def test_webhook_get_no_challenge_returns_400(self):

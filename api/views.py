@@ -3808,41 +3808,80 @@ def whatsapp_webhook(request):
 
             for msg in messages:
                 msg_type = msg.get('type', 'text')
-                sender = msg.get('from') or msg.get('from_user_id')
+                sender_phone = (msg.get('from') or '').strip()
+                sender_user_id = (msg.get('from_user_id') or '').strip()
                 msg_id = msg.get('id')
 
-                sender_contact = next((c for c in contacts if c.get('wa_id') == sender or c.get('user_id') == sender), None)
+                sender_contact = next(
+                    (
+                        c for c in contacts
+                        if (sender_user_id and c.get('user_id') == sender_user_id)
+                        or (sender_phone and c.get('wa_id') == sender_phone)
+                    ),
+                    None,
+                )
                 contact_info = sender_contact or (contacts[0] if contacts else {})
                 profile = contact_info.get('profile', {})
 
-                contact_name = profile.get('name', sender)
+                contact_name = profile.get('name') or sender_phone or sender_user_id
                 raw_username = contact_info.get('username') or profile.get('username') or ''
                 whatsapp_username = raw_username.lstrip('@') or None
-                wa_id = contact_info.get('wa_id') or contact_info.get('user_id') or sender
 
-                conversation, created = Conversation.objects.get_or_create(
-                    whatsapp_id=wa_id,
-                    defaults={
-                        'contact_name': contact_name,
-                        'contact_phone': wa_id if wa_id and wa_id.isdigit() else None,
-                        'whatsapp_username': whatsapp_username,
-                        'group': get_default_group(),
-                    }
-                )
+                # Meta always sends the business-scoped user ID (BSUID, `user_id`
+                # / `from_user_id`) and only sometimes the phone (`wa_id`). For a
+                # username contact the attached phone can belong to a different
+                # person (contact-book / 30-day lookback), so username contacts are
+                # keyed by their BSUID and the phone is never used to route them.
+                # Phone-only contacts keep using the phone, preserving every
+                # existing conversation.
+                bsuid = (contact_info.get('user_id') or sender_user_id or '').strip()
+                phone = (
+                    contact_info.get('wa_id')
+                    or (sender_phone if sender_phone.isdigit() else '')
+                    or ''
+                ).strip()
 
-                if not created:
-                    updated = False
+                if whatsapp_username and bsuid:
+                    wa_id = bsuid
+                    conversation_phone = None
+                else:
+                    wa_id = phone or bsuid or sender_phone
+                    conversation_phone = wa_id if wa_id.isdigit() else None
+
+                conversation = Conversation.objects.filter(whatsapp_id=wa_id).first()
+                if conversation is None and whatsapp_username:
+                    # Reuse this username's existing thread instead of forking a
+                    # second conversation when it was previously keyed by a phone.
+                    conversation = (
+                        Conversation.objects
+                        .filter(whatsapp_username=whatsapp_username)
+                        .order_by('id')
+                        .first()
+                    )
+                if conversation is None:
+                    conversation, _ = Conversation.objects.get_or_create(
+                        whatsapp_id=wa_id,
+                        defaults={
+                            'contact_name': contact_name or wa_id,
+                            'contact_phone': conversation_phone,
+                            'whatsapp_username': whatsapp_username,
+                            'group': get_default_group(),
+                        },
+                    )
+                else:
+                    updated_fields = []
                     if contact_name and conversation.contact_name != contact_name:
                         conversation.contact_name = contact_name
-                        updated = True
+                        updated_fields.append('contact_name')
                     if whatsapp_username and conversation.whatsapp_username != whatsapp_username:
                         conversation.whatsapp_username = whatsapp_username
-                        updated = True
-                    if wa_id and wa_id.isdigit() and conversation.contact_phone != wa_id:
-                        conversation.contact_phone = wa_id
-                        updated = True
-                    if updated:
-                        conversation.save(update_fields=['contact_name', 'whatsapp_username', 'contact_phone', 'updated_at'])
+                        updated_fields.append('whatsapp_username')
+                    if conversation_phone and conversation.contact_phone != conversation_phone:
+                        conversation.contact_phone = conversation_phone
+                        updated_fields.append('contact_phone')
+                    if updated_fields:
+                        updated_fields.append('updated_at')
+                        conversation.save(update_fields=updated_fields)
 
                 if not conversation.custom_name:
                     existing_custom = Conversation.objects.filter(
