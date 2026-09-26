@@ -18,10 +18,12 @@ can retry with the same idempotency key without creating duplicates in ops.
 
 import logging
 import re
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from django.core.cache import cache
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from api.models import Order, OrderStop
 
@@ -40,6 +42,11 @@ MAX_STOPS = 10
 DEFAULT_ORDER_CREATED_MESSAGE = (
     '✅ Pedido {order_numbers} recibido. '
     'Un domiciliario lo aceptará pronto.'
+)
+
+DEFAULT_ORDER_SCHEDULED_MESSAGE = (
+    '🗓️ Pedido {order_number} programado para el {scheduled_at}. '
+    'Valor: {total}. Te avisaremos cuando un domiciliario lo tome.'
 )
 
 # Agent logins are national ids (DNI); ops matches them on ``users.dni``.
@@ -174,6 +181,23 @@ def _render_template(template: str, values: dict) -> str:
 
 
 def build_confirmation_text(order: Order) -> str:
+    scheduled_for = getattr(order, 'scheduled_for', None)
+    if scheduled_for and order.status == 'programado':
+        from api.bot.config import get_config
+
+        template = get_config('order_scheduled_message', DEFAULT_ORDER_SCHEDULED_MESSAGE)
+        if not isinstance(template, str) or not template.strip():
+            template = DEFAULT_ORDER_SCHEDULED_MESSAGE
+        return _render_template(template, {
+            'order_numbers': order_numbers_text(order) or f'#{order.id}',
+            'order_number': first_order_number_text(order),
+            'total': format_cop(order.total),
+            'count': order.stops.count(),
+            'client_name': order.client_name or '',
+            'origin': order.origin_address or '',
+            'scheduled_at': _format_scheduled_local(scheduled_for),
+        })
+
     template = get_order_created_message()
     return _render_template(template, {
         'order_numbers': order_numbers_text(order) or f'#{order.id}',
@@ -183,6 +207,21 @@ def build_confirmation_text(order: Order) -> str:
         'client_name': order.client_name or '',
         'origin': order.origin_address or '',
     })
+
+
+def _format_scheduled_local(value) -> str:
+    """Render a scheduled instant in the panel's timezone (Bogota)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        from django.conf import settings
+        from django.utils import timezone as dj_timezone
+
+        zone = ZoneInfo(getattr(settings, 'TIME_ZONE', 'America/Bogota'))
+        local = dj_timezone.localtime(value, zone)
+        return local.strftime('%d/%m/%Y %H:%M')
+    except Exception:
+        return str(value)
 
 
 def resolve_client(conversation, client_data: dict | None) -> dict:
@@ -310,6 +349,11 @@ def build_ops_payload(order: Order, client_ref: dict, data: dict, actor: str | N
         if client_ref.get('phone'):
             payload['client_phone'] = client_ref['phone']
 
+    # Pedido programado: la fecha futura viaja a ops; con domi queda
+    # pre-asignado y sin domi se difunde recién al activarse.
+    if order.scheduled_for:
+        payload['scheduled_at'] = order.scheduled_for.isoformat()
+
     # Phase 8: con un domi elegido la comanda se asigna de inmediato en modo
     # manual (ops valida deuda, suspende su turno y lo notifica). Sin domi el
     # pedido sigue saliendo libre, como hasta ahora.
@@ -367,6 +411,11 @@ def apply_ops_response(order: Order, response: dict, client_ref: dict) -> Order:
 
     order.ops_batch_id = str(response.get('batch_id') or '')[:32] or None
     order.status = response.get('status') or 'disponible'
+    scheduled = response.get('scheduled_at')
+    if scheduled:
+        parsed = parse_datetime(str(scheduled))
+        if parsed is not None:
+            order.scheduled_for = parsed
     order.ops_client_user_id = client.get('id') or client_ref.get('user_id') or None
     order.client_name = (client.get('name') or client_ref.get('name') or '')[:255]
     if courier.get('id'):
@@ -392,6 +441,7 @@ def apply_ops_response(order: Order, response: dict, client_ref: dict) -> Order:
     order.save(update_fields=[
         'ops_batch_id', 'status', 'ops_client_user_id', 'client_name',
         'ops_courier_user_id', 'courier_name', 'courier_code',
+        'scheduled_for',
         'last_synced_at', 'payload', 'total', 'updated_at',
     ])
     return order
@@ -460,6 +510,13 @@ def create_order(conversation, data: dict, user):
     # ``assignment=libre`` must never reach ops as a manual assignment.
     data = {**data, 'assignment': assignment, 'courier': courier_ref or None}
 
+    # Pedido programado: la fecha viaja a ops; el pedido queda en ``programado``
+    # hasta que el scheduler de ops lo active.
+    scheduled_for = data.get('scheduled_for')
+    if scheduled_for is not None and not isinstance(scheduled_for, datetime):
+        scheduled_for = parse_datetime(str(scheduled_for))
+    data = {**data, 'scheduled_for': scheduled_for}
+
     idem_key = (data.get('idempotency_key') or '').strip()[:64]
     cache_key = f'order:idem:{user.id}:{idem_key}' if idem_key else None
     if cache_key:
@@ -485,6 +542,7 @@ def create_order(conversation, data: dict, user):
             'send_confirmation': bool(data.get('send_confirmation', True)),
             'idempotency_key': idem_key,
             'assignment': assignment,
+            'scheduled_for': scheduled_for.isoformat() if scheduled_for else None,
             'courier': (
                 {
                     'ops_courier_user_id': courier_id,
@@ -515,6 +573,7 @@ def create_order(conversation, data: dict, user):
         acompanante=bool(data.get('acompanante')),
         total=sum(stop['price'] for stop in stops_data),
         status='pending',
+        scheduled_for=scheduled_for,
         source=data.get('source') or 'agent',
         created_by=user,
         payload=payload,
@@ -608,6 +667,9 @@ def refresh_order(order: Order) -> Order:
 
     courier: dict = {}
     courier_resolved = False
+    scheduled_for = None
+    scheduled_mode = None
+    scheduled_resolved = False
     for number, group in groups.items():
         data = ops.get_order(number)
         if not isinstance(data, dict) or not data.get('ok'):
@@ -620,6 +682,11 @@ def refresh_order(order: Order) -> Order:
         snapshot = courier_snapshot(data)
         if snapshot:
             courier = snapshot
+
+        if 'scheduled_at' in data:
+            scheduled_resolved = True
+            scheduled_for = parse_datetime(str(data.get('scheduled_at'))) if data.get('scheduled_at') else None
+            scheduled_mode = data.get('scheduled_mode')
 
         entries = {}
         for entry in (data.get('stops') or []):
@@ -657,6 +724,13 @@ def refresh_order(order: Order) -> Order:
     recompute_order_status(order)
     order.last_synced_at = now
     updates = ['status', 'total', 'last_synced_at', 'updated_at']
+    if scheduled_resolved:
+        order.scheduled_for = scheduled_for
+        # Un pedido pre-asignado que ops liberó al activarse.
+        order.scheduled_released = bool(
+            scheduled_mode == 'manual' and order.status == 'disponible'
+        )
+        updates += ['scheduled_for', 'scheduled_released']
     if courier_resolved:
         if courier:
             if courier.get('code'):

@@ -1032,8 +1032,8 @@ class OrderProxyTests(APITestCase):
 
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.data['couriers'], rows)
-        get.assert_any_call(query='sam')
-        self.assertEqual(get.call_args_list[-1], mock.call(query=None))
+        get.assert_any_call(query='sam', for_schedule=False)
+        self.assertEqual(get.call_args_list[-1], mock.call(query=None, for_schedule=False))
         self.assertEqual(all_rows.status_code, 200)
         self.assertEqual(all_rows.data['couriers'], rows)
 

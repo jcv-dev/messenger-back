@@ -275,9 +275,10 @@ def order_couriers(request):
     (queue position, active order, pause) is always fresh in the selector.
     """
     query = (request.query_params.get('q') or '').strip()[:60]
+    for_schedule = str(request.query_params.get('for_schedule') or '').strip().lower() in ('1', 'true', 'yes')
 
     try:
-        data = ops.list_couriers(query=query or None)
+        data = ops.list_couriers(query=query or None, for_schedule=for_schedule)
     except ops.OpsAPIError as exc:
         logger.warning('Courier list failed: %s', exc)
         return _ops_error_response(exc)

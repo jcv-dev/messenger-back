@@ -42,7 +42,7 @@ DOMII_TAG_COLOR = 'gray'
 EVENT_DEDUPE_TTL = 86400  # 24 h
 
 KNOWN_ORDER_STATUSES = frozenset({
-    'nuevo', 'disponible', 'asignado', 'confirmado', 'en_ruta',
+    'nuevo', 'programado', 'disponible', 'asignado', 'confirmado', 'en_ruta',
     'entregado', 'cancelado',
 })
 
@@ -164,6 +164,14 @@ def recompute_order_status(order: Order) -> str:
     else:
         new_status = order.status
 
+    # Un pedido programado sigue programado hasta que ops lo active, salvo
+    # cancelación total. La activación llega como una parada ya
+    # asignada/disponible, así que el estado se destraba.
+    if (order.status or '').strip().lower() == 'programado' and not all_canceled:
+        activated = any(s not in ('nuevo', '') for s in normalized)
+        if not activated:
+            new_status = 'programado'
+
     order.status = new_status
     total = sum((s.price or 0) for s in order.stops.all())
     # Keep the last known total when the payload has no per-stop prices yet
@@ -200,6 +208,8 @@ def adopt_order(conversation, data, order_number: int):
     client = data.get('client') if isinstance(data.get('client'), dict) else {}
     courier = data.get('courier') if isinstance(data.get('courier'), dict) else {}
     event_status = str(data.get('status') or '').strip().lower() or 'disponible'
+    scheduled_raw = data.get('scheduled_at')
+    scheduled_for = parse_datetime(str(scheduled_raw)) if scheduled_raw else None
     now = timezone.now()
 
     entries = [e for e in (data.get('stops') or []) if isinstance(e, dict)]
@@ -217,6 +227,7 @@ def adopt_order(conversation, data, order_number: int):
         origin_address=str(data.get('origin') or ''),
         total=_as_int(data.get('total')),
         status=event_status,
+        scheduled_for=scheduled_for,
         payload={'ops_event': data, 'adopted': True},
         last_synced_at=now,
     )
@@ -499,12 +510,30 @@ class OrderEventsView(IntegrationAPIView):
             courier_code = str(
                 data.get('courier_code') or courier.get('code') or ''
             ).strip()[:12]
-            if courier_code:
-                order.courier_code = courier_code
-            if courier.get('id'):
-                order.ops_courier_user_id = _as_int(courier['id']) or None
-            if courier.get('name'):
-                order.courier_name = str(courier['name'])[:255]
+            # Un pedido que ops libera (p. ej. el domi programado ya no estaba
+            # disponible): el payload no trae courier y hay que soltar el espejo.
+            if status_value in ('disponible', 'nuevo') and not courier.get('id') and not courier_code:
+                order.ops_courier_user_id = None
+                order.courier_name = ''
+                order.courier_code = ''
+            else:
+                if courier_code:
+                    order.courier_code = courier_code
+                if courier.get('id'):
+                    order.ops_courier_user_id = _as_int(courier['id']) or None
+                if courier.get('name'):
+                    order.courier_name = str(courier['name'])[:255]
+            scheduled_raw = data.get('scheduled_at')
+            if scheduled_raw:
+                parsed_scheduled = parse_datetime(str(scheduled_raw))
+                if parsed_scheduled is not None:
+                    order.scheduled_for = parsed_scheduled
+            # Un pedido programado pre-asignado que ops liberó al activarse.
+            if (
+                status_value in ('disponible', 'nuevo')
+                and (data.get('scheduled_mode') == 'manual')
+            ):
+                order.scheduled_released = True
             recompute_order_status(order)
             order.last_synced_at = now
             order.save()

@@ -349,7 +349,8 @@ sends silently:
   validates them and `create_order` stores the block in `Order.payload['draft']`.
 - Driver selector (Phase 8): `GET /api/orders/couriers/?q=` (`order_views.order_couriers`)
   proxies `ops.list_couriers()` → `GET /api/v1/couriers` without cache (turn state is
-  volatile). `POST /api/conversations/{id}/orders/` accepts `assignment`
+  volatile). Pass `?for_schedule=1` for the scheduled-order picker (full non-fired
+  roster, turn/pause/fijo ignored). `POST /api/conversations/{id}/orders/` accepts `assignment`
   (`libre|manual`, default `libre`) and `courier {ops_courier_user_id, name, code}`;
   `create_order` normalizes it, sends `courier_user_id` + `mode=manual` to ops,
   mirrors `Order.ops_courier_user_id`/`courier_name`/`courier_code` (migration
@@ -361,6 +362,19 @@ sends silently:
   `OrderValidationError(field='courier')` (the view returns 400) instead of leaving a
   `failed` batch; other ops errors keep the 502 + retry flow. Ops keeps owning the
   turn logic: `createCommand` suspends the domi's queue position and notifies them.
+- Scheduled orders (Phase 10): `POST /api/conversations/{id}/orders/` accepts
+  `scheduled_for` (aware; ≥15 min, ≤30 days, Bogota). The local `Order` mirrors
+  ops' `programado` status plus `scheduled_for`/`scheduled_released` (migration
+  `0045_order_scheduled`); the ops payload carries `scheduled_at`, and ops owns
+  the future state and activation (`domii:activate-scheduled-orders`). At
+  activation a pre-assigned domi keeps the order only if they are **working**
+  (`is_working=1`, not paused/fired/in debt); off-shift releases to libre. The
+  event handler accepts `programado`, keeps it while the local stops are still
+  `nuevo` (create/push choreography), promotes it once a stop is
+  assigned/available, and clears the courier + sets `scheduled_released` when ops
+  frees a pre-assigned domi. `order_scheduled_message` (BotConfig) renders the
+  creation confirmation; `OrderSheet` has the schedule switch/inputs and
+  `CourierPicker` the `forSchedule` full-roster mode.
 
 ## Database
 

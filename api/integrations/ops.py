@@ -189,7 +189,15 @@ def get_order(order_number: int, timeout: float | None = None):
     return _request('GET', f'/api/v1/orders/{order_number}', timeout=timeout)
 
 
-def list_couriers(query: str | None = None):
-    """GET /api/v1/couriers — snapshot with turn/availability state."""
-    params = {'q': query} if query else None
-    return _request('GET', '/api/v1/couriers', params=params)
+def list_couriers(query: str | None = None, for_schedule: bool = False):
+    """GET /api/v1/couriers — snapshot with turn/availability state.
+
+    ``for_schedule`` requests the complete roster (ignore turn/pause/fijo,
+    exclude only disabled accounts), used by the scheduled-order picker.
+    """
+    params: dict = {}
+    if query:
+        params['q'] = query
+    if for_schedule:
+        params['for_schedule'] = 1
+    return _request('GET', '/api/v1/couriers', params=params or None)

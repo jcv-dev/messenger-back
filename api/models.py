@@ -437,6 +437,7 @@ class Order(models.Model):
     """Local mirror of a Domiitulua pedido (batch of one or more stops)."""
     STATUS_CHOICES = [
         ('draft', 'Borrador'), ('pending', 'Enviando'), ('failed', 'Fallido'),
+        ('programado', 'Programado'),
         ('disponible', 'Buscando domiciliario'), ('asignado', 'Asignado'),
         ('confirmado', 'Confirmado'), ('en_ruta', 'En camino'),
         ('entregado', 'Entregado'), ('cancelado', 'Cancelado'),
@@ -458,6 +459,10 @@ class Order(models.Model):
     acompanante = models.BooleanField(default=False)
     total = models.DecimalField(max_digits=12, decimal_places=0, default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft', db_index=True)
+    # Pedido programado: instante futuro (aware, America/Bogota) en que ops lo
+    # activa; `scheduled_released` marca que un domi pre-asignado se liberó.
+    scheduled_for = models.DateTimeField(null=True, blank=True, db_index=True)
+    scheduled_released = models.BooleanField(default=False)
     notified_statuses = models.JSONField(default=list, blank=True)
     source = models.CharField(max_length=10, default='agent')  # agent | llm
     created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)

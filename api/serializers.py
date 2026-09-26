@@ -726,6 +726,7 @@ class OrderSerializer(serializers.ModelSerializer):
             'ops_courier_user_id', 'courier_name', 'courier_code',
             'client_name', 'origin_address', 'payment_method', 'profile',
             'tools', 'acompanante', 'total', 'status', 'status_label',
+            'scheduled_for', 'scheduled_released',
             'notified_statuses', 'source', 'payload', 'stops',
             'last_synced_at', 'created_at', 'updated_at',
         ]
@@ -807,6 +808,36 @@ class OrderCreateInputSerializer(serializers.Serializer):
     )
     courier = OrderCourierInputSerializer(required=False, allow_null=True)
     stops = OrderStopInputSerializer(many=True)
+    # Pedido programado: instante futuro (America/Bogota). Con `assignment=manual`
+    # queda pre-asignado; con `libre` ops lo difunde al activarse.
+    scheduled_for = serializers.DateTimeField(required=False, allow_null=True)
+
+    def validate_scheduled_for(self, value):
+        if value is None:
+            return None
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
+
+        from django.conf import settings
+        from django.utils import timezone as dj_timezone
+
+        tz = getattr(settings, 'TIME_ZONE', 'America/Bogota')
+        zone = ZoneInfo(tz)
+        now = dj_timezone.localtime(dj_timezone.now(), zone)
+        if dj_timezone.is_naive(value):
+            value = dj_timezone.make_aware(value, zone)
+        local = dj_timezone.localtime(value, zone)
+        min_lead = int(getattr(settings, 'ORDER_SCHEDULED_MIN_LEAD_MINUTES', 15))
+        max_days = int(getattr(settings, 'ORDER_SCHEDULED_MAX_HORIZON_DAYS', 30))
+        if local < now + timedelta(minutes=min_lead):
+            raise serializers.ValidationError(
+                f'El pedido programado debe ser al menos {min_lead} minutos en el futuro.'
+            )
+        if local > now + timedelta(days=max_days):
+            raise serializers.ValidationError(
+                f'El pedido programado no puede estar a más de {max_days} días.'
+            )
+        return local
 
 
 class OrderDraftInputSerializer(serializers.Serializer):
