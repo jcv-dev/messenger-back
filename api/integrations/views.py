@@ -166,11 +166,17 @@ def recompute_order_status(order: Order) -> str:
 
     # Un pedido programado sigue programado hasta que ops lo active, salvo
     # cancelación total. La activación llega como una parada ya
-    # asignada/disponible, así que el estado se destraba.
+    # asignada/disponible, así que el estado se destraba — pero solo cuando su
+    # hora ya llegó: una edición del panel antes del `scheduled_for` no puede
+    # promoverlo (y mucho menos notificar al cliente).
     if (order.status or '').strip().lower() == 'programado' and not all_canceled:
-        activated = any(s not in ('nuevo', '') for s in normalized)
-        if not activated:
+        due = order.scheduled_for is None or order.scheduled_for <= timezone.now()
+        if not due:
             new_status = 'programado'
+        else:
+            activated = any(s not in ('nuevo', '') for s in normalized)
+            if not activated:
+                new_status = 'programado'
 
     order.status = new_status
     total = sum((s.price or 0) for s in order.stops.all())
@@ -732,7 +738,9 @@ class OrderEventsView(IntegrationAPIView):
                 _apply_stop_fields(stop, entry)
             if stop.ops_order_number is None and order_number:
                 stop.ops_order_number = order_number
-            stop.status = status_value
+            # Un pedido programado mantiene sus paradas en `nuevo`: ops no las
+            # mueve hasta activarlo. El estado del pedido sí queda `programado`.
+            stop.status = 'nuevo' if status_value == 'programado' else status_value
             stop.payload = {
                 **(stop.payload or {}),
                 'status_label': str(data.get('status_label') or ''),

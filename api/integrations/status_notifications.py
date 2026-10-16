@@ -24,6 +24,7 @@ Meta template (``aviso_asignado`` …) configured in
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 
 logger = logging.getLogger('api')
 
@@ -305,6 +306,15 @@ def maybe_notify(order) -> str | None:
     """
     if not notifications_enabled():
         return None
+    # Un pedido programado no notifica al cliente hasta que llegue su hora:
+    # ops puede editarlo o pre-asignar un domi sin disparar el "asignado".
+    if (order.status or '').strip().lower() == 'programado':
+        scheduled = getattr(order, 'scheduled_for', None)
+        if scheduled is None or scheduled > timezone.now():
+            logger.info(
+                'Order %s is still scheduled; notification suppressed', order.id,
+            )
+            return None
     transition = resolve_transition(order)
     if not transition:
         return None

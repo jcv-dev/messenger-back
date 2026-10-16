@@ -17,6 +17,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
 from api.integrations.orders import build_confirmation_text, send_confirmation
+from api.integrations.status_notifications import maybe_notify
 from api.integrations.views import recompute_order_status
 from api.models import Conversation, Order, OrderStop
 from api.serializers import OrderCreateInputSerializer, OrderSerializer
@@ -230,6 +231,69 @@ class ScheduledStatusPreservationTests(TestCase):
         )
         recompute_order_status(order)
         self.assertEqual(order.status, 'cancelado')
+
+    def test_recompute_keeps_programado_with_assigned_stops_before_scheduled(self):
+        # Una edición del panel que deja la parada en `asignado` no puede
+        # promover el pedido antes de su hora.
+        conv = self._orders()
+        order = Order.objects.create(
+            conversation=conv, status='programado',
+            scheduled_for=timezone.now() + timedelta(days=1), total=8000,
+        )
+        OrderStop.objects.create(
+            order=order, stop_no=1, service_type='domicilio',
+            dest_address='Cra 5', price=8000, status='asignado',
+        )
+        recompute_order_status(order)
+        self.assertEqual(order.status, 'programado')
+
+    def test_recompute_promotes_programado_once_due(self):
+        conv = self._orders()
+        order = Order.objects.create(
+            conversation=conv, status='programado',
+            scheduled_for=timezone.now() - timedelta(minutes=1), total=8000,
+        )
+        OrderStop.objects.create(
+            order=order, stop_no=1, service_type='domicilio',
+            dest_address='Cra 5', price=8000, status='asignado',
+        )
+        recompute_order_status(order)
+        self.assertEqual(order.status, 'asignado')
+
+    def test_maybe_notify_suppressed_while_scheduled(self):
+        # El "asignado" prematuro que recibió el cliente de #41597.
+        conv = self._orders()
+        order = Order.objects.create(
+            conversation=conv, status='programado',
+            scheduled_for=timezone.now() + timedelta(days=1), total=8000,
+        )
+        OrderStop.objects.create(
+            order=order, stop_no=1, service_type='domicilio',
+            dest_address='Cra 5', price=8000, status='asignado',
+        )
+
+        notified = maybe_notify(order)
+
+        self.assertIsNone(notified)
+        order.refresh_from_db()
+        self.assertEqual(order.notified_statuses, [])
+
+    def test_maybe_notify_fires_once_due(self):
+        conv = self._orders()
+        order = Order.objects.create(
+            conversation=conv, status='asignado',
+            scheduled_for=timezone.now() - timedelta(minutes=1), total=8000,
+        )
+        OrderStop.objects.create(
+            order=order, stop_no=1, service_type='domicilio',
+            dest_address='Cra 5', price=8000, status='asignado',
+        )
+
+        notified = maybe_notify(order)
+
+        self.assertEqual(notified, 'asignado')
+        order.refresh_from_db()
+        self.assertIn('asignado', order.notified_statuses)
 
     def test_order_serializer_exposes_schedule_fields(self):
         conv = self._orders()
