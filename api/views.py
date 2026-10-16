@@ -17,6 +17,7 @@ from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.cache import cache_page
 from django.db import transaction, models
+from django.utils.dateparse import parse_datetime
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from datetime import datetime, timezone as dt_timezone, timedelta
@@ -1916,7 +1917,15 @@ class ConversationViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def active_conversations(self, request):
-        """Get active conversations with cursor-based pagination"""
+        """Get active conversations with cursor-based pagination.
+
+        Pinned conversations (group or personal) always travel whole in the
+        first page. The cursor only walks the *unpinned* remainder on a
+        ``(last_message_at, id)`` keyset — a plain ``last_message_at`` filter
+        cannot express the pinned-first order, so pinned rows would be served
+        again on every later page (2026-10 duplicate bug) and timestamp ties
+        could be skipped.
+        """
         user = request.user
         queryset = self.get_queryset().filter(status='active').annotate(
             msg_count=Count('messages')
@@ -1928,15 +1937,54 @@ class ConversationViewSet(viewsets.ModelViewSet):
         if request.query_params.get('only_unread') == 'true':
             queryset = queryset.filter(messages__is_read=False, messages__direction='inbound').distinct()
 
+        # Pinned rows are never paginated by the keyset below.
+        pinned_filter = Q(is_pinned=True) | Q(_has_user_pin=True)
+        unpinned = queryset.filter(~pinned_filter).order_by(
+            models.F('last_message_at').desc(nulls_last=True), '-id',
+        )
+
+        def cursor_for(rows):
+            """``<last_message_at>|<id>`` keyset cursor for the last row."""
+            last = rows[-1]
+            if last.last_message_at is None:
+                return None
+            return f'{last.last_message_at.isoformat()}|{last.id}'
+
         if before:
-            queryset = queryset.filter(last_message_at__lt=before)
-
-        queryset = queryset.order_by('-is_pinned', 'pinned_at', '-_has_user_pin', '-last_message_at', '-created_at')
-        conv_page = list(queryset[:limit + 1])
-        has_more = len(conv_page) > limit
-        conv_page = conv_page[:limit]
-
-        cursor = conv_page[-1].last_message_at.isoformat() if conv_page and has_more else None
+            # Following pages: unpinned rows strictly after the cursor row in
+            # (last_message_at DESC, id DESC) order. The old plain-ISO cursor
+            # is still accepted for in-flight clients.
+            cursor_lma, _, cursor_id = before.partition('|')
+            parsed_lma = parse_datetime(cursor_lma)
+            if parsed_lma is None:
+                conv_page, cursor, has_more = [], None, False
+            else:
+                if timezone.is_naive(parsed_lma):
+                    parsed_lma = timezone.make_aware(parsed_lma)
+                keyset = Q(last_message_at__lt=parsed_lma)
+                if cursor_id:
+                    try:
+                        keyset |= Q(last_message_at=parsed_lma, id__lt=int(cursor_id))
+                    except ValueError:
+                        pass
+                conv_page = list(unpinned.filter(keyset)[:limit + 1])
+                has_more = len(conv_page) > limit
+                conv_page = conv_page[:limit]
+                cursor = cursor_for(conv_page) if conv_page and has_more else None
+                if has_more and cursor is None:
+                    has_more = False
+        else:
+            # First page: every pinned conversation, then the most recent
+            # unpinned ones. Recents keep their own cursor so later pages only
+            # ever contain unpinned rows.
+            pinned_page = list(queryset.filter(pinned_filter)[:limit])
+            recents_raw = list(unpinned[:limit + 1])
+            has_more = len(recents_raw) > limit
+            recents = recents_raw[:limit]
+            cursor = cursor_for(recents) if recents and has_more else None
+            if has_more and cursor is None:
+                has_more = False
+            conv_page = pinned_page + recents
 
         if not user.is_staff:
             logger.debug(

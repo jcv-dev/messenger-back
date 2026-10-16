@@ -251,7 +251,9 @@ class ConversationViewSetTests(APITestCase):
         self.assertNotIn('messages', response.data)
 
     def test_active_conversations_query_count(self):
-        """Verify N+1 prevented: 5 conversations = ~7 queries, not 5*3+1=16."""
+        """Verify N+1 prevented: 5 conversations cost a constant number of
+        queries. The first page runs two list queries (pinned block + unpinned
+        recents, both with prefetches), not one per conversation."""
         for i in range(4):
             conv = Conversation.objects.create(
                 whatsapp_id=f'1555{i:05d}', contact_name=f'Contact {i}', contact_phone=f'1555{i:05d}',
@@ -261,7 +263,7 @@ class ConversationViewSetTests(APITestCase):
             ConversationNote.create_note(conversation=conv, content=f'note-{i}', created_by=self.user)
             ConversationTake.create_take(conversation=conv, created_by=self.user, duration_minutes=60)
 
-        with self.assertNumQueries(9):
+        with self.assertNumQueries(10):
             self.client.get('/api/conversations/active_conversations/')
 
     def test_messages_cursor_pagination(self):
@@ -2521,6 +2523,124 @@ class ConversationCursorPaginationTests(APITestCase):
         conv_ids = [c['id'] for c in response.data['results']]
         self.assertIn(conv_unread.id, conv_ids)
         self.assertIn(conv_read.id, conv_ids)
+
+
+class ConversationPinnedPaginationTests(APITestCase):
+    """Pinned conversations must never repeat across cursor pages.
+
+    Regression for the 2026-10 duplicate bug: ``active_conversations`` sorted
+    pinned-first but paginated on ``last_message_at`` alone, so a pinned
+    conversation older than the page-0 cursor came back again on page 1 (and
+    timestamp ties could be skipped). Pinned rows now travel whole in the first
+    page and the cursor only walks the unpinned remainder on a
+    ``(last_message_at, id)`` keyset.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='pinpageuser', password='pass')
+        self.token = Token.objects.create(user=self.user)
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        self.group = get_or_create_tulua_group()
+        assign_user_group(self.user, self.group)
+
+        self.now = timezone.now()
+        self.convs = []
+        for i in range(6):
+            conv = Conversation.objects.create(
+                whatsapp_id=f'pinpage{i:03d}',
+                contact_name=f'Pin Page {i}',
+                group=self.group,
+                last_message_at=self.now - timedelta(minutes=i + 1),
+            )
+            Message.objects.create(
+                conversation=conv, direction='inbound', message_type='text',
+                content=f'msg {i}',
+            )
+            self.convs.append(conv)
+
+    def _walk(self, limit, extra_params=None):
+        ids, pages = [], []
+        before = None
+        for _ in range(10):
+            params = dict(extra_params or {})
+            params['limit'] = limit
+            if before:
+                params['before'] = before
+            response = self.client.get('/api/conversations/active_conversations/', params)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            page_ids = [c['id'] for c in response.data['results']]
+            pages.append(page_ids)
+            ids.extend(page_ids)
+            if not response.data['has_more'] or not response.data['cursor']:
+                break
+            before = response.data['cursor']
+        else:
+            self.fail('cursor pagination did not terminate')
+        return ids, pages
+
+    def test_unpinned_pages_are_disjoint_and_complete(self):
+        ids, _ = self._walk(limit=2)
+        self.assertEqual(len(ids), len(set(ids)), f'duplicated ids: {ids}')
+        self.assertEqual(set(ids), {c.id for c in self.convs})
+
+    def test_personal_pin_not_duplicated_across_pages(self):
+        oldest = self.convs[-1]
+        ConversationUserPin.objects.create(conversation=oldest, user=self.user)
+
+        ids, pages = self._walk(limit=2)
+
+        self.assertEqual(len(ids), len(set(ids)), f'duplicated ids: {ids}')
+        self.assertEqual(set(ids), {c.id for c in self.convs})
+        # The pinned conversation rides in the first page...
+        self.assertIn(oldest.id, pages[0])
+        # ...and never again on any later page.
+        for page in pages[1:]:
+            self.assertNotIn(oldest.id, page)
+
+    def test_group_pin_not_duplicated_across_pages(self):
+        oldest = self.convs[-1]
+        oldest.is_pinned = True
+        oldest.pinned_at = self.now
+        oldest.save(update_fields=['is_pinned', 'pinned_at'])
+
+        ids, pages = self._walk(limit=2)
+
+        self.assertEqual(len(ids), len(set(ids)), f'duplicated ids: {ids}')
+        self.assertEqual(set(ids), {c.id for c in self.convs})
+        self.assertEqual(pages[0][0], oldest.id)
+
+    def test_equal_timestamps_are_not_skipped(self):
+        Conversation.objects.filter(
+            id__in=[c.id for c in self.convs],
+        ).update(last_message_at=self.now)
+
+        ids, _ = self._walk(limit=1)
+
+        self.assertEqual(len(ids), len(set(ids)), f'duplicated ids: {ids}')
+        self.assertEqual(set(ids), {c.id for c in self.convs})
+
+    def test_cursor_encodes_timestamp_and_id(self):
+        response = self.client.get('/api/conversations/active_conversations/', {'limit': 2})
+        cursor = response.data['cursor']
+        self.assertIsNotNone(cursor)
+        lma, _, cid = cursor.partition('|')
+        self.assertTrue(lma)
+        self.assertTrue(cid.isdigit(), f'cursor id missing: {cursor!r}')
+
+    def test_legacy_plain_timestamp_cursor_still_pages(self):
+        response = self.client.get('/api/conversations/active_conversations/', {'limit': 2})
+        legacy_cursor = response.data['results'][-1]['last_message_at']
+
+        response2 = self.client.get(
+            '/api/conversations/active_conversations/',
+            {'limit': 2, 'before': legacy_cursor},
+        )
+
+        self.assertEqual(response2.status_code, status.HTTP_200_OK)
+        self.assertTrue(response2.data['results'])
+        first_ids = {c['id'] for c in response.data['results']}
+        next_ids = {c['id'] for c in response2.data['results']}
+        self.assertFalse(first_ids & next_ids)
 
 
 # ── Initiate Conversation ────────────────────────────────────────────────────
