@@ -21,7 +21,7 @@ from rest_framework.test import APITestCase
 from api.integrations import ops
 from api.integrations.adoption import _lock_key, sync_active_orders
 from api.integrations.couriers import courier_snapshot
-from api.models import Conversation, Order, OrderStop
+from api.models import BotConfig, Conversation, Order, OrderStop
 from api.tests import get_or_create_tulua_group
 
 OPS_SETTINGS = dict(OPS_API_URL='https://ops.test', OPS_API_KEY='dmikey_x')
@@ -113,6 +113,18 @@ class CourierSnapshotTests(SimpleTestCase):
 class SyncActiveOrdersTests(TestCase):
     def setUp(self):
         cache.clear()
+        from api.bot.config import _clear_cache
+
+        _clear_cache()
+        BotConfig.objects.update_or_create(
+            key='order_status_enabled',
+            defaults={
+                'value': {
+                    'asignado': True, 'en_ruta': True,
+                    'entregado': True, 'cancelado': True,
+                },
+            },
+        )
         self.group = get_or_create_tulua_group()
         self.conversation = Conversation.objects.create(
             whatsapp_id='573001234567', contact_name='Janne',

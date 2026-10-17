@@ -125,6 +125,11 @@ class OrderValidationUnitTests(TestCase):
             ], catalog=catalog)
 
     def test_build_confirmation_text_placeholders(self):
+        from api.bot.config import _clear_cache
+
+        BotConfig.objects.filter(key='order_created_message').delete()
+        _clear_cache()
+        self.addCleanup(_clear_cache)
         conversation = Conversation.objects.create(
             whatsapp_id='573001234567', contact_name='Ana',
         )
@@ -147,7 +152,7 @@ class OrderValidationUnitTests(TestCase):
         # The default confirmation never shows the price (user feedback).
         self.assertNotIn('$14.500', text)
         self.assertNotIn('{total}', text)
-        self.assertIn('Un domiciliario lo aceptará pronto', text)
+        self.assertIn('Te avisaremos cuando sea entregado', text)
         self.assertEqual(order_numbers_text(order), '#1234, #1235')
 
     def test_order_numbers_text_dedupes_a_shared_comanda_number(self):

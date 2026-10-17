@@ -301,6 +301,10 @@ sends silently:
   inside the webhook transaction. Texts/templates are `BotConfig` keys
   `order_status_messages`, `order_status_templates` and
   `order_status_notifications_enabled` (seeded by migrations `0041`/`0042`).
+  `order_status_enabled` (migration `0046`) controls each transition; the
+  cost-saving default sends only `entregado` and `cancelado`, while disabled
+  transitions are claimed silently so they never replay. The creation
+  confirmation (`order_created_message`) is the “recibido” message.
   `order_status_templates` params are value-key strings for positional templates
   or `{name, value}` objects for named ones; the approved `aviso_*` templates use
   the named variable `order_code`.

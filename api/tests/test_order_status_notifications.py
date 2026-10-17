@@ -24,8 +24,10 @@ from api.integrations.notify import (
 )
 from api.integrations.orders import send_confirmation
 from api.integrations.status_notifications import (
+    DEFAULT_ORDER_STATUS_ENABLED,
     DEFAULT_ORDER_STATUS_MESSAGES,
     build_fallback_template,
+    get_order_status_enabled,
     maybe_notify,
     render_status_text,
     resolve_transition,
@@ -54,6 +56,15 @@ class OrderStatusNotificationWebhookTests(APITestCase):
         from api.bot.config import _clear_cache
 
         _clear_cache()
+        # The production default only sends entregado/cancelado. These tests
+        # exercise aggregation, so enable every transition explicitly and let
+        # the policy-specific tests override this map.
+        BotConfig.objects.update_or_create(
+            key='order_status_enabled',
+            defaults={
+                'value': {key: True for key in DEFAULT_ORDER_STATUS_ENABLED},
+            },
+        )
         raw, key_hash, prefix = generate_api_key()
         self.key = raw
         IntegrationApiKey.objects.create(
@@ -262,6 +273,57 @@ class OrderStatusNotificationWebhookTests(APITestCase):
         finally:
             _clear_cache()
 
+    def test_disabled_transition_is_consumed_without_a_message(self):
+        BotConfig.objects.update_or_create(
+            key='order_status_enabled',
+            defaults={'value': {'entregado': True, 'cancelado': True}},
+        )
+        from api.bot.config import _clear_cache
+
+        _clear_cache()
+        try:
+            self.make_stops(1, number=1240)
+
+            en_route = self.post_event(self.event(1240, 'en_ruta'))
+
+            self.assertFalse(en_route.json()['notified'])
+            self.assertEqual(len(self.messages()), 0)
+            self.assertIn('en_ruta', self.refresh_order().notified_statuses)
+
+            delivered = self.post_event(self.event(1240, 'entregado'))
+
+            self.assertTrue(delivered.json()['notified'])
+            self.assertEqual(delivered.json()['notified_status'], 'entregado')
+            self.assertEqual(len(self.messages()), 1)
+        finally:
+            _clear_cache()
+
+    def test_default_policy_only_notifies_delivered(self):
+        BotConfig.objects.filter(key='order_status_enabled').delete()
+        from api.bot.config import _clear_cache
+
+        _clear_cache()
+        try:
+            self.make_stops(1, number=1240)
+
+            assigned = self.post_event(self.event(1240, 'asignado'))
+            en_route = self.post_event(self.event(1240, 'en_ruta'))
+
+            self.assertFalse(assigned.json()['notified'])
+            self.assertFalse(en_route.json()['notified'])
+            self.assertEqual(len(self.messages()), 0)
+            self.assertEqual(
+                self.refresh_order().notified_statuses, ['asignado', 'en_ruta'],
+            )
+
+            delivered = self.post_event(self.event(1240, 'entregado'))
+
+            self.assertTrue(delivered.json()['notified'])
+            self.assertEqual(len(self.messages()), 1)
+            self.assertIn('entregado', self.messages()[0].content)
+        finally:
+            _clear_cache()
+
     def test_configured_status_text_is_used(self):
         BotConfig.objects.update_or_create(
             key='order_status_messages',
@@ -314,6 +376,32 @@ class StatusNotificationUnitTests(TestCase):
         self.stop(1, 'confirmado')
         self.stop(2, 'asignado')
         self.assertEqual(resolve_transition(self.order), 'asignado')
+
+    def test_default_status_switches_send_only_delivered_and_canceled(self):
+        from api.bot.config import _clear_cache
+
+        _clear_cache()
+        enabled = get_order_status_enabled()
+        self.assertEqual(
+            enabled,
+            {'asignado': False, 'en_ruta': False, 'entregado': True, 'cancelado': True},
+        )
+
+    def test_status_switches_accept_string_values(self):
+        from api.bot.config import _clear_cache
+
+        BotConfig.objects.update_or_create(
+            key='order_status_enabled',
+            defaults={'value': {'asignado': 'true', 'en_ruta': 'off'}},
+        )
+        _clear_cache()
+        try:
+            enabled = get_order_status_enabled()
+            self.assertTrue(enabled['asignado'])
+            self.assertFalse(enabled['en_ruta'])
+            self.assertTrue(enabled['entregado'])
+        finally:
+            _clear_cache()
 
     def test_values_exclude_the_client_name(self):
         self.order.ops_order_number = None
@@ -653,6 +741,12 @@ class UsernameOnlyOrderNotificationTests(TestCase):
         from api.bot.config import _clear_cache
 
         _clear_cache()
+        BotConfig.objects.update_or_create(
+            key='order_status_enabled',
+            defaults={
+                'value': {key: True for key in DEFAULT_ORDER_STATUS_ENABLED},
+            },
+        )
         self.conversation = Conversation.objects.create(
             whatsapp_id=self.BSUID, contact_name='Juan Camilo', contact_phone='',
         )

@@ -10,9 +10,13 @@ notifies the client **at most once per batch-level transition**:
 ``cancelado``    every stop canceled
 ===============  ==========================================================
 
-A mixed batch (for example one canceled stop and one delivered stop) sends
-nothing: agents see it in the order card. Transitions already sent are stored in
-``Order.notified_statuses``, so repeated webhooks never duplicate a message.
+Each transition is controlled by ``BotConfig.order_status_enabled``. The
+cost-saving default only notifies ``entregado`` and ``cancelado``: every
+outbound WhatsApp message is billable, and the creation confirmation already
+covers the "recibido" moment. Disabled transitions are still claimed in
+``Order.notified_statuses`` (without sending), so enabling a switch later never
+replays a stale state. A mixed batch (for example one canceled stop and one
+delivered stop) sends nothing: agents see it in the order card.
 
 Delivery: the client first receives a normal free-text message (valid inside the
 WhatsApp 24 h customer-service window). When Meta rejects it because the window
@@ -33,6 +37,17 @@ DEFAULT_ORDER_STATUS_MESSAGES = {
     'en_ruta': '🛵 Pedido {order_numbers} en camino.',
     'entregado': '✅ Pedido {order_numbers} entregado. ¡Gracias por preferirnos!',
     'cancelado': '❌ Pedido {order_numbers} cancelado. Si necesitas ayuda, escríbenos.',
+}
+
+# Per-status switches. WhatsApp bills every outbound message, so the default
+# keeps only the two moments that matter to the client: delivery and the rare
+# cancellation. "recibido" is the order-creation confirmation (a separate
+# BotConfig key) and is not part of this map.
+DEFAULT_ORDER_STATUS_ENABLED = {
+    'asignado': False,
+    'en_ruta': False,
+    'entregado': True,
+    'cancelado': True,
 }
 
 # Names supplied by the user (already approved by Meta). Each entry describes
@@ -96,6 +111,35 @@ def get_order_status_messages() -> dict:
             if name in messages and isinstance(text, str) and text.strip():
                 messages[name] = text
     return messages
+
+
+def _as_bool(value, default: bool) -> bool:
+    """Best-effort boolean for values saved through the admin API."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ('1', 'true', 'yes', 'on', 'sí', 'si'):
+            return True
+        if normalized in ('0', 'false', 'no', 'off', ''):
+            return False
+    return default
+
+
+def get_order_status_enabled() -> dict:
+    """Configured per-transition switches merged over the cost-saving defaults."""
+    from api.bot.config import get_config
+
+    enabled = dict(DEFAULT_ORDER_STATUS_ENABLED)
+    stored = get_config('order_status_enabled', None)
+    if isinstance(stored, dict):
+        for key, value in stored.items():
+            name = _normalize(key)
+            if name in enabled:
+                enabled[name] = _as_bool(value, enabled[name])
+    return enabled
 
 
 def _clean_params(raw) -> list:
@@ -317,6 +361,15 @@ def maybe_notify(order) -> str | None:
             return None
     transition = resolve_transition(order)
     if not transition:
+        return None
+    if not get_order_status_enabled().get(transition, True):
+        # Consume the transition silently. If the switch is enabled later, the
+        # client must not receive a stale "asignado"/"en ruta" message.
+        claim_transition(order, transition)
+        logger.info(
+            'Order %s %s notification disabled; transition consumed',
+            order.id, transition,
+        )
         return None
     if not has_delivery_target(order.conversation):
         # Nothing to address (no phone and no username): do not claim the

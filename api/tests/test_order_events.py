@@ -13,7 +13,7 @@ from rest_framework.test import APITestCase
 
 from api.integrations.auth import generate_api_key
 from api.integrations.hmac import compute_signature
-from api.models import Conversation, IntegrationApiKey, Order, OrderStop
+from api.models import BotConfig, Conversation, IntegrationApiKey, Order, OrderStop
 
 SECRET = 'test-webhook-secret'
 URL = '/api/integrations/orders/events/'
@@ -23,6 +23,19 @@ URL = '/api/integrations/orders/events/'
 class OrderEventsTests(APITestCase):
     def setUp(self):
         cache.clear()
+        from api.bot.config import _clear_cache
+
+        _clear_cache()
+        # Event mechanics are independent of the cost-saving defaults.
+        BotConfig.objects.update_or_create(
+            key='order_status_enabled',
+            defaults={
+                'value': {
+                    'asignado': True, 'en_ruta': True,
+                    'entregado': True, 'cancelado': True,
+                },
+            },
+        )
         raw, key_hash, prefix = generate_api_key()
         self.key = raw
         self.api_key = IntegrationApiKey.objects.create(

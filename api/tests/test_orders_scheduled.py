@@ -281,19 +281,19 @@ class ScheduledStatusPreservationTests(TestCase):
     def test_maybe_notify_fires_once_due(self):
         conv = self._orders()
         order = Order.objects.create(
-            conversation=conv, status='asignado',
+            conversation=conv, status='entregado',
             scheduled_for=timezone.now() - timedelta(minutes=1), total=8000,
         )
         OrderStop.objects.create(
             order=order, stop_no=1, service_type='domicilio',
-            dest_address='Cra 5', price=8000, status='asignado',
+            dest_address='Cra 5', price=8000, status='entregado',
         )
 
         notified = maybe_notify(order)
 
-        self.assertEqual(notified, 'asignado')
+        self.assertEqual(notified, 'entregado')
         order.refresh_from_db()
-        self.assertIn('asignado', order.notified_statuses)
+        self.assertIn('entregado', order.notified_statuses)
 
     def test_order_serializer_exposes_schedule_fields(self):
         conv = self._orders()

@@ -41,7 +41,7 @@ MAX_STOPS = 10
 
 DEFAULT_ORDER_CREATED_MESSAGE = (
     '✅ Pedido {order_numbers} recibido. '
-    'Un domiciliario lo aceptará pronto.'
+    'Te avisaremos cuando sea entregado.'
 )
 
 DEFAULT_ORDER_SCHEDULED_MESSAGE = (
