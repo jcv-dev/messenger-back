@@ -196,7 +196,7 @@ class MessageSerializer(serializers.ModelSerializer):
             'id', 'direction', 'message_type', 'content', 'content_display',
             'sender_name', 'sender', 'sender_detail',
             'whatsapp_message_id', 'media_url', 'metadata', 'created_at',
-            'is_read', 'is_forwarded', 'is_frequently_forwarded',
+            'is_read', 'is_automated', 'is_forwarded', 'is_frequently_forwarded',
             'context_message_id', 'context_message_preview',
         ]
 
@@ -285,6 +285,35 @@ class MessageSerializer(serializers.ModelSerializer):
             return ' · '.join(str(value) for value in positional if value)
 
         return f'[Plantilla: {name}]'
+
+
+class AutoReplyMessageSerializer(serializers.ModelSerializer):
+    """Captured automated business reply, flattened for the admin review page."""
+    conversation_id = serializers.IntegerField(source='conversation.id', read_only=True)
+    conversation_name = serializers.SerializerMethodField()
+    contact_phone = serializers.CharField(source='conversation.contact_phone', read_only=True)
+    matched_pattern = serializers.SerializerMethodField()
+    template_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Message
+        fields = [
+            'id', 'conversation_id', 'conversation_name', 'contact_phone',
+            'message_type', 'content', 'created_at', 'is_read',
+            'matched_pattern', 'template_name',
+        ]
+
+    def get_conversation_name(self, obj):
+        return obj.conversation.custom_name or obj.conversation.contact_name
+
+    def _guard(self, obj):
+        return (obj.metadata or {}).get('auto_reply_guard') or {}
+
+    def get_matched_pattern(self, obj):
+        return self._guard(obj).get('matched_pattern') or ''
+
+    def get_template_name(self, obj):
+        return self._guard(obj).get('template_name') or ''
 
 
 class ConversationSerializer(serializers.ModelSerializer):

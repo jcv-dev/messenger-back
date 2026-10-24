@@ -42,6 +42,7 @@ from .serializers import (
     WhatsAppTemplateSerializer, CallSerializer, AuditLogSerializer,
     CannedResponseSerializer, AgentPresenceSerializer,
     TemplateExclusionSerializer, PushSubscriptionSerializer, MessageSearchSerializer,
+    AutoReplyMessageSerializer,
     media_signer, sign_media_url,
 )
 from .redis_client import get_sync_redis
@@ -57,6 +58,7 @@ from django.core.cache import cache
 from .realtime import publish, subscribe, unsubscribe
 from .rate_limiter import acquire as acquire_rate_capacity
 from .integrations.clients import schedule_auto_link
+from .auto_replies import classify_message, apply_guard
 
 logger = logging.getLogger('api')
 
@@ -431,8 +433,9 @@ def publish_conversation_update(conversation, message=None, escalated=False):
     except Exception:
         logger.exception("Failed to publish SSE conversation update")
 
-    # Push notification for inbound messages to the take owner
-    if message and message.get('direction') == 'inbound':
+    # Push notification for inbound messages to the take owner. Automated
+    # business replies are captured as read and must never ring a phone.
+    if message and message.get('direction') == 'inbound' and not message.get('is_automated'):
         try:
             from .models import PushSubscription
             now_ts = int(time.time())
@@ -2189,6 +2192,11 @@ class ConversationViewSet(viewsets.ModelViewSet):
             content=json.dumps(payload),
             sender_name=request.user.get_full_name() or request.user.username,
             sender=request.user,
+            metadata={
+                'template_name': template.name,
+                'template_id': template.id,
+                'template_category': template.category,
+            },
         )
 
         conversation.last_message = f'[{template.name}]'
@@ -2664,6 +2672,24 @@ class BotConfigViewSet(viewsets.ReadOnlyModelViewSet):
             pass
         return Response(BotConfigSerializer(config).data)
 
+    @action(detail=False, methods=['post'])
+    def set_value(self, request):
+        """Upsert a config by key (used by settings pages for seeded defaults)."""
+        key = (request.data.get('key') or '').strip()
+        value = request.data.get('value')
+        if not key:
+            return Response({'detail': 'key is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if value is None:
+            return Response({'detail': 'value is required'}, status=status.HTTP_400_BAD_REQUEST)
+        config, _ = BotConfig.objects.update_or_create(key=key, defaults={'value': value})
+        try:
+            from .bot.config import _clear_cache
+
+            _clear_cache()
+        except Exception:
+            pass
+        return Response(BotConfigSerializer(config).data)
+
 
 class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
     """Manage WhatsApp message templates. Admins can create, list, sync, delete."""
@@ -2888,6 +2914,11 @@ class WhatsAppTemplateViewSet(viewsets.ModelViewSet):
                 content=json.dumps(payload),
                 sender_name='Bot',
                 sender=None,
+                metadata={
+                    'template_name': template.name,
+                    'template_id': template.id,
+                    'template_category': template.category,
+                },
             )
             conv.last_message = f'[{template.name}]'
             conv.last_message_at = timezone.now()
@@ -3042,6 +3073,132 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
         if lte:
             qs = qs.filter(created_at__lte=lte)
         return qs
+
+
+class AutoReplyViewSet(viewsets.ReadOnlyModelViewSet):
+    """Captured automated business replies (admin review + backfill)."""
+    serializer_class = AutoReplyMessageSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    pagination_class = UserPagination
+
+    def get_queryset(self):
+        qs = (
+            Message.objects
+            .filter(is_automated=True, direction='inbound')
+            .select_related('conversation')
+        )
+        query = (self.request.query_params.get('q') or '').strip()
+        if query:
+            qs = qs.filter(
+                Q(content__icontains=query)
+                | Q(conversation__contact_name__icontains=query)
+                | Q(conversation__custom_name__icontains=query)
+                | Q(conversation__contact_phone__icontains=query)
+            )
+        conversation = self.request.query_params.get('conversation')
+        if conversation:
+            qs = qs.filter(conversation_id=conversation)
+        days = self.request.query_params.get('days')
+        if days:
+            try:
+                since = timezone.now() - timedelta(days=max(1, min(365, int(days))))
+                qs = qs.filter(created_at__gte=since)
+            except (TypeError, ValueError):
+                pass
+        return qs.order_by('-created_at', '-id')
+
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        from zoneinfo import ZoneInfo
+
+        local_now = timezone.now().astimezone(ZoneInfo('America/Bogota'))
+        today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = timezone.now() - timedelta(days=7)
+        base = Message.objects.filter(is_automated=True, direction='inbound')
+        response.data['summary'] = base.aggregate(
+            total=Count('id'),
+            today=Count('id', filter=Q(created_at__gte=today_start)),
+            last_7_days=Count('id', filter=Q(created_at__gte=week_start)),
+            unread=Count('id', filter=Q(is_read=False)),
+        )
+        return response
+
+    @action(detail=False, methods=['get'])
+    def config(self, request):
+        """Effective guard configuration plus the recommended defaults."""
+        from .auto_replies import DEFAULT_CONFIG, DEFAULT_PATTERNS, get_guard_config
+
+        current = get_guard_config()
+        return Response({
+            'key': 'auto_reply_guard',
+            'value': {
+                'enabled': current['enabled'],
+                'mark_read': current['mark_read'],
+                'require_marketing': current['require_marketing'],
+                'marketing_window_hours': current['marketing_window_hours'],
+                'patterns': [original for original, _ in current['patterns']],
+            },
+            'defaults': {
+                **DEFAULT_CONFIG,
+                'patterns': list(DEFAULT_PATTERNS),
+            },
+        })
+
+    @action(detail=False, methods=['post'])
+    def backfill(self, request):
+        """Classify recent historical messages with the current guard rules.
+
+        Used from the admin page to clean the campaign that already produced
+        unread replies. ``days`` is clamped to 90 and the scan to 5000
+        messages; the management command covers larger backfills.
+        """
+        try:
+            days = max(1, min(90, int(request.data.get('days', 7))))
+        except (TypeError, ValueError):
+            days = 7
+        try:
+            limit = max(1, min(5000, int(request.data.get('limit', 2000))))
+        except (TypeError, ValueError):
+            limit = 2000
+
+        since = timezone.now() - timedelta(days=days)
+        candidates = (
+            Message.objects
+            .filter(
+                Q(is_automated=False) | Q(is_automated=True, is_read=False),
+                direction='inbound',
+                created_at__gte=since,
+            )
+            .exclude(message_type__in=('reaction', 'edit'))
+            .select_related('conversation')
+            .order_by('-created_at')[:limit]
+        )
+
+        scanned = detected = marked_read = 0
+        for message in candidates:
+            scanned += 1
+            match = classify_message(
+                message.conversation, message.message_type,
+                message.content, at=message.created_at,
+            )
+            if not match:
+                continue
+            detected += 1
+            was_read = message.is_read
+            apply_guard(message, match)
+            if not was_read and message.is_read:
+                marked_read += 1
+
+        logger.info(
+            'Auto-reply backfill: days=%s scanned=%s detected=%s marked_read=%s',
+            days, scanned, detected, marked_read,
+        )
+        return Response({
+            'days': days,
+            'scanned': scanned,
+            'detected': detected,
+            'marked_read': marked_read,
+        })
 
 
 class CannedResponseViewSet(viewsets.ModelViewSet):
@@ -4167,6 +4324,24 @@ def whatsapp_webhook(request):
                         logger.info('Skipping duplicate message %s', msg_id)
                         continue
 
+                msg_ts = None
+                wa_ts = msg.get('timestamp')
+                if wa_ts:
+                    try:
+                        msg_ts = datetime.fromtimestamp(int(wa_ts), tz=dt_timezone.utc)
+                    except (ValueError, OSError, TypeError):
+                        msg_ts = None
+
+                auto_reply = classify_message(
+                    conversation, msg_type, content, at=msg_ts,
+                )
+                if auto_reply:
+                    meta['auto_reply_guard'] = auto_reply
+                    logger.info(
+                        'Auto-reply captured: msg=%s conv=%s pattern=%r',
+                        msg_id, conversation.id, auto_reply.get('matched_pattern'),
+                    )
+
                 message = Message.objects.create(
                     conversation=conversation,
                     direction='inbound',
@@ -4177,6 +4352,8 @@ def whatsapp_webhook(request):
                     media_url=media_url,
                     metadata=meta,
                     context_message=context_message_obj,
+                    is_automated=bool(auto_reply),
+                    is_read=bool(auto_reply and auto_reply.get('mark_read')),
                 )
 
                 if meta.get('is_forwarded'):
@@ -4186,16 +4363,9 @@ def whatsapp_webhook(request):
                     Message.objects.filter(id=message.id).update(**update_kwargs)
                     message.refresh_from_db()
 
-                msg_ts = None
-                wa_ts = msg.get('timestamp')
-                if wa_ts:
-                    try:
-                        from datetime import datetime, timezone as dt_timezone
-                        msg_ts = datetime.fromtimestamp(int(wa_ts), tz=dt_timezone.utc)
-                        Message.objects.filter(id=message.id).update(created_at=msg_ts)
-                        message.refresh_from_db()
-                    except (ValueError, OSError):
-                        pass
+                if msg_ts:
+                    Message.objects.filter(id=message.id).update(created_at=msg_ts)
+                    message.refresh_from_db()
 
                 if msg_ts and (conversation.last_message_at is None or msg_ts > conversation.last_message_at):
                     conversation.last_message = last_msg_text

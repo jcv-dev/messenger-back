@@ -243,6 +243,14 @@ async def handle_inbound(event: dict):
         return
     if msg_data.get("direction") != "inbound":
         return
+    if msg_data.get("is_automated"):
+        # Business auto-responders are captured and marked read by the
+        # auto-reply guard. Answering them would create a reply ping-pong.
+        logger.debug(
+            "Skipping automated reply for conv=%s",
+            conv_data.get("id"),
+        )
+        return
 
     conversation_id = conv_data["id"]
 
