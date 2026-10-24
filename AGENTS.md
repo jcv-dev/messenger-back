@@ -384,9 +384,9 @@ sends silently:
 
 - `api/auto_replies.py` classifies inbound messages by normalized phrases
   (`BotConfig` key `auto_reply_guard`: `enabled`, `mark_read`,
-  `require_marketing`, `marketing_window_hours`, `patterns`). Detection is
+  `require_marketing`, `marketing_window_minutes`, `patterns`). Detection is
   restricted by default to conversations that received a `MARKETING` template
-  inside the window, so organic greetings are not swallowed.
+  inside the 2-minute window, so organic greetings are not swallowed.
 - The webhook creates matching messages with `is_automated=True` and
   `is_read=True` (when `mark_read`), stores the evidence in
   `metadata['auto_reply_guard']`, and `publish_conversation_update` skips the
@@ -401,8 +401,10 @@ sends silently:
 - Template sends (`send_template`, `templates/bulk_send`) record
   `metadata.template_name` / `template_category` so the window check does not
   depend on parsing JSON or on the template still existing.
-- Migration `0047_auto_reply_guard` adds the field and seeds the config; the
-  recommended pattern list stays in `DEFAULT_PATTERNS` so it can evolve.
+- Migration `0047_auto_reply_guard` adds the field and seeds the config;
+  `0048_auto_reply_window_minutes` moves the window to minutes (2-minute
+  default). The recommended pattern list stays in `DEFAULT_PATTERNS` so it can
+  evolve.
 
 ## Database
 

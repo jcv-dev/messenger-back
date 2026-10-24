@@ -106,6 +106,17 @@ class AutoReplyGuardTests(APITestCase):
         self.assertIsNotNone(match)
         self.assertEqual(match['matched_pattern'], 'gracias por escribirnos')
         self.assertEqual(match['template_name'], 'promo_demo')
+        self.assertEqual(match['window_minutes'], 2)
+
+    def test_auto_reply_inside_two_minute_window_is_classified(self):
+        self._marketing_template(at=timezone.now() - timedelta(minutes=1))
+        match = classify_message(self.conversation, 'text', MARKETING_TEXT)
+        self.assertIsNotNone(match)
+
+    def test_auto_reply_five_minutes_later_is_not_classified(self):
+        self._marketing_template(at=timezone.now() - timedelta(minutes=5))
+        match = classify_message(self.conversation, 'text', MARKETING_TEXT)
+        self.assertIsNone(match)
 
     def test_regular_reply_after_marketing_template_is_not_classified(self):
         self._marketing_template()
@@ -124,8 +135,8 @@ class AutoReplyGuardTests(APITestCase):
         self.assertIsNone(match)
 
     def test_auto_reply_outside_marketing_window_is_not_classified(self):
-        self._set_config(marketing_window_hours=24)
-        self._marketing_template(at=timezone.now() - timedelta(days=3))
+        self._set_config(marketing_window_minutes=1)
+        self._marketing_template(at=timezone.now() - timedelta(minutes=3))
         match = classify_message(self.conversation, 'text', MARKETING_TEXT)
         self.assertIsNone(match)
 
@@ -264,6 +275,7 @@ class AutoReplyGuardTests(APITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['key'], 'auto_reply_guard')
         self.assertTrue(response.data['value']['enabled'])
+        self.assertEqual(response.data['value']['marketing_window_minutes'], 2)
         self.assertGreater(len(response.data['value']['patterns']), 0)
         self.assertEqual(
             response.data['value']['patterns'],
@@ -277,7 +289,7 @@ class AutoReplyGuardTests(APITestCase):
             'enabled': True,
             'mark_read': True,
             'require_marketing': False,
-            'marketing_window_hours': 24,
+            'marketing_window_minutes': 24,
             'patterns': ['solo esto'],
         }
 
@@ -290,13 +302,16 @@ class AutoReplyGuardTests(APITestCase):
         _clear_config_cache()
 
         saved = BotConfig.objects.get(key='auto_reply_guard')
-        self.assertEqual(saved.value['marketing_window_hours'], 24)
+        self.assertEqual(saved.value['marketing_window_minutes'], 24)
         self.assertEqual(saved.value['patterns'], ['solo esto'])
 
     def test_backfill_flags_historical_reply_relative_to_its_timestamp(self):
-        self._marketing_template(at=timezone.now() - timedelta(days=2))
+        # Both messages are older than the 2-minute window measured from
+        # "now", but the reply landed one minute after the template, so the
+        # backfill must evaluate the window against the reply's own timestamp.
+        self._marketing_template(at=timezone.now() - timedelta(minutes=10))
         historical = self._inbound(
-            MARKETING_TEXT, at=timezone.now() - timedelta(days=1),
+            MARKETING_TEXT, at=timezone.now() - timedelta(minutes=9),
         )
         admin = User.objects.create_user('admin', password='x', is_staff=True)
         self.client.force_authenticate(user=admin)

@@ -17,7 +17,7 @@ Configuration lives in ``BotConfig`` key ``auto_reply_guard``:
       "enabled": true,
       "mark_read": true,
       "require_marketing": true,
-      "marketing_window_hours": 72,
+      "marketing_window_minutes": 2,
       "patterns": ["gracias por escribirnos", ...]
     }
 
@@ -92,10 +92,10 @@ DEFAULT_CONFIG = {
     'enabled': True,
     'mark_read': True,
     'require_marketing': True,
-    'marketing_window_hours': 72,
+    'marketing_window_minutes': 2,
 }
-DEFAULT_WINDOW_HOURS = 72
-MAX_WINDOW_HOURS = 24 * 30
+DEFAULT_WINDOW_MINUTES = 2
+MAX_WINDOW_MINUTES = 24 * 60 * 30
 
 # Auto-responders answer with text (or a caption on an attachment). Reactions
 # and edits are never auto-replies.
@@ -123,12 +123,12 @@ def _as_bool(value, default):
     return bool(value)
 
 
-def _as_window_hours(value):
+def _as_window_minutes(value):
     try:
-        hours = int(value)
+        minutes = int(value)
     except (TypeError, ValueError):
-        return DEFAULT_WINDOW_HOURS
-    return max(1, min(MAX_WINDOW_HOURS, hours))
+        return DEFAULT_WINDOW_MINUTES
+    return max(1, min(MAX_WINDOW_MINUTES, minutes))
 
 
 def _pattern_pairs(raw_patterns):
@@ -160,8 +160,8 @@ def get_guard_config():
         'require_marketing': _as_bool(
             raw.get('require_marketing'), DEFAULT_CONFIG['require_marketing'],
         ),
-        'marketing_window_hours': _as_window_hours(
-            raw.get('marketing_window_hours', DEFAULT_WINDOW_HOURS),
+        'marketing_window_minutes': _as_window_minutes(
+            raw.get('marketing_window_minutes', DEFAULT_WINDOW_MINUTES),
         ),
         'patterns': _pattern_pairs(raw.get('patterns')),
     }
@@ -196,9 +196,9 @@ def _template_name_from_message(message):
     return None
 
 
-def _recent_marketing_template(conversation, window_hours, at):
+def _recent_marketing_template(conversation, window_minutes, at):
     """Return the name of a MARKETING template sent inside the window."""
-    since = at - timedelta(hours=window_hours)
+    since = at - timedelta(minutes=window_minutes)
     recent = (
         Message.objects
         .filter(
@@ -258,7 +258,7 @@ def classify_message(conversation, message_type, content, at=None):
     template_name = None
     if config['require_marketing']:
         template_name = _recent_marketing_template(
-            conversation, config['marketing_window_hours'], at,
+            conversation, config['marketing_window_minutes'], at,
         )
         if not template_name:
             return None
@@ -267,7 +267,7 @@ def classify_message(conversation, message_type, content, at=None):
         'matched_pattern': matched_original,
         'matched_normalized': matched_normalized,
         'template_name': template_name,
-        'window_hours': config['marketing_window_hours'] if config['require_marketing'] else None,
+        'window_minutes': config['marketing_window_minutes'] if config['require_marketing'] else None,
         'require_marketing': config['require_marketing'],
         'mark_read': config['mark_read'],
         'detected_at': timezone.now().isoformat(),

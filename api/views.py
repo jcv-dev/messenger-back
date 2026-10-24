@@ -3135,7 +3135,7 @@ class AutoReplyViewSet(viewsets.ReadOnlyModelViewSet):
                 'enabled': current['enabled'],
                 'mark_read': current['mark_read'],
                 'require_marketing': current['require_marketing'],
-                'marketing_window_hours': current['marketing_window_hours'],
+                'marketing_window_minutes': current['marketing_window_minutes'],
                 'patterns': [original for original, _ in current['patterns']],
             },
             'defaults': {
